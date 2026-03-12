@@ -24,20 +24,13 @@ ssh-guard sits between the agent and SSH. Every command gets evaluated by a fast
 
 ## Install
 
-Single file, no dependencies beyond `bash`, `curl`, and `jq`.
-
 ```bash
-# Download
-curl -fsSL -o ~/.local/bin/ssh-guard \
-  https://raw.githubusercontent.com/morgaesis/ssh-guard/main/ssh-guard
-chmod +x ~/.local/bin/ssh-guard
-
-# Or clone
-git clone https://github.com/morgaesis/ssh-guard.git
-cp ssh-guard/ssh-guard ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/morgaesis/ssh-guard/main/install.sh | bash
 ```
 
-Requires `~/.local/bin` in your `PATH` (or put it wherever you like).
+Or build from source: `cargo install --path .`
+
+See [INSTALL.md](INSTALL.md) for all options (manual download, specific versions, provider setup, agent integration).
 
 ## Quick start
 
