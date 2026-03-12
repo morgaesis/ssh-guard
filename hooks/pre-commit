@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> pre-commit: scanning for secrets with infisical..."
+
+if ! command -v infisical &>/dev/null; then
+  echo "WARNING: infisical not found, skipping secret scan"
+  exit 0
+fi
+
+# Scan staged files only
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+if [[ -z "$STAGED_FILES" ]]; then
+  exit 0
+fi
+
+SCAN_FAILED=0
+for file in $STAGED_FILES; do
+  if infisical scan "$file" 2>&1 | grep -qiE '(finding|leak|secret)'; then
+    echo "BLOCKED: potential secret found in $file"
+    SCAN_FAILED=1
+  fi
+done
+
+if [[ "$SCAN_FAILED" -ne 0 ]]; then
+  echo "pre-commit: secret scan failed. Fix the issues above or use --no-verify to skip."
+  exit 1
+fi
+
+echo "pre-commit: secret scan passed."

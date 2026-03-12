@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> pre-push: running QA checks..."
+
+# Commit message validation (last commit)
+LAST_MSG=$(git log -1 --pretty=%B)
+if [[ ${#LAST_MSG} -lt 10 ]]; then
+  echo "BLOCKED: commit message too short (min 10 chars)"
+  exit 1
+fi
+if echo "$LAST_MSG" | head -1 | grep -qE '^.{73,}'; then
+  echo "WARNING: commit subject line exceeds 72 chars"
+fi
+echo "  commit message: ok"
+
+# Rust checks (if Cargo.toml exists)
+if [[ -f "Cargo.toml" ]]; then
+  echo "  cargo fmt..."
+  cargo fmt --all -- --check || {
+    echo "BLOCKED: cargo fmt found formatting issues"
+    exit 1
+  }
+
+  echo "  cargo clippy..."
+  cargo clippy --quiet -- -D warnings || {
+    echo "BLOCKED: clippy found warnings"
+    exit 1
+  }
+
+  echo "  cargo test..."
+  cargo test --quiet || {
+    echo "BLOCKED: tests failed"
+    exit 1
+  }
+fi
+
+# Shell checks (if shellcheck is available and shell scripts exist)
+if command -v shellcheck &>/dev/null; then
+  SHELL_FILES=$(find . -name '*.sh' -not -path './.git/*' -not -path './target/*' 2>/dev/null || true)
+  if [[ -n "$SHELL_FILES" ]]; then
+    echo "  shellcheck..."
+    echo "$SHELL_FILES" | xargs shellcheck || {
+      echo "BLOCKED: shellcheck found issues"
+      exit 1
+    }
+  fi
+fi
+
+echo "pre-push: all checks passed."
