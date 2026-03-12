@@ -5,7 +5,6 @@ set -e
 
 CYAN='\033[0;36m'
 RED='\033[0;31m'
-GREEN='\033[0;32m'
 DIM='\033[2m'
 RESET='\033[0m'
 
@@ -18,7 +17,7 @@ _type() {
 }
 
 _prompt() {
-  printf "${DIM}\$ ${RESET}"
+  printf '%b$ %b' "$DIM" "$RESET"
 }
 
 _run() {
@@ -29,8 +28,16 @@ _run() {
 }
 
 _comment() {
-  printf "${CYAN}# %s${RESET}\n" "$1"
+  printf '%b# %s%b\n' "$CYAN" "$1" "$RESET"
   sleep 0.5
+}
+
+_denied() {
+  printf '%bssh-guard: %s%b\n' "$RED" "$1" "$RESET"
+}
+
+_dim() {
+  printf '%b%s%b\n' "$DIM" "$1" "$RESET"
 }
 
 echo
@@ -55,7 +62,7 @@ echo
 _comment "Dangerous commands are denied with risk score"
 _run "ssh-guard prod-db 'rm -rf /var/lib/postgresql/'"
 sleep 0.3
-printf "${RED}ssh-guard: DENIED (risk=10) - Recursive deletion of database data directory.${RESET}\n"
+_denied "DENIED (risk=10) - Recursive deletion of database data directory."
 sleep 1.5
 
 echo
@@ -72,7 +79,7 @@ sleep 1
 echo
 _run "ssh-guard prod-db 'sudo systemctl restart postgresql'"
 sleep 0.3
-printf "${RED}ssh-guard: DENIED (risk=7) - Modifies service state by restarting the database.${RESET}\n"
+_denied "DENIED (risk=7) - Modifies service state by restarting the database."
 sleep 1.5
 
 echo
@@ -87,9 +94,9 @@ echo
 _comment "Interactive sessions are blocked"
 _run "ssh-guard prod-db"
 sleep 0.3
-printf "${RED}ssh-guard: interactive sessions are not permitted through ssh-guard.${RESET}\n"
-printf "${RED}ssh-guard: provide a command: ssh-guard prod-db 'command'${RESET}\n"
-printf "${RED}ssh-guard: for interactive access, use ssh directly.${RESET}\n"
+_denied "interactive sessions are not permitted through ssh-guard."
+_denied "provide a command: ssh-guard prod-db 'command'"
+_denied "for interactive access, use ssh directly."
 sleep 1.5
 
 echo
@@ -97,7 +104,7 @@ _comment "Switch modes for different policies"
 _run "SSH_GUARD_MODE=safe ssh-guard prod-db 'systemctl restart myapp'"
 sleep 0.3
 echo ""
-printf "${DIM}(service restarted)${RESET}\n"
+_dim "(service restarted)"
 sleep 1
 
 echo
