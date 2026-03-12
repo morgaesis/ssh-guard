@@ -2,7 +2,7 @@
 # Run: vhs demo.tape
 # Requires: ssh-guard binary in PATH, a reachable SSH host, SSH_GUARD_API_KEY set
 
-Output demo.gif
+Output docs/demo.svg
 Set FontSize 14
 Set Width 1000
 Set Height 500

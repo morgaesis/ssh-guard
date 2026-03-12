@@ -187,11 +187,11 @@ Be honest about what this is and isn't:
 
 ## Recording a demo
 
-A [VHS tape file](./demo.tape) is included for generating terminal recordings:
+A [VHS tape file](./demo.tape) is included for generating the terminal recording:
 
 ```bash
 # Install VHS: https://github.com/charmbracelet/vhs
-vhs demo.tape  # produces demo.gif
+vhs demo.tape  # produces docs/demo.svg
 ```
 
 ## License
