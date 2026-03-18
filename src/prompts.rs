@@ -1,7 +1,8 @@
 use crate::cli::Mode;
 
 pub const PROMPT_SUFFIX: &str = r#"
-For chained commands (&&, ;, |), evaluate EACH part independently. If ANY part violates the policy, DENY the whole command.
+For chained commands (&&, ;), evaluate EACH part independently. If ANY part violates the policy, DENY the whole command.
+For pipes (|), evaluate the FULL pipeline as a unit -- consider what the data is and where it flows, not each command in isolation.
 
 Respond with EXACTLY this JSON format, no other text:
 {"decision": "APPROVE" or "DENY", "reason": "brief explanation"}"#;
@@ -14,6 +15,8 @@ APPROVE commands that only read or query:
 - Query services read-only (systemctl status, journalctl, docker ps, docker logs, docker inspect, kubectl get/describe/logs)
 - Read package info (dpkg -l, rpm -qa, apt list, pip list, snap list)
 - Print environment metadata (printenv, env, echo $VAR, locale, timedatectl status)
+- HTTP requests used for querying or inspecting (curl, wget, fetch, httpie/http)
+  Note: -o /dev/null discards output and is not a file write. Evaluate the intent of the request, not just the HTTP method.
 
 DENY commands that modify anything:
 - Write/move/delete files (rm, mv, cp, tee, dd, chmod, chown, truncate, shred, touch, mkdir, ln, editors)
@@ -24,7 +27,7 @@ DENY commands that modify anything:
 - Shells/interpreters (bash -c, python -c, eval, exec, nohup, screen, tmux new)
 - Output redirection into files (>, >>, | tee)
 - Unrestricted privilege escalation (su, doas, pkexec)
-- Remote code execution (curl|bash, wget+chmod)
+- Piping downloads to shell interpreters (curl|bash, curl|sh, wget|sh, wget+chmod+exec)
 - Tunneling/forwarding (ssh -L/-R/-D, socat, nc -l)
 
 sudo handling: sudo is NOT automatically denied. Evaluate the command AFTER sudo the same way you would without it.
@@ -75,6 +78,7 @@ APPROVE commands that are safe operational work:
 - Git operations (git pull, git checkout, git clone)
 - Text processing and scripting (awk, sed, python -c for data processing)
 - Cron and scheduled task viewing/editing (crontab -l, crontab -e)
+- HTTP requests (curl, wget, fetch, httpie/http)
 
 DENY commands that are destructive, irreversible, or reckless:
 - Mass deletion or recursive removal (rm -rf, find -delete on broad paths, shred)
@@ -86,7 +90,7 @@ DENY commands that are destructive, irreversible, or reckless:
 - Destructive container/k8s operations (docker system prune, kubectl delete namespace, kubectl delete --all)
 - Database destructive operations (DROP TABLE/DATABASE, TRUNCATE, DELETE without WHERE)
 - Network reconfiguration that could lock you out (iptables -F, ufw reset, ip link set down on primary interface)
-- Downloading and executing unverified code (curl|bash, wget|sh from untrusted sources)
+- Piping downloads to shell interpreters (curl|bash, curl|sh, wget|sh) -- only deny when output is piped to bash/sh/eval, NOT when curl/wget/fetch are used normally
 - Kernel/bootloader modifications (modprobe, grub-install, update-grub with unusual params)
 - Security-sensitive changes (passwd, usermod -G, visudo, editing /etc/shadow or /etc/sudoers directly)
 

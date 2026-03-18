@@ -2,14 +2,14 @@
 
 SSH wrapper that sends every command to an LLM for approval before execution. Give your AI agents SSH access without giving them the keys to the kingdom.
 
-```
-$ ssh-guard prod-server 'ls -la /etc/nginx/'
-drwxr-xr-x 8 root root 4096 Mar 10 14:22 .
--rw-r--r-- 1 root root 1482 Mar 10 14:22 nginx.conf
-...
+```bash
+ssh-guard prod-server 'ls -la /etc/nginx/'
+# drwxr-xr-x 8 root root 4096 Mar 10 14:22 .
+# -rw-r--r-- 1 root root 1482 Mar 10 14:22 nginx.conf
+# ...
 
-$ ssh-guard prod-server 'rm -rf /etc/nginx/'
-ssh-guard: DENIED (risk=9) - Recursive deletion of system config directory.
+ssh-guard prod-server 'rm -rf /etc/nginx/'
+# ssh-guard: DENIED (risk=9) - Recursive deletion of system config directory.
 ```
 
 Zero output on approval. Denied commands print the reason and risk score.
@@ -53,11 +53,11 @@ ssh-guard myserver 'systemctl restart nginx'
 
 Three built-in policies, set via `SSH_GUARD_MODE`:
 
-| Mode | Default | Use case |
-|------|---------|----------|
-| `readonly` | Yes | Agents that only need to observe. Blocks all writes, installs, service changes. |
-| `paranoid` | | Like readonly, but also blocks reading file contents, env vars, logs. Only structural metadata (ls, ps, df, etc). Prevents secret exfiltration. |
-| `safe` | | Agents that need to do work. Allows targeted writes and service restarts, blocks destructive/broad operations (rm -rf, reboot, kubectl delete namespace). |
+| Mode       | Default | Use case                                                                                                                                                  |
+| ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readonly` | Yes     | Agents that only need to observe. Blocks all writes, installs, service changes.                                                                           |
+| `paranoid` |         | Like readonly, but also blocks reading file contents, env vars, logs. Only structural metadata (ls, ps, df, etc). Prevents secret exfiltration.           |
+| `safe`     |         | Agents that need to do work. Allows targeted writes and service restarts, blocks destructive/broad operations (rm -rf, reboot, kubectl delete namespace). |
 
 ```bash
 SSH_GUARD_MODE=safe ssh-guard server 'systemctl restart myapp'  # allowed
@@ -65,10 +65,11 @@ SSH_GUARD_MODE=paranoid ssh-guard server 'cat /etc/passwd'      # denied
 ```
 
 All modes evaluate `sudo` by the underlying command, not the keyword itself:
-```
-sudo ls /etc/nginx/        -> readonly: allowed (read operation)
-sudo rm -rf /etc/nginx/    -> readonly: denied  (write operation)
-sudo systemctl restart app -> safe: allowed      (targeted restart)
+
+```bash
+sudo ls /etc/nginx/        # readonly: allowed (read operation)
+sudo rm -rf /etc/nginx/    # readonly: denied  (write operation)
+sudo systemctl restart app # safe: allowed     (targeted restart)
 ```
 
 ## Configuration
@@ -77,20 +78,20 @@ All configuration via environment variables or `.env` files.
 
 ssh-guard walks up from your current directory to `/` looking for `.env` files (closest wins), so you can scope config per project.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SSH_GUARD_API_KEY` | `$OPENROUTER_API_KEY` | LLM API key (required) |
-| `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
-| `SSH_GUARD_MODEL` | `google/gemini-2.0-flash-001` | Model for command evaluation |
-| `SSH_GUARD_API_TYPE` | `openai` | `openai` or `anthropic` |
-| `SSH_GUARD_MODE` | `readonly` | `readonly`, `paranoid`, or `safe` |
-| `SSH_GUARD_PROMPT` | (per mode) | Custom system prompt (overrides mode) |
-| `SSH_GUARD_PASSTHROUGH` | (none) | Always-allow commands, comma-separated |
-| `SSH_GUARD_LOG` | (none) | Audit log file path |
-| `SSH_GUARD_REDACT` | `true` | Redact secrets from command output |
-| `SSH_GUARD_SSH_BIN` | `/usr/bin/ssh` | Path to real ssh binary |
-| `SSH_GUARD_TIMEOUT` | `30` | LLM call timeout (seconds) |
-| `SSH_GUARD_MAX_TOKENS` | `512` | Max LLM response tokens |
+| Variable                | Default                                         | Description                            |
+| ----------------------- | ----------------------------------------------- | -------------------------------------- |
+| `SSH_GUARD_API_KEY`     | `$OPENROUTER_API_KEY`                           | LLM API key (required)                 |
+| `SSH_GUARD_API_URL`     | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint         |
+| `SSH_GUARD_MODEL`       | `google/gemini-2.0-flash-001`                   | Model for command evaluation           |
+| `SSH_GUARD_API_TYPE`    | `openai`                                        | `openai` or `anthropic`                |
+| `SSH_GUARD_MODE`        | `readonly`                                      | `readonly`, `paranoid`, or `safe`      |
+| `SSH_GUARD_PROMPT`      | (per mode)                                      | Custom system prompt (overrides mode)  |
+| `SSH_GUARD_PASSTHROUGH` | (none)                                          | Always-allow commands, comma-separated |
+| `SSH_GUARD_LOG`         | (none)                                          | Audit log file path                    |
+| `SSH_GUARD_REDACT`      | `true`                                          | Redact secrets from command output     |
+| `SSH_GUARD_SSH_BIN`     | `/usr/bin/ssh`                                  | Path to real ssh binary                |
+| `SSH_GUARD_TIMEOUT`     | `30`                                            | LLM call timeout (seconds)             |
+| `SSH_GUARD_MAX_TOKENS`  | `512`                                           | Max LLM response tokens                |
 
 See [`.env.example`](.env.example) for a copyable template.
 
@@ -103,6 +104,7 @@ Point your agent's SSH command at `ssh-guard` instead of `ssh`.
 
 ```markdown
 # SSH Access
+
 Use `ssh-guard` instead of `ssh` for all remote commands.
 Never use interactive SSH sessions.
 ```
@@ -156,7 +158,7 @@ export SSH_GUARD_API_KEY="..."
 
 When `SSH_GUARD_REDACT=true` (default), command output is filtered through pattern-based redaction before reaching the agent:
 
-```
+```CFG
 DB_PASSWORD=hunter2         ->  DB_PASSWORD=[REDACTED]
 export API_TOKEN="sk-..."   ->  export API_TOKEN="[REDACTED]"
 -----BEGIN PRIVATE KEY----  ->  -----BEGIN PRIVATE KEY---- [REDACTED]
@@ -171,7 +173,8 @@ export SSH_GUARD_LOG=/var/log/ssh-guard.log
 ```
 
 Logs denials always. Logs approvals only when risk score >= 4. Format:
-```
+
+```logs
 [2025-03-12T14:22:01+00:00] DENIED risk=9 cmd=rm -rf / reason=Recursive deletion of root filesystem
 [2025-03-12T14:22:15+00:00] APPROVED risk=4 cmd=sudo cat /etc/hosts reason=Reading system config file
 ```

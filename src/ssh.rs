@@ -1,6 +1,7 @@
 use crate::redact::redact_output;
 use anyhow::Result;
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 /// SSH options that take a separate argument value.
@@ -95,26 +96,38 @@ pub fn extract_destination(args: &[String]) -> Option<String> {
 /// Execute SSH with the given arguments, optionally redacting output.
 pub async fn exec_ssh(ssh_bin: &str, args: &[String], redact: bool) -> Result<i32> {
     if redact {
-        let output = Command::new(ssh_bin)
+        let mut child = Command::new(ssh_bin)
             .args(args)
             .stdin(Stdio::inherit())
-            .output()
-            .await?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
 
-        let redacted_stdout = redact_output(&stdout);
-        let redacted_stderr = redact_output(&stderr);
+        let stdout_task = tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let redacted = redact_output(&line);
+                println!("{}", redacted);
+            }
+        });
 
-        if !redacted_stdout.is_empty() {
-            print!("{}", redacted_stdout);
-        }
-        if !redacted_stderr.is_empty() {
-            eprint!("{}", redacted_stderr);
-        }
+        let stderr_task = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let redacted = redact_output(&line);
+                eprintln!("{}", redacted);
+            }
+        });
 
-        Ok(output.status.code().unwrap_or(1))
+        let status = child.wait().await?;
+        let _ = tokio::join!(stdout_task, stderr_task);
+
+        Ok(status.code().unwrap_or(1))
     } else {
         let status = Command::new(ssh_bin)
             .args(args)
