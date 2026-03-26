@@ -422,6 +422,11 @@ fn match_glob_recursive(pattern: &[char], text: &[char]) -> bool {
                         p_idx = sp + 1;
                         t_idx = t_at_star.unwrap() + 1;
                         t_at_star = Some(t_idx);
+                        // If we've consumed all text after backtracking and still have pattern,
+                        // fail immediately to avoid infinite loop
+                        if t_idx >= text.len() && p_idx < pattern.len() {
+                            return false;
+                        }
                     } else {
                         return false;
                     }
