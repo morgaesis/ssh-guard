@@ -820,6 +820,21 @@ mod tests {
             return;
         }
 
+        // Skip if pass version doesn't support --multifile
+        let multifile_supported = std::process::Command::new("pass")
+            .arg("insert")
+            .arg("--help")
+            .output()
+            .map(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("--multifile")
+            })
+            .unwrap_or(false);
+
+        if !multifile_supported {
+            eprintln!("skipping pass integration test (pass --multifile not supported)");
+            return;
+        }
+
         let backend = PassBackend::new(None);
         let test_key = format!("guard_test_{}", std::process::id());
         let test_value = "integration_test_value";
