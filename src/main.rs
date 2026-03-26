@@ -1,271 +1,490 @@
-mod cli;
-mod config;
-mod llm;
-mod prompts;
+//! ssh-guard server mode - privileged command execution guard for AI agents
+//!
+#![allow(unused)]
+
+mod client_config;
+mod policy;
 mod redact;
+mod secrets;
+mod server;
+mod shim;
 mod ssh;
 
-use anyhow::Result;
-use clap::Parser;
-use cli::Cli;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::process;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use tracing_subscriber::{fmt, EnvFilter};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let cli = Cli::parse();
-
-    if let Err(e) = setup_logging(&cli) {
-        eprintln!("ssh-guard: failed to initialize logging: {}", e);
-        process::exit(1);
-    }
-
-    if let Err(e) = run(cli).await {
-        eprintln!("ssh-guard: {}", e);
-        process::exit(1);
-    }
+#[derive(Parser)]
+enum MainArgs {
+    /// Direct command execution via server
+    Run {
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Server management
+    #[command(subcommand)]
+    Server(ServerCommands),
+    /// Connect to server and execute
+    Connect {
+        target: String,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Manage secrets
+    Secrets {
+        #[command(subcommand)]
+        subcommand: SecretCommands,
+    },
+    /// Install shim scripts
+    Shim {
+        #[command(subcommand)]
+        subcommand: ShimCommands,
+    },
+    /// Manage client configuration
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigCommands,
+    },
 }
 
-async fn run(cli: Cli) -> Result<()> {
-    // Load .env files walking up from CWD
-    config::load_env_files();
+#[derive(Subcommand)]
+enum ServerCommands {
+    /// Start the ssh-guard server (privileged daemon)
+    Start {
+        #[arg(long, default_value = "/var/run/ssh-guard/ssh-guard.sock")]
+        socket: Option<String>,
 
-    // If no SSH args, pass through to ssh (will show usage)
-    if cli.ssh_args.is_empty() {
-        let config = config::load_config(cli.mode);
-        // If config loading fails (no API key), still pass through for bare ssh
-        let ssh_bin = config
-            .map(|c| c.ssh_bin)
-            .unwrap_or_else(|_| "/usr/bin/ssh".to_string());
+        #[arg(long)]
+        tcp_port: Option<u16>,
 
-        let status = tokio::process::Command::new(&ssh_bin).status().await?;
-        process::exit(status.code().unwrap_or(1));
-    }
+        #[arg(long, default_value = "/usr/bin/ssh")]
+        ssh_bin: Option<String>,
 
-    let remote_cmd = ssh::extract_command(&cli.ssh_args);
-    let destination =
-        ssh::extract_destination(&cli.ssh_args).unwrap_or_else(|| "unknown".to_string());
+        #[arg(long)]
+        identity_key: Option<String>,
 
-    // Block interactive sessions
-    if remote_cmd.is_empty() {
-        eprintln!("ssh-guard: interactive sessions are not permitted through ssh-guard.");
-        eprintln!(
-            "ssh-guard: provide a command: ssh-guard {} 'command'",
-            destination
-        );
-        eprintln!("ssh-guard: for interactive access, use ssh directly.");
-        log_to_file(
-            None,
-            &format!("BLOCKED interactive session attempt: {:?}", cli.ssh_args),
-        );
-        return Err(anyhow::anyhow!("interactive sessions are blocked"));
-    }
+        #[arg(long)]
+        auth_token: Option<String>,
 
-    // Load config (requires API key for non-passthrough commands)
-    let config = config::load_config(cli.mode)?;
+        #[arg(long)]
+        socket_group: Option<String>,
 
-    tracing::info!(
-        "mode={} destination={} command={}",
-        config.mode,
-        destination,
-        remote_cmd
-    );
+        #[arg(long)]
+        users: Option<String>,
+    },
+    /// Connect to ssh-guard server
+    Connect {
+        #[arg(long)]
+        socket: Option<String>,
 
-    log_to_file(
-        config.log_file.as_deref(),
-        &format!("REQUEST host={} cmd={}", destination, remote_cmd),
-    );
+        #[arg(long)]
+        tcp_port: Option<u16>,
 
-    // Check passthrough
-    if ssh::is_passthrough(&remote_cmd, &config.passthrough) {
-        tracing::info!("passthrough match, executing directly");
-        log_to_file(
-            config.log_file.as_deref(),
-            &format!("PASSTHROUGH cmd={}", remote_cmd),
-        );
+        #[arg(long)]
+        token: Option<String>,
 
-        if cli.dry_run {
-            eprintln!(
-                "ssh-guard: [dry-run] would execute (passthrough): ssh {:?}",
-                cli.ssh_args
-            );
-            return Ok(());
+        target: String,
+
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Show current configuration
+    Show,
+    /// Set server socket path
+    SetServer { socket: String },
+    /// Set TCP port
+    SetPort { port: u16 },
+    /// Set auth token
+    SetToken { token: String },
+    /// Set default user
+    SetUser { user: String },
+    /// Clear configuration
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum ShimCommands {
+    Install {
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
+    },
+    Remove {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    List {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommands {
+    Add { key: String, value: Option<String> },
+    List,
+    Remove { key: String },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).with_target(true).init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        match MainArgs::try_parse_from(std::env::args()) {
+            Ok(_) => {}
+            Err(e) => eprintln!("{}", e),
         }
-
-        let exit_code = ssh::exec_ssh(&config.ssh_bin, &cli.ssh_args, config.redact).await?;
-        process::exit(exit_code);
-    }
-
-    // Resolve system prompt
-    let system_prompt = prompts::resolve_prompt(config.mode, config.prompt_override.as_deref());
-
-    tracing::trace!("system prompt: {}", system_prompt);
-    tracing::debug!(
-        "calling LLM: model={} api_type={:?} url={}",
-        config.model,
-        config.api_type,
-        config.api_url
-    );
-
-    if cli.dry_run {
-        eprintln!("ssh-guard: [dry-run] would call LLM for approval:");
-        eprintln!("  host: {}", destination);
-        eprintln!("  command: {}", remote_cmd);
-        eprintln!("  mode: {}", config.mode);
-        eprintln!("  model: {}", config.model);
         return Ok(());
     }
 
-    // Call LLM
-    let start = std::time::Instant::now();
-    let decision = match llm::call_llm(&config, &system_prompt, &remote_cmd, &destination).await {
-        Ok(d) => d,
-        Err(e) => {
-            // Fail closed
-            let msg = format!("LLM call failed: {}", e);
-            log_to_file(config.log_file.as_deref(), &format!("ERROR {}", msg));
-            return Err(anyhow::anyhow!("{}", msg));
+    if args.iter().any(|a| a == "--version") {
+        println!("ssh-guard v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    let subcommands = ["server", "connect", "secrets", "shim", "config"];
+    let first_arg = args.first();
+
+    if first_arg
+        .map(|s| subcommands.contains(&s.as_str()))
+        .unwrap_or(false)
+    {
+        match MainArgs::try_parse_from(std::env::args())? {
+            MainArgs::Run { cmd } => run_direct(cmd).await,
+            MainArgs::Server(cmd) => run_server(cmd).await,
+            MainArgs::Connect { target, command } => run_connect(target, command).await,
+            MainArgs::Secrets { subcommand } => handle_secrets(subcommand).await,
+            MainArgs::Shim { subcommand } => handle_shim(subcommand).await,
+            MainArgs::Config { subcommand } => handle_config(subcommand).await,
         }
-    };
-    let elapsed = start.elapsed();
-
-    tracing::debug!(
-        "LLM response in {:?}: decision={} risk={} reason={}",
-        elapsed,
-        decision.decision,
-        decision.risk,
-        decision.reason
-    );
-
-    if decision.is_approve() {
-        // Silent on approve; log only when risk is notable (>= 4)
-        if decision.risk >= 4 {
-            log_to_file(
-                config.log_file.as_deref(),
-                &format!(
-                    "APPROVED risk={} cmd={} reason={}",
-                    decision.risk, remote_cmd, decision.reason
-                ),
-            );
-        }
-
-        let exit_code = ssh::exec_ssh(&config.ssh_bin, &cli.ssh_args, config.redact).await?;
-        process::exit(exit_code);
     } else {
-        log_to_file(
-            config.log_file.as_deref(),
-            &format!(
-                "DENIED risk={} cmd={} reason={}",
-                decision.risk, remote_cmd, decision.reason
-            ),
-        );
-        eprintln!(
-            "ssh-guard: DENIED (risk={}) - {}",
-            decision.risk, decision.reason
-        );
-        process::exit(1);
+        run_direct(args).await
     }
 }
 
-/// Append a timestamped line to the log file, if configured.
-fn log_to_file(log_path: Option<&str>, message: &str) {
-    let Some(path) = log_path else { return };
-
-    let timestamp = chrono_lite_now();
-    let line = format!("[{}] {}\n", timestamp, message);
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
+async fn run_direct(args: Vec<String>) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!("Usage: ssh-guard <host> <command> [args...]");
     }
-}
 
-/// Simple ISO 8601-ish timestamp without pulling in chrono.
-fn chrono_lite_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
-    // Convert to a rough UTC timestamp string
-    // Good enough for logging; not worth adding chrono as a dependency
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Approximate year/month/day from days since epoch (1970-01-01)
-    // Simple calculation, accurate enough for log timestamps
-    let mut y = 1970i64;
-    let mut remaining_days = days as i64;
-    loop {
-        let days_in_year = if is_leap_year(y) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        y += 1;
-    }
-    let days_in_months: [i64; 12] = if is_leap_year(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    let target = &args[0];
+    let command = if args.len() > 1 {
+        args[1..].join(" ")
     } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 0usize;
-    for (i, &dim) in days_in_months.iter().enumerate() {
-        if remaining_days < dim {
-            m = i;
-            break;
-        }
-        remaining_days -= dim;
-    }
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m + 1,
-        remaining_days + 1,
-        hours,
-        minutes,
-        seconds
-    )
-}
-
-fn is_leap_year(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn setup_logging(cli: &Cli) -> Result<()> {
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let level = if cli.quiet {
-        "error"
-    } else {
-        match cli.verbose {
-            0 => "warn",
-            1 => "info",
-            2 => "debug",
-            _ => "trace",
-        }
+        String::new()
     };
 
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| {
-            let env_val = std::env::var("SSH_GUARD_LOG_LEVEL")
-                .or_else(|_| std::env::var("LOG_LEVEL"))
-                .unwrap_or_else(|_| level.to_string());
-            EnvFilter::try_new(env_val)
-        })
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let auth_token = std::env::var("SSH_GUARD_AUTH_TOKEN")
+        .ok()
+        .or(config.auth_token.clone());
 
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .init();
+    let user = std::env::var("USER").ok().or(config.default_user);
+
+    let resp = if let Some(ref socket) = config.server_socket {
+        let socket_path = PathBuf::from(socket);
+        if socket_path.exists() || std::env::var("SSH_GUARD_FORCE_LOCAL").is_err() {
+            let client = server::Client::new(Some(socket_path), config.server_tcp_port);
+            client
+                .execute_with_auth(target, &command, user.as_deref(), auth_token.as_deref())
+                .await?
+        } else {
+            return Err(anyhow::anyhow!(
+                "socket not found and SSH_GUARD_FORCE_LOCAL not set"
+            ));
+        }
+    } else if let Some(port) = config.server_tcp_port {
+        let client = server::Client::new(None, Some(port));
+        client
+            .execute_with_auth(target, &command, user.as_deref(), auth_token.as_deref())
+            .await?
+    } else {
+        anyhow::bail!("No server configured. Use 'ssh-guard config set-server <path>' or 'ssh-guard config set-port <port>'");
+    };
+
+    if !resp.allowed {
+        eprintln!("DENIED: {}", resp.reason);
+        std::process::exit(1);
+    }
+
+    if let Some(code) = resp.exit_code {
+        std::process::exit(code);
+    }
 
     Ok(())
+}
+
+async fn run_server(cmd: ServerCommands) -> Result<()> {
+    match cmd {
+        ServerCommands::Start {
+            socket,
+            tcp_port,
+            ssh_bin,
+            identity_key,
+            auth_token,
+            socket_group,
+            users,
+        } => {
+            tracing::info!("Starting ssh-guard server...");
+            let socket_path = socket.map(PathBuf::from);
+            let ssh_binary = ssh_bin.unwrap_or_else(|| "/usr/bin/ssh".to_string());
+            tracing::info!("SSH binary: {}", ssh_binary);
+
+            let allowed_uids: Option<Vec<u32>> =
+                users.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+            tracing::info!("Allowed UIDs: {:?}", allowed_uids);
+
+            tracing::info!("Loading policy...");
+            let policy = policy::PolicyEngine::load_default().context("Failed to load policy")?;
+            tracing::info!("Policy loaded successfully");
+
+            tracing::info!("Initializing secret backend...");
+            let backend = secrets::detect_backend()
+                .build()
+                .context("Failed to create secret backend")?;
+            let secrets = secrets::SecretManager::new(backend);
+            tracing::info!("Secret backend ready");
+
+            let redact = std::env::var("SSH_GUARD_REDACT")
+                .map(|v| v != "false")
+                .unwrap_or(true);
+
+            tracing::info!("Creating server instance...");
+            let srv = server::Server::new(
+                socket_path,
+                tcp_port,
+                policy,
+                secrets,
+                ssh_binary,
+                redact,
+                identity_key,
+                auth_token,
+                socket_group,
+                allowed_uids,
+            );
+            srv.run().await
+        }
+        ServerCommands::Connect {
+            socket,
+            tcp_port,
+            token,
+            target,
+            command,
+        } => {
+            let socket_path = socket.map(PathBuf::from);
+            let client = server::Client::new(socket_path, tcp_port);
+
+            let user = std::env::var("USER").ok();
+            let cmd_str = command.join(" ");
+
+            let resp = client
+                .execute_with_auth(&target, &cmd_str, user.as_deref(), token.as_deref())
+                .await?;
+
+            if resp.allowed {
+                if let Some(code) = resp.exit_code {
+                    std::process::exit(code);
+                }
+                Ok(())
+            } else {
+                eprintln!("DENIED: {}", resp.reason);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn run_connect(target: String, command: Vec<String>) -> Result<()> {
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let cmd_str = command.join(" ");
+
+    let user = std::env::var("USER").ok();
+
+    if let Some(ref socket) = config.server_socket {
+        let socket_path = PathBuf::from(socket);
+        let client = server::Client::new(Some(socket_path.clone()), config.server_tcp_port);
+        let resp = client
+            .execute_with_auth(
+                &target,
+                &cmd_str,
+                user.as_deref(),
+                config.auth_token.as_deref(),
+            )
+            .await?;
+
+        if resp.allowed {
+            if let Some(code) = resp.exit_code {
+                std::process::exit(code);
+            }
+            Ok(())
+        } else {
+            eprintln!("DENIED: {}", resp.reason);
+            std::process::exit(1);
+        }
+    } else if let Some(port) = config.server_tcp_port {
+        let client = server::Client::new(None, Some(port));
+        let resp = client
+            .execute_with_auth(
+                &target,
+                &cmd_str,
+                user.as_deref(),
+                config.auth_token.as_deref(),
+            )
+            .await?;
+
+        if resp.allowed {
+            if let Some(code) = resp.exit_code {
+                std::process::exit(code);
+            }
+            Ok(())
+        } else {
+            eprintln!("DENIED: {}", resp.reason);
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!("No server configured");
+        std::process::exit(1);
+    }
+}
+
+async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
+    match subcommand {
+        ConfigCommands::Show => {
+            let config = client_config::ClientConfig::load().unwrap_or_default();
+            println!("socket: {:?}", config.server_socket.unwrap_or_default());
+            println!(
+                "port: {:?}",
+                config
+                    .server_tcp_port
+                    .map(|p| p.to_string())
+                    .unwrap_or_default()
+            );
+            println!("user: {:?}", config.default_user.unwrap_or_default());
+            println!(
+                "token: {}",
+                if config.auth_token.is_some() {
+                    "***"
+                } else {
+                    "(none)"
+                }
+            );
+        }
+        ConfigCommands::SetServer { socket } => {
+            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            config.server_socket = Some(socket);
+            config.server_tcp_port = None;
+            config.save()?;
+            println!("Server socket set");
+        }
+        ConfigCommands::SetPort { port } => {
+            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            config.server_tcp_port = Some(port);
+            config.server_socket = None;
+            config.save()?;
+            println!("Server port set");
+        }
+        ConfigCommands::SetToken { token } => {
+            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            config.auth_token = Some(token);
+            config.save()?;
+            println!("Token set");
+        }
+        ConfigCommands::SetUser { user } => {
+            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            config.default_user = Some(user);
+            config.save()?;
+            println!("Default user set");
+        }
+        ConfigCommands::Clear => {
+            let config = client_config::ClientConfig::default();
+            config.save()?;
+            println!("Configuration cleared");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
+    let backend = secrets::detect_backend()
+        .build()
+        .context("Failed to create secret backend")?;
+
+    match subcommand {
+        SecretCommands::Add { key, value } => {
+            let secret_value = if let Some(v) = value {
+                v
+            } else {
+                rpassword::prompt_password("Secret value: ")?
+            };
+            backend.set(&key, &secret_value).await?;
+            println!("Secret '{}' stored", key);
+            Ok(())
+        }
+        SecretCommands::List => {
+            let keys = backend.list().await?;
+            if keys.is_empty() {
+                println!("No secrets stored");
+            } else {
+                for key in keys {
+                    println!("  - {}", key);
+                }
+            }
+            Ok(())
+        }
+        SecretCommands::Remove { key } => {
+            backend.delete(&key).await?;
+            println!("Secret '{}' removed", key);
+            Ok(())
+        }
+    }
+}
+
+async fn handle_shim(subcommand: ShimCommands) -> Result<()> {
+    let shim_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".guard/shims");
+
+    match subcommand {
+        ShimCommands::Install { path, tools } => {
+            let target_dir = path.unwrap_or(shim_dir);
+            let tools_to_install =
+                tools.unwrap_or_else(|| vec!["ssh".to_string(), "scp".to_string()]);
+            let generator = shim::ShimGenerator::with_defaults()?;
+            let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
+            generator.generate(&tools_refs)?;
+            println!("Installed shims to: {}", target_dir.display());
+            Ok(())
+        }
+        ShimCommands::Remove { path } => {
+            let target_dir = path.unwrap_or(shim_dir);
+            let generator = shim::ShimGenerator::new(std::env::current_exe()?, target_dir);
+            generator.remove_all()?;
+            println!("Removed shims");
+            Ok(())
+        }
+        ShimCommands::List { path } => {
+            let target_dir = path.unwrap_or(shim_dir);
+            let generator = shim::ShimGenerator::new(std::env::current_exe()?, target_dir);
+            let installed = generator.list_installed()?;
+            if installed.is_empty() {
+                println!("No shims installed");
+            } else {
+                for shim in installed {
+                    println!("  - {}", shim);
+                }
+            }
+            Ok(())
+        }
+    }
 }

@@ -1,0 +1,274 @@
+openapi: 3.0.0
+info:
+  title: Model Guard API
+  description: |
+    API specification for Model Guard - A secure middleware for language model interactions.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+components:
+  schemas:
+    Message:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+      required:
+        - role
+        - content
+
+    ModelRequest:
+      type: object
+      properties:
+        model:
+          type: string
+          description: Model identifier or "auto" for automatic selection
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 2
+        max_tokens:
+          type: integer
+          minimum: 1
+        stream:
+          type: boolean
+      required:
+        - model
+        - messages
+
+    ModelResponse:
+      type: object
+      properties:
+        content:
+          type: string
+        model:
+          type: string
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    StreamChunk:
+      type: object
+      properties:
+        content:
+          type: string
+        finish_reason:
+          type: string
+          enum: [stop, length, content_filter]
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        details:
+          type: object
+
+    ValidationRule:
+      type: object
+      properties:
+        name:
+          type: string
+        rule_type:
+          type: string
+          enum: [length, format, schema, classifier, custom]
+        parameters:
+          type: object
+        severity:
+          type: string
+          enum: [error, warning, info]
+
+    SecurityEvent:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        event_type:
+          type: string
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        details:
+          type: object
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /v1/completions:
+    post:
+      summary: Create a model completion
+      description: Send a request to a language model and get a completion
+      operationId: createCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelRequest'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/completions/stream:
+    post:
+      summary: Create a streaming model completion
+      description: Send a request and get a streaming response
+      operationId: createStreamingCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelRequest'
+      responses:
+        '200':
+          description: Successful streaming response
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/StreamChunk'
+
+  /v1/validation/rules:
+    get:
+      summary: List validation rules
+      description: Get all configured validation rules
+      operationId: listValidationRules
+      responses:
+        '200':
+          description: List of validation rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ValidationRule'
+
+    post:
+      summary: Add validation rule
+      description: Add a new validation rule
+      operationId: addValidationRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidationRule'
+      responses:
+        '201':
+          description: Rule created successfully
+
+  /v1/security/events:
+    get:
+      summary: List security events
+      description: Get security events with optional filtering
+      operationId: listSecurityEvents
+      parameters:
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [low, medium, high, critical]
+        - name: start_time
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: end_time
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: List of security events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SecurityEvent'
+
+  /v1/metrics:
+    get:
+      summary: Get metrics
+      description: Get system metrics in Prometheus format
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics in Prometheus format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /health:
+    get:
+      summary: Health check
+      description: Check system health status
+      operationId: getHealth
+      responses:
+        '200':
+          description: System is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  version:
+                    type: string
+                  uptime:
+                    type: number
