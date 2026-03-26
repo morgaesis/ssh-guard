@@ -1,0 +1,44 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: Rust formatting
+        description: Check if all files are formatted correctly.
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: Rust linting
+        description: Run clippy on all targets.
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: Rust tests
+        description: Run cargo test.
+        entry: cargo test
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-audit
+        name: Security audit
+        description: Audit Cargo.lock for known security vulnerabilities.
+        entry: cargo audit
+        language: system
+        files: Cargo\.(toml|lock)
+        pass_filenames: false
