@@ -39,6 +39,10 @@ pub struct ExecuteResponse {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
 }
 
 #[derive(Clone)]
@@ -381,6 +385,8 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
                     allowed: false,
                     reason: format!("invalid request: {}", e),
                     exit_code: None,
+                    stdout: None,
+                    stderr: None,
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -396,6 +402,8 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
                 allowed: false,
                 reason: "invalid auth token".to_string(),
                 exit_code: None,
+                stdout: None,
+                stderr: None,
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -419,6 +427,8 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
             allowed: result.allowed,
             reason: result.reason,
             exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
         };
         writer
             .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -441,6 +451,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     allowed: false,
                     reason: format!("invalid request: {}", e),
                     exit_code: None,
+                    stdout: None,
+                    stderr: None,
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -455,6 +467,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 allowed: false,
                 reason: "invalid auth token".to_string(),
                 exit_code: None,
+                stdout: None,
+                stderr: None,
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -478,6 +492,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
             allowed: result.allowed,
             reason: result.reason,
             exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
         };
         writer
             .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -492,6 +508,8 @@ struct ExecuteResult {
     allowed: bool,
     reason: String,
     exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
 }
 
 async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Result<ExecuteResult> {
@@ -508,6 +526,8 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
             allowed: false,
             reason: policy_result.reason,
             exit_code: None,
+            stdout: None,
+            stderr: None,
         });
     }
 
@@ -548,94 +568,79 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
     let is_localhost =
         request.target == "localhost" || request.target == "127.0.0.1" || request.target == "::1";
 
-    let exit_code = if is_localhost {
+    let (exit_code, stdout, stderr) = if is_localhost {
         tracing::info!("Executing locally: {}", request.command);
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&request.command);
-        if !config.redact {
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-            let status = cmd.status().await?;
-            status.code()
+
+        let output = tokio::process::Command::new("sh")
+            .args(["-c", &request.command])
+            .output()
+            .await
+            .context("failed to execute command")?;
+
+        let stdout = if output.stdout.is_empty() {
+            None
         } else {
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            let mut child = cmd.spawn()?;
+            let s = String::from_utf8_lossy(&output.stdout).to_string();
+            if config.redact {
+                Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
+            } else {
+                Some(s)
+            }
+        };
 
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
+        let stderr = if output.stderr.is_empty() {
+            None
+        } else {
+            let s = String::from_utf8_lossy(&output.stderr).to_string();
+            if config.redact {
+                Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
+            } else {
+                Some(s)
+            }
+        };
 
-            let stdout_task = tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let redacted = redact_output(&line);
-                    println!("{}", redacted);
-                }
-            });
-
-            let stderr_task = tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let redacted = redact_output(&line);
-                    eprintln!("{}", redacted);
-                }
-            });
-
-            let status = child.wait().await?;
-            let _ = tokio::join!(stdout_task, stderr_task);
-            status.code()
-        }
+        (output.status.code(), stdout, stderr)
     } else {
         tracing::info!("Executing SSH: {} {:?}", config.ssh_bin, ssh_args);
 
-        if config.redact {
-            let mut child = Command::new(&config.ssh_bin)
-                .args(&ssh_args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
+        let output = tokio::process::Command::new(&config.ssh_bin)
+            .args(&ssh_args)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .context("failed to execute SSH command")?;
 
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
-
-            let stdout_task = tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let redacted = redact_output(&line);
-                    println!("{}", redacted);
-                }
-            });
-
-            let stderr_task = tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let redacted = redact_output(&line);
-                    eprintln!("{}", redacted);
-                }
-            });
-
-            let status = child.wait().await?;
-            let _ = tokio::join!(stdout_task, stderr_task);
-            status.code()
+        let stdout = if output.stdout.is_empty() {
+            None
         } else {
-            let status = Command::new(&config.ssh_bin)
-                .args(&ssh_args)
-                .stdin(Stdio::null())
-                .status()
-                .await?;
-            status.code()
-        }
+            let s = String::from_utf8_lossy(&output.stdout).to_string();
+            if config.redact {
+                Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
+            } else {
+                Some(s)
+            }
+        };
+
+        let stderr = if output.stderr.is_empty() {
+            None
+        } else {
+            let s = String::from_utf8_lossy(&output.stderr).to_string();
+            if config.redact {
+                Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
+            } else {
+                Some(s)
+            }
+        };
+
+        (output.status.code(), stdout, stderr)
     };
 
     Ok(ExecuteResult {
         allowed: true,
         reason: policy_result.reason,
         exit_code,
+        stdout,
+        stderr,
     })
 }
 

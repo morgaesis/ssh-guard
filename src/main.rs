@@ -218,6 +218,18 @@ async fn run_direct(args: Vec<String>) -> Result<()> {
         std::process::exit(1);
     }
 
+    if let Some(stdout) = &resp.stdout {
+        if !stdout.is_empty() {
+            println!("{}", stdout);
+        }
+    }
+
+    if let Some(stderr) = &resp.stderr {
+        if !stderr.is_empty() {
+            eprintln!("{}", stderr);
+        }
+    }
+
     if let Some(code) = resp.exit_code {
         std::process::exit(code);
     }
