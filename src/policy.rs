@@ -258,9 +258,9 @@ impl PolicyEngine {
             }
         }
 
-        // 3. Check policy group rules
+        // 3. Check policy group rules (sorted by priority, highest first)
         let mut sorted_groups = self.groups.clone();
-        sorted_groups.sort_by_key(|g| g.priority);
+        sorted_groups.sort_by_key(|g| std::cmp::Reverse(g.priority));
 
         for group in &sorted_groups {
             for rule in &group.rules {
@@ -456,10 +456,14 @@ fn pattern_matches(
 ) -> bool {
     // If the pattern has no wildcards, it should match as a prefix of the command
     if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
-        // Match as prefix: "ssh" matches "ssh", "ssh user@host", "ssh-agent"
-        return full_cmd.starts_with(pattern)
-            || cmd_with_first_arg.starts_with(pattern)
-            || cmd_only.starts_with(pattern)
+        // Match as prefix with boundary: "ssh" matches "ssh" or "ssh user@host"
+        // but NOT "ssh-agent" or "github" (different commands)
+        let matches_prefix = |s: &str| -> bool {
+            s == pattern || (s.starts_with(pattern) && s[pattern.len()..].starts_with(' '))
+        };
+        return matches_prefix(full_cmd)
+            || matches_prefix(cmd_with_first_arg)
+            || matches_prefix(cmd_only)
             || match_glob(pattern, full_cmd)
             || match_glob(pattern, cmd_with_first_arg)
             || match_glob(pattern, cmd_only);
