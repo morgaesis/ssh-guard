@@ -129,6 +129,7 @@ impl ServerConfig {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct Server {
     config: ServerConfig,
 }
@@ -259,72 +260,6 @@ impl Server {
         }
     }
 
-    async fn run_unix(&self, socket_path: &PathBuf) -> Result<()> {
-        if let Some(parent) = socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("failed to create socket directory")?;
-        }
-
-        if socket_path.exists() {
-            tokio::fs::remove_file(socket_path).await?;
-        }
-
-        let listener = UnixListener::bind(socket_path).context("failed to bind UNIX socket")?;
-
-        tracing::info!("ssh-guard server listening on {}", socket_path.display());
-
-        if let Some(ref group) = self.config.socket_group {
-            Self::chown_to_group(socket_path, group).await?;
-            if let Some(parent) = socket_path.parent() {
-                Self::chmod_dir(parent, 0o750).await?;
-            }
-        }
-
-        loop {
-            match listener.accept().await {
-                Ok((stream, _peer_addr)) => {
-                    let config = self.config.clone();
-
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client_unix(stream, &config).await {
-                            tracing::error!("client handler error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("accept error: {}", e);
-                }
-            }
-        }
-    }
-
-    async fn run_tcp(&self, port: u16) -> Result<()> {
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .context("failed to bind TCP socket")?;
-
-        tracing::info!("ssh-guard server listening on tcp://{}", addr);
-
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let config = self.config.clone();
-
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client_tcp(stream, &config).await {
-                            tracing::error!("client handler error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("accept error: {}", e);
-                }
-            }
-        }
-    }
-
     async fn chown_to_group(path: &PathBuf, group: &str) -> Result<()> {
         let output = Command::new("chgrp").arg(group).arg(path).output().await?;
 
@@ -357,13 +292,9 @@ impl Server {
     }
 }
 
-fn get_peer_uid(_stream: &UnixStream) -> Option<u32> {
-    None
-}
-
 async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result<()> {
     tracing::info!("handle_client_unix: new connection");
-    let uid = get_peer_uid(&stream).unwrap_or(0);
+    let uid = 0;
     tracing::info!("handle_client_unix: peer uid = {}", uid);
 
     if let Err(e) = config.validate_uid(uid) {

@@ -17,7 +17,7 @@ echo "  commit message: ok"
 # Rust checks (if Cargo.toml exists)
 if [[ -f "Cargo.toml" ]]; then
   echo "  cargo fmt..."
-  cargo fmt --all -- --check || {
+  cargo fmt --all -- --check 2>/dev/null || {
     echo "BLOCKED: cargo fmt found formatting issues"
     exit 1
   }
