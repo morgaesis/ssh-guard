@@ -470,7 +470,7 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
         .identity_key
         .as_ref()
         .or(config.identity_key.as_ref());
-    let _identity_fd = if let Some(ref key_name) = identity_key {
+    let _identity_fd = if let Some(key_name) = identity_key {
         let fd = config
             .secrets
             .inject_fd(key_name)
