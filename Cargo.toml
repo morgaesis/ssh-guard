@@ -7,6 +7,14 @@ authors = ["Mörgæsis <morgaesis+git@morgaes.is>"]
 license = "MIT"
 repository = "https://github.com/morgaesis/ssh-guard"
 
+[lib]
+name = "ssh_guard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ssh-guard"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
