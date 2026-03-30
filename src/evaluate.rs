@@ -343,10 +343,16 @@ impl Evaluator {
 
         let output = tokio::process::Command::new("curl")
             .args([
-                "-s", "-X", "POST", &api_url,
-                "-H", &format!("Authorization: Bearer {}", api_key),
-                "-H", "Content-Type: application/json",
-                "-d", &body_str,
+                "-s",
+                "-X",
+                "POST",
+                &api_url,
+                "-H",
+                &format!("Authorization: Bearer {}", api_key),
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body_str,
             ])
             .output()
             .await;
