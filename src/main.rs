@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
     }
 
     let result = MainArgs::try_parse_from(std::env::args());
-    
+
     match result {
         Ok(MainArgs::Run {
             identity,
@@ -177,10 +177,18 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim(subcommand)) => handle_shim(subcommand).await,
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
-        Err(ref e) if e.kind() == clap::error::ErrorKind::InvalidSubcommand 
-                    || e.kind() == clap::error::ErrorKind::UnknownArgument => {
+        Err(ref e)
+            if e.kind() == clap::error::ErrorKind::InvalidSubcommand
+                || e.kind() == clap::error::ErrorKind::UnknownArgument =>
+        {
             if let Some(run_args) = parse_as_run(&args) {
-                run_connect(run_args.identity, run_args.user, run_args.target, run_args.command).await
+                run_connect(
+                    run_args.identity,
+                    run_args.user,
+                    run_args.target,
+                    run_args.command,
+                )
+                .await
             } else {
                 eprintln!("{}", e);
                 std::process::exit(1);
@@ -204,13 +212,13 @@ fn parse_as_run(args: &[String]) -> Option<RunArgs> {
     if args.is_empty() {
         return None;
     }
-    
+
     let mut identity = None;
     let mut user = None;
     let mut target = None;
     let mut command = Vec::new();
     let mut collecting_command = false;
-    
+
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         if collecting_command {
@@ -230,12 +238,12 @@ fn parse_as_run(args: &[String]) -> Option<RunArgs> {
             break;
         }
     }
-    
+
     let target = target?;
     if command.is_empty() {
         return None;
     }
-    
+
     Some(RunArgs {
         identity,
         user,
@@ -262,20 +270,18 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_llm,
         } => {
             tracing::info!("Starting ssh-guard server...");
-            
+
             let socket_path = socket
                 .map(PathBuf::from)
                 .or_else(|| {
                     let config = client_config::ClientConfig::load().ok()?;
                     config.server_socket.map(PathBuf::from)
                 })
-                .or_else(|| {
-                    dirs::home_dir().map(|h| h.join(".guard").join("guard.sock"))
-                });
-            
+                .or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("guard.sock")));
+
             let ssh_binary = ssh_bin.unwrap_or_else(|| "/usr/bin/ssh".to_string());
             tracing::info!("SSH binary: {}", ssh_binary);
-            
+
             if let Some(ref path) = socket_path {
                 tracing::info!("Socket: {}", path.display());
             }
@@ -285,8 +291,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             tracing::info!("Allowed UIDs: {:?}", allowed_uids);
 
             tracing::info!("Loading policy...");
-            let policy =
-                policy::PolicyEngine::load_default().context("Failed to load policy")?;
+            let policy = policy::PolicyEngine::load_default().context("Failed to load policy")?;
             tracing::info!("Policy loaded successfully");
 
             tracing::info!("Initializing secret backend...");
@@ -364,12 +369,7 @@ async fn run_connect(
         let socket_path = PathBuf::from(socket);
         let client = server::Client::new(Some(socket_path.clone()), config.server_tcp_port);
         let resp = client
-            .execute_with_options(
-                &target,
-                &cmd_str,
-                user.as_deref(),
-                identity.as_deref(),
-            )
+            .execute_with_options(&target, &cmd_str, user.as_deref(), identity.as_deref())
             .await?;
 
         if resp.allowed {
@@ -387,12 +387,7 @@ async fn run_connect(
     } else if let Some(port) = config.server_tcp_port {
         let client = server::Client::new(None, Some(port));
         let resp = client
-            .execute_with_options(
-                &target,
-                &cmd_str,
-                user.as_deref(),
-                identity.as_deref(),
-            )
+            .execute_with_options(&target, &cmd_str, user.as_deref(), identity.as_deref())
             .await?;
 
         if resp.allowed {
