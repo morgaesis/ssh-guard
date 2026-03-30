@@ -1,6 +1,5 @@
 use crate::policy::PolicyEngine;
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
