@@ -30,6 +30,8 @@ pub struct ExecuteRequest {
     pub command: String,
     pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
 }
 
@@ -464,7 +466,8 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
 
     let mut ssh_args = vec![];
 
-    let _identity_fd = if let Some(ref key_name) = config.identity_key {
+    let identity_key = request.identity_key.as_ref().or(config.identity_key.as_ref());
+    let _identity_fd = if let Some(ref key_name) = identity_key {
         let fd = config
             .secrets
             .inject_fd(key_name)
@@ -601,10 +604,22 @@ impl Client {
         command: &str,
         user: Option<&str>,
     ) -> Result<ExecuteResponse> {
+        self.execute_with_options(target, command, user, None).await
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        target: &str,
+        command: &str,
+        user: Option<&str>,
+        identity_key: Option<&str>,
+    ) -> Result<ExecuteResponse> {
         if let Some(ref socket_path) = self.socket_path {
-            self.execute_unix(socket_path, target, command, user).await
+            self.execute_unix(socket_path, target, command, user, identity_key)
+                .await
         } else if let Some(port) = self.tcp_port {
-            self.execute_tcp(port, target, command, user).await
+            self.execute_tcp(port, target, command, user, identity_key)
+                .await
         } else {
             anyhow::bail!("no socket path or TCP port configured");
         }
@@ -616,6 +631,7 @@ impl Client {
         target: &str,
         command: &str,
         user: Option<&str>,
+        identity_key: Option<&str>,
     ) -> Result<ExecuteResponse> {
         let stream = UnixStream::connect(socket_path)
             .await
@@ -627,6 +643,7 @@ impl Client {
             target: target.to_string(),
             command: command.to_string(),
             user: user.map(String::from),
+            identity_key: identity_key.map(String::from),
             auth_token: self.auth_token.clone(),
         };
 
@@ -654,6 +671,7 @@ impl Client {
         target: &str,
         command: &str,
         user: Option<&str>,
+        identity_key: Option<&str>,
     ) -> Result<ExecuteResponse> {
         let addr = format!("127.0.0.1:{}", port);
         let stream = tokio::net::TcpStream::connect(&addr)
@@ -666,6 +684,7 @@ impl Client {
             target: target.to_string(),
             command: command.to_string(),
             user: user.map(String::from),
+            identity_key: identity_key.map(String::from),
             auth_token: self.auth_token.clone(),
         };
 
