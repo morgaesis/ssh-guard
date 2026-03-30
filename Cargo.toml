@@ -1,6 +1,6 @@
 [package]
 name = "ssh-guard"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "SSH wrapper that sends commands to an LLM for approval before execution"
 authors = ["Mörgæsis <morgaesis+git@morgaes.is>"]
