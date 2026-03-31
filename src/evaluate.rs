@@ -276,43 +276,34 @@ impl Evaluator {
     }
 
     pub async fn evaluate(&self, command: &str, host: &str) -> EvalResult {
-        if self.has_static_policy() {
-            return self.evaluate_static(command);
+        if let Some(ref engine) = self.policy_engine {
+            let static_result = engine.check(command);
+            if static_result.is_denied() {
+                tracing::debug!("static policy denied: {}", static_result.reason);
+                return EvalResult::Deny {
+                    reason: static_result.reason,
+                    source: EvalSource::StaticPolicy,
+                };
+            }
         }
 
         if self.llm_config.enabled {
             return self.evaluate_llm(command, host).await;
         }
 
+        if let Some(ref engine) = self.policy_engine {
+            let static_result = engine.check(command);
+            if static_result.is_allowed() {
+                return EvalResult::Allow {
+                    reason: static_result.reason,
+                    source: EvalSource::StaticPolicy,
+                };
+            }
+        }
+
         EvalResult::Deny {
             reason: "no policy and LLM disabled: default-deny".to_string(),
             source: EvalSource::StaticPolicy,
-        }
-    }
-
-    fn evaluate_static(&self, command: &str) -> EvalResult {
-        let engine = match &self.policy_engine {
-            Some(e) => e,
-            None => {
-                return EvalResult::Deny {
-                    reason: "no static policy configured".to_string(),
-                    source: EvalSource::StaticPolicy,
-                }
-            }
-        };
-
-        let result = engine.check(command);
-
-        if result.is_allowed() {
-            EvalResult::Allow {
-                reason: result.reason,
-                source: EvalSource::StaticPolicy,
-            }
-        } else {
-            EvalResult::Deny {
-                reason: result.reason,
-                source: EvalSource::StaticPolicy,
-            }
         }
     }
 

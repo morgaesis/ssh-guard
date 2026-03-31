@@ -9,7 +9,7 @@
 //! - Socket dir: 0750 (only owner + group can access)
 //! - Socket: 0770 (owner + group read/write)
 
-use crate::policy::PolicyEngine;
+use crate::evaluate::Evaluator;
 use crate::redact::redact_output;
 use crate::secrets::SecretManager;
 use anyhow::{bail, Context, Result};
@@ -51,7 +51,7 @@ pub struct ExecuteResponse {
 pub struct ServerConfig {
     pub socket_path: Option<PathBuf>,
     pub tcp_port: Option<u16>,
-    pub policy: Arc<PolicyEngine>,
+    pub evaluator: Arc<Evaluator>,
     pub secrets: Arc<SecretManager>,
     pub ssh_bin: String,
     pub redact: bool,
@@ -66,7 +66,7 @@ impl ServerConfig {
     pub fn new(
         socket_path: Option<PathBuf>,
         tcp_port: Option<u16>,
-        policy: PolicyEngine,
+        evaluator: Evaluator,
         secrets: SecretManager,
         ssh_bin: String,
         redact: bool,
@@ -78,7 +78,7 @@ impl ServerConfig {
         Self {
             socket_path,
             tcp_port,
-            policy: Arc::new(policy),
+            evaluator: Arc::new(evaluator),
             secrets: Arc::new(secrets),
             ssh_bin,
             redact,
@@ -141,7 +141,7 @@ impl Server {
     pub fn new(
         socket_path: Option<PathBuf>,
         tcp_port: Option<u16>,
-        policy: PolicyEngine,
+        evaluator: Evaluator,
         secrets: SecretManager,
         ssh_bin: String,
         redact: bool,
@@ -153,7 +153,7 @@ impl Server {
         let config = ServerConfig {
             socket_path,
             tcp_port,
-            policy: Arc::new(policy),
+            evaluator: Arc::new(evaluator),
             secrets: Arc::new(secrets),
             ssh_bin,
             redact,
@@ -446,23 +446,36 @@ struct ExecuteResult {
 }
 
 async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Result<ExecuteResult> {
-    let cmd_parts =
-        shell_words::split(&request.command).unwrap_or_else(|_| vec![request.command.clone()]);
+    let eval_result = config
+        .evaluator
+        .evaluate(&request.command, &request.target)
+        .await;
 
-    let cmd_name = cmd_parts.first().map(|s| s.as_str()).unwrap_or("");
-    let args = &cmd_parts[1..];
-
-    let policy_result = config.policy.check_command(cmd_name, args);
-
-    if policy_result.is_denied() {
-        return Ok(ExecuteResult {
-            allowed: false,
-            reason: policy_result.reason,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-        });
-    }
+    let allow_reason = match eval_result {
+        crate::evaluate::EvalResult::Deny { reason, .. } => {
+            return Ok(ExecuteResult {
+                allowed: false,
+                reason,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+            });
+        }
+        crate::evaluate::EvalResult::Error(e) => {
+            tracing::error!("evaluation error: {}", e);
+            return Ok(ExecuteResult {
+                allowed: false,
+                reason: format!("evaluation error: {}", e),
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+            });
+        }
+        crate::evaluate::EvalResult::Allow { reason, .. } => {
+            tracing::debug!("command allowed: {}", reason);
+            reason
+        }
+    };
 
     let mut ssh_args = vec![];
 
@@ -574,7 +587,7 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
 
     Ok(ExecuteResult {
         allowed: true,
-        reason: policy_result.reason,
+        reason: allow_reason,
         exit_code,
         stdout,
         stderr,

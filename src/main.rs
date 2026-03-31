@@ -3,13 +3,13 @@
 #![allow(unused)]
 
 mod client_config;
-mod evaluate;
-mod policy;
 mod redact;
 mod secrets;
 mod server;
 mod shim;
 mod ssh;
+
+use ssh_guard::evaluate;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -290,9 +290,34 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 users.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
             tracing::info!("Allowed UIDs: {:?}", allowed_uids);
 
-            tracing::info!("Loading policy...");
-            let policy = policy::PolicyEngine::load_default().context("Failed to load policy")?;
-            tracing::info!("Policy loaded successfully");
+            let llm_enabled = !no_llm;
+            if no_llm {
+                tracing::info!("LLM evaluation disabled (static policy only)");
+            }
+
+            let api_key = llm_api_key
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .or_else(|| std::env::var("SSH_GUARD_API_KEY").ok());
+
+            if llm_enabled && api_key.is_none() {
+                tracing::warn!("No LLM API key provided (set OPENROUTER_API_KEY or --llm-api-key)");
+            }
+
+            let eval_config = evaluate::EvalConfig::default()
+                .llm_enabled(llm_enabled)
+                .llm_api_key(api_key.unwrap_or_default())
+                .llm_api_url(llm_api_url.unwrap_or_default())
+                .llm_model(llm_model.unwrap_or_default())
+                .llm_timeout_secs(llm_timeout.unwrap_or(30));
+
+            if let Some(ref policy_path) = policy {
+                tracing::info!("Loading static policy from: {}", policy_path);
+            }
+
+            tracing::info!("Creating evaluator...");
+            let evaluator =
+                evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
+            tracing::info!("Evaluator created successfully");
 
             tracing::info!("Initializing secret backend...");
             let backend = secrets::detect_backend()
@@ -309,7 +334,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             let srv = server::Server::new(
                 socket_path,
                 tcp_port,
-                policy,
+                evaluator,
                 secrets,
                 ssh_binary,
                 redact,
