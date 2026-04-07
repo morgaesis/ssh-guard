@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 mod client_config;
+mod mcp;
 mod redact;
 mod secrets;
 mod server;
@@ -41,6 +42,9 @@ enum MainArgs {
     /// Manage client configuration
     #[clap(subcommand)]
     Config(ConfigCommands),
+    /// Expose ssh-guard as an MCP server over stdio
+    #[clap(subcommand)]
+    Mcp(McpCommands),
 }
 
 fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool {
@@ -139,6 +143,27 @@ enum ConfigCommands {
 }
 
 #[derive(Subcommand)]
+enum McpCommands {
+    /// Start a stdio MCP server backed by the configured ssh-guard daemon
+    Serve {
+        #[arg(long)]
+        socket: Option<String>,
+
+        #[arg(long)]
+        tcp_port: Option<u16>,
+
+        #[arg(long)]
+        token: Option<String>,
+
+        #[arg(long)]
+        user: Option<String>,
+
+        #[arg(long, default_value = "ssh_guard_run")]
+        tool_name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ShimCommands {
     Install {
         #[arg(long)]
@@ -196,6 +221,7 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim(subcommand)) => handle_shim(subcommand).await,
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
+        Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::InvalidSubcommand
                 || e.kind() == clap::error::ErrorKind::UnknownArgument =>
@@ -568,6 +594,34 @@ async fn run_connect(
     } else {
         eprintln!("No server configured");
         std::process::exit(1);
+    }
+}
+
+async fn run_mcp(subcommand: McpCommands) -> Result<()> {
+    match subcommand {
+        McpCommands::Serve {
+            socket,
+            tcp_port,
+            token,
+            user,
+            tool_name,
+        } => {
+            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+            let socket_path = socket.or(config.server_socket).map(PathBuf::from);
+            let tcp_port = tcp_port.or(config.server_tcp_port);
+            let auth_token = token.or(config.auth_token);
+            let default_user = user.or(config.default_user);
+
+            let mcp_config = mcp::McpConfig {
+                socket_path,
+                tcp_port,
+                auth_token,
+                default_user,
+                tool_name,
+            };
+
+            mcp::serve(mcp_config).await
+        }
     }
 }
 

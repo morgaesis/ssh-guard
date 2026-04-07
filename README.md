@@ -99,6 +99,43 @@ See [`.env.example`](.env.example) for a copyable template.
 
 Point your agent's SSH command at `ssh-guard` instead of `ssh`.
 
+## MCP server
+
+`ssh-guard` can also run as a stdio MCP server so agents call a tool instead of shelling out to the CLI directly.
+
+```bash
+# Reuse the existing guard daemon configuration
+ssh-guard config set-server ~/.guard/guard.sock
+
+# Start MCP over stdio
+ssh-guard mcp serve
+```
+
+The server exposes one tool, `ssh_guard_run`, with this input shape:
+
+```json
+{
+  "target": "prod-server",
+  "command": "journalctl -u nginx --no-pager -n 50",
+  "user": "deploy",
+  "identity_key": "prod_deploy_key"
+}
+```
+
+The tool returns structured fields matching the existing guard response:
+
+```json
+{
+  "allowed": true,
+  "reason": "Allowed by policy",
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": null
+}
+```
+
+If the guard daemon denies a command, the MCP tool returns `isError: true` with the denial reason, so the agent can revise the command instead of guessing from process exit codes.
+
 <details>
 <summary><b>Claude Code (CLAUDE.md)</b></summary>
 

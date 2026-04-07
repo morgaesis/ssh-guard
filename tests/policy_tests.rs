@@ -3,9 +3,11 @@ use ssh_guard::policy::PolicyEngine;
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
-    command: String,
+    #[serde(rename = "command")]
+    _command: String,
     expect: String,
-    desc: String,
+    #[serde(rename = "desc")]
+    _desc: String,
 }
 
 fn load_tests() -> Vec<TestCase> {
