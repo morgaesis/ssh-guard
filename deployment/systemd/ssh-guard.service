@@ -1,0 +1,24 @@
+[Unit]
+Description=ssh-guard server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ssh-guard
+Group=ssh-guard
+WorkingDirectory=/var/lib/ssh-guard
+EnvironmentFile=-/etc/default/ssh-guard
+RuntimeDirectory=ssh-guard
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/bin/ssh-guard server start --socket /run/ssh-guard/ssh-guard.sock --users 1000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/ssh-guard /var/lib/ssh-guard
+
+[Install]
+WantedBy=multi-user.target

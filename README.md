@@ -25,12 +25,12 @@ ssh-guard sits between the agent and SSH. Every command gets evaluated by a fast
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/morgaesis/ssh-guard/main/install.sh | bash
+cargo install --path .
 ```
 
-Or build from source: `cargo install --path .`
+Or download a release artifact and install the binary manually.
 
-See [INSTALL.md](INSTALL.md) for all options (manual download, specific versions, provider setup, agent integration).
+See [INSTALL.md](INSTALL.md) for install options and [DEPLOYMENT.md](DEPLOYMENT.md) for service deployment.
 
 ## Quick start
 
