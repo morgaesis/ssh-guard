@@ -4,16 +4,17 @@
 //! Each request is evaluated against the policy engine before execution.
 //!
 //! Security model:
-//! - UNIX socket: group-based access control (socket group = ssh-guard)
+//! - UNIX socket: peer UID-based authorization
 //! - TCP socket: auth token required
-//! - Socket dir: 0750 (only owner + group can access)
-//! - Socket: 0770 (owner + group read/write)
+//! - Socket dir: 0755 when managed by socket_group
+//! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
 use crate::redact::redact_output;
 use crate::secrets::SecretManager;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -208,13 +209,14 @@ impl Server {
         }
 
         let listener = UnixListener::bind(socket_path).context("failed to bind UNIX socket")?;
+        Self::chmod_path(socket_path, 0o666).await?;
 
         tracing::info!("ssh-guard server listening on {}", socket_path.display());
 
         if let Some(ref group) = config.socket_group {
             Self::chown_to_group(socket_path, group).await?;
             if let Some(parent) = socket_path.parent() {
-                Self::chmod_dir(parent, 0o750).await?;
+                Self::chmod_path(parent, 0o755).await?;
             }
         }
 
@@ -276,27 +278,20 @@ impl Server {
         Ok(())
     }
 
-    async fn chmod_dir(path: &std::path::Path, mode: u32) -> Result<()> {
-        let output = Command::new("chmod")
-            .arg(format!("{:o}", mode))
-            .arg(path)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            bail!(
-                "failed to chmod {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    async fn chmod_path(path: &std::path::Path, mode: u32) -> Result<()> {
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to chmod {} to {:o}", path.display(), mode))?;
         Ok(())
     }
 }
 
 async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result<()> {
     tracing::info!("handle_client_unix: new connection");
-    let uid = 0;
+    let uid = stream
+        .peer_cred()
+        .context("failed to read peer credentials")?
+        .uid();
     tracing::info!("handle_client_unix: peer uid = {}", uid);
 
     if let Err(e) = config.validate_uid(uid) {

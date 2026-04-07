@@ -13,6 +13,7 @@ use ssh_guard::evaluate;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ssh_guard::policy::PolicyMode;
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -303,15 +304,34 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::warn!("No LLM API key provided (set OPENROUTER_API_KEY or --llm-api-key)");
             }
 
-            let eval_config = evaluate::EvalConfig::default()
+            let mut eval_config = evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
-                .llm_api_key(api_key.unwrap_or_default())
-                .llm_api_url(llm_api_url.unwrap_or_default())
-                .llm_model(llm_model.unwrap_or_default())
                 .llm_timeout_secs(llm_timeout.unwrap_or(30));
+
+            if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
+                eval_config = eval_config.llm_api_key(api_key);
+            }
+
+            if let Some(api_url) = llm_api_url.filter(|value| !value.is_empty()) {
+                eval_config = eval_config.llm_api_url(api_url);
+            }
+
+            if let Some(model) = llm_model.filter(|value| !value.is_empty()) {
+                eval_config = eval_config.llm_model(model);
+            }
+
+            let mode = std::env::var("SSH_GUARD_MODE")
+                .ok()
+                .and_then(|value| PolicyMode::parse(&value));
+
+            if let Some(mode) = mode {
+                tracing::info!("Using built-in {} policy mode", mode.as_str());
+                eval_config = eval_config.mode(mode);
+            }
 
             if let Some(ref policy_path) = policy {
                 tracing::info!("Loading static policy from: {}", policy_path);
+                eval_config = eval_config.policy_path(PathBuf::from(policy_path));
             }
 
             tracing::info!("Creating evaluator...");

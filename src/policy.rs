@@ -7,6 +7,33 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Built-in operating modes for the policy engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyMode {
+    Readonly,
+    Paranoid,
+    Safe,
+}
+
+impl PolicyMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "readonly" => Some(Self::Readonly),
+            "paranoid" => Some(Self::Paranoid),
+            "safe" => Some(Self::Safe),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::Paranoid => "paranoid",
+            Self::Safe => "safe",
+        }
+    }
+}
+
 /// The authorization decision for a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -182,6 +209,185 @@ impl PolicyEngine {
         // Return a permissive default policy
         tracing::info!("No policy file found, using permissive default");
         Ok(Self::new())
+    }
+
+    /// Build one of the documented built-in modes.
+    pub fn from_mode(mode: PolicyMode) -> Self {
+        let mut engine = Self::new();
+
+        let common_allow = [
+            "ls*",
+            "stat*",
+            "find *",
+            "pwd*",
+            "whoami*",
+            "id*",
+            "hostname*",
+            "uname*",
+            "date*",
+            "uptime*",
+            "ps*",
+            "df*",
+            "du*",
+            "free*",
+            "mount*",
+            "ss*",
+            "netstat*",
+            "ip addr*",
+            "ip route*",
+            "ip link*",
+            "iptables -L*",
+        ];
+
+        for pattern in common_allow {
+            engine = engine.add_allow(pattern);
+        }
+
+        let readonly_allow = [
+            "cat /etc/hosts*",
+            "cat /etc/passwd*",
+            "kubectl get*",
+            "kubectl describe*",
+            "kubectl top*",
+            "kubectl logs*",
+            "kubectl exec*",
+            "docker ps*",
+            "docker inspect*",
+            "crictl ps*",
+            "crictl inspect*",
+            "journalctl*",
+            "systemctl status*",
+            "grep*",
+            "sed -n*",
+            "head*",
+            "tail*",
+        ];
+
+        let safe_allow = [
+            "touch *",
+            "mkdir *",
+            "cp *",
+            "mv *",
+            "rm *",
+            "chmod *",
+            "chown *",
+            "systemctl restart*",
+            "systemctl reload*",
+            "systemctl start*",
+            "systemctl stop*",
+            "apt *",
+            "apt-get *",
+            "dnf *",
+            "yum *",
+            "apk *",
+            "kubectl apply*",
+            "kubectl rollout*",
+            "kubectl scale*",
+            "kubectl patch*",
+            "kubectl delete pod*",
+            "kubectl delete job*",
+        ];
+
+        let common_deny = [
+            "sudo su*",
+            "sudo -i*",
+            "su root*",
+            "rm -rf /",
+            "rm -rf /*",
+            "dd *",
+            "mkfs*",
+            "curl * | bash*",
+            "wget * | sh*",
+            ":(){:|:&};:*",
+            "reboot*",
+            "shutdown*",
+            "poweroff*",
+            "init 0*",
+            "init 6*",
+            "halt*",
+            "systemctl mask ssh*",
+            "systemctl stop ssh*",
+            "iptables -F*",
+            "ufw disable*",
+            "kubectl delete namespace*",
+            "kubectl drain*",
+        ];
+
+        for pattern in common_deny {
+            engine = engine.add_deny(pattern);
+        }
+
+        match mode {
+            PolicyMode::Readonly => {
+                for pattern in readonly_allow {
+                    engine = engine.add_allow(pattern);
+                }
+
+                let readonly_deny = [
+                    "systemctl *",
+                    "service *",
+                    "kubectl apply*",
+                    "kubectl patch*",
+                    "kubectl edit*",
+                    "kubectl delete*",
+                    "kubectl exec*rm*",
+                    "docker exec*rm*",
+                ];
+
+                for pattern in readonly_deny {
+                    engine = engine.add_deny(pattern);
+                }
+            }
+            PolicyMode::Paranoid => {
+                let paranoid_deny = [
+                    "cat *",
+                    "grep *",
+                    "sed *",
+                    "awk *",
+                    "head *",
+                    "tail *",
+                    "less*",
+                    "more*",
+                    "strings *",
+                    "env*",
+                    "printenv*",
+                    "export*",
+                    "set*",
+                    "journalctl*",
+                    "kubectl*",
+                    "docker*",
+                    "crictl*",
+                ];
+
+                for pattern in paranoid_deny {
+                    engine = engine.add_deny(pattern);
+                }
+            }
+            PolicyMode::Safe => {
+                for pattern in readonly_allow {
+                    engine = engine.add_allow(pattern);
+                }
+
+                for pattern in safe_allow {
+                    engine = engine.add_allow(pattern);
+                }
+
+                let safe_deny = [
+                    "rm -rf /etc*",
+                    "rm -rf /var/lib*",
+                    "rm -rf /usr*",
+                    "kubectl delete node*",
+                    "kubectl delete namespace*",
+                    "kubectl delete pvc*",
+                ];
+
+                for pattern in safe_deny {
+                    engine = engine.add_deny(pattern);
+                }
+            }
+        }
+
+        engine
     }
 
     /// Build a PolicyEngine from a PolicyDefinitions struct.
@@ -841,6 +1047,33 @@ policy:
         assert_eq!(engine.allow_list(), &["ssh", "kubectl"]);
         assert_eq!(engine.deny_list(), &["kubectl exec", "rm -rf /*"]);
         assert_eq!(engine.group_count(), 0);
+    }
+
+    #[test]
+    fn test_policy_mode_parse() {
+        assert_eq!(PolicyMode::parse("readonly"), Some(PolicyMode::Readonly));
+        assert_eq!(PolicyMode::parse("Paranoid"), Some(PolicyMode::Paranoid));
+        assert_eq!(PolicyMode::parse("SAFE"), Some(PolicyMode::Safe));
+        assert_eq!(PolicyMode::parse("invalid"), None);
+    }
+
+    #[test]
+    fn test_builtin_paranoid_mode() {
+        let engine = PolicyEngine::from_mode(PolicyMode::Paranoid);
+
+        assert!(engine.check("ls -la /").is_allowed());
+        assert!(engine.check("cat /etc/passwd").is_denied());
+        assert!(engine.check("env").is_denied());
+        assert!(engine.check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s").is_denied());
+    }
+
+    #[test]
+    fn test_builtin_readonly_mode() {
+        let engine = PolicyEngine::from_mode(PolicyMode::Readonly);
+
+        assert!(engine.check("ls -la /").is_allowed());
+        assert!(engine.check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s").is_allowed());
+        assert!(engine.check("systemctl restart ssh").is_denied());
     }
 
     #[test]

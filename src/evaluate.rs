@@ -1,4 +1,4 @@
-use crate::policy::PolicyEngine;
+use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ impl LlmConfig {
 #[derive(Debug, Clone, Default)]
 pub struct EvalConfig {
     pub policy_path: Option<PathBuf>,
+    pub mode: Option<PolicyMode>,
     pub llm: LlmConfig,
 }
 
@@ -90,6 +91,11 @@ impl EvalConfig {
 
     pub fn llm_enabled(mut self, enabled: bool) -> Self {
         self.llm.enabled = enabled;
+        self
+    }
+
+    pub fn mode(mut self, mode: PolicyMode) -> Self {
+        self.mode = Some(mode);
         self
     }
 
@@ -185,6 +191,8 @@ impl Evaluator {
                 bail!("policy file does not exist: {}", path.display());
             }
             Some(PolicyEngine::load_file(path).context("failed to load policy file")?)
+        } else if let Some(mode) = config.mode {
+            Some(PolicyEngine::from_mode(mode))
         } else {
             None
         };
