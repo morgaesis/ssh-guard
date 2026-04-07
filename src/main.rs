@@ -12,7 +12,7 @@ mod ssh;
 use ssh_guard::evaluate;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use ssh_guard::policy::PolicyMode;
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -83,7 +83,17 @@ enum ServerCommands {
         #[arg(long)]
         llm_timeout: Option<u64>,
 
-        #[arg(long)]
+        #[arg(
+            long,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_llm"
+        )]
+        llm: Option<bool>,
+
+        #[arg(long = "no-llm", action = ArgAction::SetTrue, overrides_with = "llm")]
         no_llm: bool,
     },
     /// Connect to ssh-guard server
@@ -268,6 +278,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm_api_url,
             llm_model,
             llm_timeout,
+            llm,
             no_llm,
         } => {
             tracing::info!("Starting ssh-guard server...");
@@ -291,8 +302,12 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 users.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
             tracing::info!("Allowed UIDs: {:?}", allowed_uids);
 
-            let llm_enabled = !no_llm;
-            if no_llm {
+            let llm_enabled = if no_llm {
+                false
+            } else {
+                llm.unwrap_or(true)
+            };
+            if !llm_enabled {
                 tracing::info!("LLM evaluation disabled (static policy only)");
             }
 
@@ -392,6 +407,79 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_start(args: &[&str]) -> ServerCommands {
+        match MainArgs::parse_from(args) {
+            MainArgs::Server(ServerCommands::Start {
+                socket,
+                tcp_port,
+                ssh_bin,
+                identity_key,
+                auth_token,
+                socket_group,
+                users,
+                policy,
+                llm_api_key,
+                llm_api_url,
+                llm_model,
+                llm_timeout,
+                llm,
+                no_llm,
+            }) => ServerCommands::Start {
+                socket,
+                tcp_port,
+                ssh_bin,
+                identity_key,
+                auth_token,
+                socket_group,
+                users,
+                policy,
+                llm_api_key,
+                llm_api_url,
+                llm_model,
+                llm_timeout,
+                llm,
+                no_llm,
+            },
+            _ => panic!("expected server start args"),
+        }
+    }
+
+    fn resolved_llm(args: &[&str]) -> bool {
+        let ServerCommands::Start { llm, no_llm, .. } = parse_start(args) else {
+            panic!("expected start");
+        };
+
+        if no_llm {
+            false
+        } else {
+            llm.unwrap_or(true)
+        }
+    }
+
+    #[test]
+    fn test_server_start_llm_defaults_true() {
+        assert!(resolved_llm(&["ssh-guard", "server", "start"]));
+    }
+
+    #[test]
+    fn test_server_start_llm_positive_forms() {
+        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm"]));
+        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm=true"]));
+        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm", "true"]));
+    }
+
+    #[test]
+    fn test_server_start_llm_negative_forms() {
+        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--no-llm"]));
+        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--llm=false"]));
+        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--llm", "false"]));
     }
 }
 
