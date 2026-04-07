@@ -1064,7 +1064,9 @@ policy:
         assert!(engine.check("ls -la /").is_allowed());
         assert!(engine.check("cat /etc/passwd").is_denied());
         assert!(engine.check("env").is_denied());
-        assert!(engine.check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s").is_denied());
+        assert!(engine
+            .check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s")
+            .is_denied());
     }
 
     #[test]
@@ -1072,7 +1074,9 @@ policy:
         let engine = PolicyEngine::from_mode(PolicyMode::Readonly);
 
         assert!(engine.check("ls -la /").is_allowed());
-        assert!(engine.check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s").is_allowed());
+        assert!(engine
+            .check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s")
+            .is_allowed());
         assert!(engine.check("systemctl restart ssh").is_denied());
     }
 

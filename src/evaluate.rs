@@ -191,10 +191,8 @@ impl Evaluator {
                 bail!("policy file does not exist: {}", path.display());
             }
             Some(PolicyEngine::load_file(path).context("failed to load policy file")?)
-        } else if let Some(mode) = config.mode {
-            Some(PolicyEngine::from_mode(mode))
         } else {
-            None
+            config.mode.map(PolicyEngine::from_mode)
         };
 
         let http_client = Client::builder()

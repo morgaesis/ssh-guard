@@ -471,15 +471,37 @@ mod tests {
     #[test]
     fn test_server_start_llm_positive_forms() {
         assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm"]));
-        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm=true"]));
-        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm", "true"]));
+        assert!(resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm=true"
+        ]));
+        assert!(resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm",
+            "true"
+        ]));
     }
 
     #[test]
     fn test_server_start_llm_negative_forms() {
         assert!(!resolved_llm(&["ssh-guard", "server", "start", "--no-llm"]));
-        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--llm=false"]));
-        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--llm", "false"]));
+        assert!(!resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm=false"
+        ]));
+        assert!(!resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm",
+            "false"
+        ]));
     }
 
     #[test]
