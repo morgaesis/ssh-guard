@@ -43,6 +43,14 @@ enum MainArgs {
     Config(ConfigCommands),
 }
 
+fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool {
+    if negated {
+        false
+    } else {
+        value.unwrap_or(default)
+    }
+}
+
 #[derive(Subcommand)]
 enum ServerCommands {
     /// Start the ssh-guard server (privileged daemon)
@@ -302,11 +310,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 users.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
             tracing::info!("Allowed UIDs: {:?}", allowed_uids);
 
-            let llm_enabled = if no_llm {
-                false
-            } else {
-                llm.unwrap_or(true)
-            };
+            let llm_enabled = resolve_bool_flag(llm, no_llm, true);
             if !llm_enabled {
                 tracing::info!("LLM evaluation disabled (static policy only)");
             }
@@ -456,11 +460,7 @@ mod tests {
             panic!("expected start");
         };
 
-        if no_llm {
-            false
-        } else {
-            llm.unwrap_or(true)
-        }
+        resolve_bool_flag(llm, no_llm, true)
     }
 
     #[test]
@@ -480,6 +480,14 @@ mod tests {
         assert!(!resolved_llm(&["ssh-guard", "server", "start", "--no-llm"]));
         assert!(!resolved_llm(&["ssh-guard", "server", "start", "--llm=false"]));
         assert!(!resolved_llm(&["ssh-guard", "server", "start", "--llm", "false"]));
+    }
+
+    #[test]
+    fn test_resolve_bool_flag() {
+        assert!(resolve_bool_flag(None, false, true));
+        assert!(!resolve_bool_flag(None, true, true));
+        assert!(resolve_bool_flag(Some(true), false, false));
+        assert!(!resolve_bool_flag(Some(false), false, true));
     }
 }
 
