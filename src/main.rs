@@ -440,105 +440,6 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_start(args: &[&str]) -> ServerCommands {
-        match MainArgs::parse_from(args) {
-            MainArgs::Server(ServerCommands::Start {
-                socket,
-                tcp_port,
-                ssh_bin,
-                identity_key,
-                auth_token,
-                socket_group,
-                users,
-                policy,
-                llm_api_key,
-                llm_api_url,
-                llm_model,
-                llm_timeout,
-                llm,
-                no_llm,
-            }) => ServerCommands::Start {
-                socket,
-                tcp_port,
-                ssh_bin,
-                identity_key,
-                auth_token,
-                socket_group,
-                users,
-                policy,
-                llm_api_key,
-                llm_api_url,
-                llm_model,
-                llm_timeout,
-                llm,
-                no_llm,
-            },
-            _ => panic!("expected server start args"),
-        }
-    }
-
-    fn resolved_llm(args: &[&str]) -> bool {
-        let ServerCommands::Start { llm, no_llm, .. } = parse_start(args) else {
-            panic!("expected start");
-        };
-
-        resolve_bool_flag(llm, no_llm, true)
-    }
-
-    #[test]
-    fn test_server_start_llm_defaults_true() {
-        assert!(resolved_llm(&["ssh-guard", "server", "start"]));
-    }
-
-    #[test]
-    fn test_server_start_llm_positive_forms() {
-        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm"]));
-        assert!(resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm=true"
-        ]));
-        assert!(resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm",
-            "true"
-        ]));
-    }
-
-    #[test]
-    fn test_server_start_llm_negative_forms() {
-        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--no-llm"]));
-        assert!(!resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm=false"
-        ]));
-        assert!(!resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm",
-            "false"
-        ]));
-    }
-
-    #[test]
-    fn test_resolve_bool_flag() {
-        assert!(resolve_bool_flag(None, false, true));
-        assert!(!resolve_bool_flag(None, true, true));
-        assert!(resolve_bool_flag(Some(true), false, false));
-        assert!(!resolve_bool_flag(Some(false), false, true));
-    }
-}
-
 async fn run_connect(
     identity: Option<String>,
     user: Option<String>,
@@ -753,5 +654,104 @@ async fn handle_shim(subcommand: ShimCommands) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_start(args: &[&str]) -> ServerCommands {
+        match MainArgs::parse_from(args) {
+            MainArgs::Server(ServerCommands::Start {
+                socket,
+                tcp_port,
+                ssh_bin,
+                identity_key,
+                auth_token,
+                socket_group,
+                users,
+                policy,
+                llm_api_key,
+                llm_api_url,
+                llm_model,
+                llm_timeout,
+                llm,
+                no_llm,
+            }) => ServerCommands::Start {
+                socket,
+                tcp_port,
+                ssh_bin,
+                identity_key,
+                auth_token,
+                socket_group,
+                users,
+                policy,
+                llm_api_key,
+                llm_api_url,
+                llm_model,
+                llm_timeout,
+                llm,
+                no_llm,
+            },
+            _ => panic!("expected server start args"),
+        }
+    }
+
+    fn resolved_llm(args: &[&str]) -> bool {
+        let ServerCommands::Start { llm, no_llm, .. } = parse_start(args) else {
+            panic!("expected start");
+        };
+
+        resolve_bool_flag(llm, no_llm, true)
+    }
+
+    #[test]
+    fn test_server_start_llm_defaults_true() {
+        assert!(resolved_llm(&["ssh-guard", "server", "start"]));
+    }
+
+    #[test]
+    fn test_server_start_llm_positive_forms() {
+        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm"]));
+        assert!(resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm=true"
+        ]));
+        assert!(resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm",
+            "true"
+        ]));
+    }
+
+    #[test]
+    fn test_server_start_llm_negative_forms() {
+        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--no-llm"]));
+        assert!(!resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm=false"
+        ]));
+        assert!(!resolved_llm(&[
+            "ssh-guard",
+            "server",
+            "start",
+            "--llm",
+            "false"
+        ]));
+    }
+
+    #[test]
+    fn test_resolve_bool_flag() {
+        assert!(resolve_bool_flag(None, false, true));
+        assert!(!resolve_bool_flag(None, true, true));
+        assert!(resolve_bool_flag(Some(true), false, false));
+        assert!(!resolve_bool_flag(Some(false), false, true));
     }
 }

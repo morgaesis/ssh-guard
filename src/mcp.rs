@@ -265,13 +265,8 @@ impl<E: GuardExecutor> McpServer<E> {
     }
 
     fn handle_notification(&mut self, method: &str, _params: Value) {
-        match method {
-            "notifications/initialized" => {
-                if !self.initialize_seen {
-                    tracing::warn!("received initialized notification before initialize request");
-                }
-            }
-            _ => {}
+        if method == "notifications/initialized" && !self.initialize_seen {
+            tracing::warn!("received initialized notification before initialize request");
         }
     }
 
