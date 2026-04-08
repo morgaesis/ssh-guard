@@ -185,13 +185,14 @@ impl Evaluator {
                 .with_context(|| format!("failed to read system prompt from {}", path.display()))?
         } else {
             // Try default config location
-            let default_path = dirs::config_dir()
-                .map(|d| d.join("guard").join("system-prompt.txt"));
+            let default_path =
+                dirs::config_dir().map(|d| d.join("guard").join("system-prompt.txt"));
             match default_path {
                 Some(p) if p.exists() => {
                     tracing::info!("Loading system prompt from {}", p.display());
-                    std::fs::read_to_string(&p)
-                        .with_context(|| format!("failed to read system prompt from {}", p.display()))?
+                    std::fs::read_to_string(&p).with_context(|| {
+                        format!("failed to read system prompt from {}", p.display())
+                    })?
                 }
                 _ => SYSTEM_PROMPT.to_string(),
             }
@@ -376,9 +377,18 @@ impl Evaluator {
         // Log token usage from the API response
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if let Some(usage) = parsed.get("usage") {
-                let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let prompt_tokens = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let completion_tokens = usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let total_tokens = usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 tracing::info!(
                     "[LLM_USAGE] model={} prompt_tokens={} completion_tokens={} total_tokens={}",
                     self.llm_config.model(),

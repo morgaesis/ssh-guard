@@ -628,9 +628,19 @@ async fn execute_command(
 
     // Allowlist: minimal set of env vars needed for child processes to function
     for var in &[
-        "PATH", "HOME", "USER", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
-        "TERM", "TZ", "SHELL", "LOGNAME", "XDG_RUNTIME_DIR",
-        "SSH_AUTH_SOCK",     // needed for SSH agent forwarding
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TZ",
+        "SHELL",
+        "LOGNAME",
+        "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK", // needed for SSH agent forwarding
     ] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);

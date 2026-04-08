@@ -907,8 +907,16 @@ policy:
         // Modes return empty engines. All patterns come from config files.
         for mode in [PolicyMode::Paranoid, PolicyMode::Readonly, PolicyMode::Safe] {
             let engine = PolicyEngine::from_mode(mode);
-            assert!(engine.allow_list().is_empty(), "{:?} should have no allows", mode);
-            assert!(engine.deny_list().is_empty(), "{:?} should have no denies", mode);
+            assert!(
+                engine.allow_list().is_empty(),
+                "{:?} should have no allows",
+                mode
+            );
+            assert!(
+                engine.deny_list().is_empty(),
+                "{:?} should have no denies",
+                mode
+            );
             // Everything goes to default-deny without config
             assert!(engine.check("ls -la /").is_denied());
         }
