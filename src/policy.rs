@@ -211,183 +211,28 @@ impl PolicyEngine {
         Ok(Self::new())
     }
 
-    /// Build one of the documented built-in modes.
-    pub fn from_mode(mode: PolicyMode) -> Self {
-        let mut engine = Self::new();
-
-        let common_allow = [
-            "ls*",
-            "stat*",
-            "find *",
-            "pwd*",
-            "whoami*",
-            "id*",
-            "hostname*",
-            "uname*",
-            "date*",
-            "uptime*",
-            "ps*",
-            "df*",
-            "du*",
-            "free*",
-            "mount*",
-            "ss*",
-            "netstat*",
-            "ip addr*",
-            "ip route*",
-            "ip link*",
-            "iptables -L*",
-        ];
-
-        for pattern in common_allow {
-            engine = engine.add_allow(pattern);
-        }
-
-        let readonly_allow = [
-            "cat /etc/hosts*",
-            "cat /etc/passwd*",
-            "kubectl get*",
-            "kubectl describe*",
-            "kubectl top*",
-            "kubectl logs*",
-            "kubectl exec*",
-            "docker ps*",
-            "docker inspect*",
-            "crictl ps*",
-            "crictl inspect*",
-            "journalctl*",
-            "systemctl status*",
-            "grep*",
-            "sed -n*",
-            "head*",
-            "tail*",
-        ];
-
-        let safe_allow = [
-            "touch *",
-            "mkdir *",
-            "cp *",
-            "mv *",
-            "rm *",
-            "chmod *",
-            "chown *",
-            "systemctl restart*",
-            "systemctl reload*",
-            "systemctl start*",
-            "systemctl stop*",
-            "apt *",
-            "apt-get *",
-            "dnf *",
-            "yum *",
-            "apk *",
-            "kubectl apply*",
-            "kubectl rollout*",
-            "kubectl scale*",
-            "kubectl patch*",
-            "kubectl delete pod*",
-            "kubectl delete job*",
-        ];
-
-        let common_deny = [
-            "sudo su*",
-            "sudo -i*",
-            "su root*",
-            "rm -rf /",
-            "rm -rf /*",
-            "dd *",
-            "mkfs*",
-            "curl * | bash*",
-            "wget * | sh*",
-            ":(){:|:&};:*",
-            "reboot*",
-            "shutdown*",
-            "poweroff*",
-            "init 0*",
-            "init 6*",
-            "halt*",
-            "systemctl mask ssh*",
-            "systemctl stop ssh*",
-            "iptables -F*",
-            "ufw disable*",
-            "kubectl delete namespace*",
-            "kubectl drain*",
-        ];
-
-        for pattern in common_deny {
-            engine = engine.add_deny(pattern);
-        }
-
-        match mode {
-            PolicyMode::Readonly => {
-                for pattern in readonly_allow {
-                    engine = engine.add_allow(pattern);
-                }
-
-                let readonly_deny = [
-                    "systemctl *",
-                    "service *",
-                    "kubectl apply*",
-                    "kubectl patch*",
-                    "kubectl edit*",
-                    "kubectl delete*",
-                    "kubectl exec*rm*",
-                    "docker exec*rm*",
-                ];
-
-                for pattern in readonly_deny {
-                    engine = engine.add_deny(pattern);
-                }
-            }
-            PolicyMode::Paranoid => {
-                let paranoid_deny = [
-                    "cat *",
-                    "grep *",
-                    "sed *",
-                    "awk *",
-                    "head *",
-                    "tail *",
-                    "less*",
-                    "more*",
-                    "strings *",
-                    "env*",
-                    "printenv*",
-                    "export*",
-                    "set*",
-                    "journalctl*",
-                    "kubectl*",
-                    "docker*",
-                    "crictl*",
-                ];
-
-                for pattern in paranoid_deny {
-                    engine = engine.add_deny(pattern);
-                }
-            }
-            PolicyMode::Safe => {
-                for pattern in readonly_allow {
-                    engine = engine.add_allow(pattern);
-                }
-
-                for pattern in safe_allow {
-                    engine = engine.add_allow(pattern);
-                }
-
-                let safe_deny = [
-                    "rm -rf /etc*",
-                    "rm -rf /var/lib*",
-                    "rm -rf /usr*",
-                    "kubectl delete node*",
-                    "kubectl delete namespace*",
-                    "kubectl delete pvc*",
-                ];
-
-                for pattern in safe_deny {
-                    engine = engine.add_deny(pattern);
-                }
-            }
-        }
-
-        engine
+    /// Build a policy engine for the given mode.
+    ///
+    /// Returns an empty engine. All patterns must be loaded from config files.
+    /// Use `load_file()` or `load_yaml()` with a policy YAML to add rules.
+    ///
+    /// ## Why no built-in patterns
+    ///
+    /// Static glob patterns match against flat command strings. They cannot:
+    /// - Parse shell operators: `ls; rm -rf /` is seen as command "ls;" with args,
+    ///   not two separate commands. The `rm -rf /` part is invisible to deny patterns.
+    /// - Understand quoting/escaping: `bash -c "rm -rf /"` is caught by `bash -c *`,
+    ///   but `bas''h -c "rm -rf /"` is not.
+    /// - Evaluate semantics: `find / -name shadow` is benign, `find / -exec cat {} \;`
+    ///   is not. Both start with `find`.
+    /// - Handle broad allow patterns safely: `head*` allows `head -1 /etc/shadow`,
+    ///   `ls*` allows `ls; rm -rf /` when chained.
+    ///
+    /// The LLM evaluator handles all these cases. If you need static policies,
+    /// load them from a config file and use DENY rules only.
+    /// See `examples/deny-policy.yaml` for a reference deny-list.
+    pub fn from_mode(_mode: PolicyMode) -> Self {
+        Self::new()
     }
 
     /// Build a PolicyEngine from a PolicyDefinitions struct.
@@ -1058,26 +903,15 @@ policy:
     }
 
     #[test]
-    fn test_builtin_paranoid_mode() {
-        let engine = PolicyEngine::from_mode(PolicyMode::Paranoid);
-
-        assert!(engine.check("ls -la /").is_allowed());
-        assert!(engine.check("cat /etc/passwd").is_denied());
-        assert!(engine.check("env").is_denied());
-        assert!(engine
-            .check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s")
-            .is_denied());
-    }
-
-    #[test]
-    fn test_builtin_readonly_mode() {
-        let engine = PolicyEngine::from_mode(PolicyMode::Readonly);
-
-        assert!(engine.check("ls -la /").is_allowed());
-        assert!(engine
-            .check("kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph -s")
-            .is_allowed());
-        assert!(engine.check("systemctl restart ssh").is_denied());
+    fn test_builtin_modes_are_empty() {
+        // Modes return empty engines. All patterns come from config files.
+        for mode in [PolicyMode::Paranoid, PolicyMode::Readonly, PolicyMode::Safe] {
+            let engine = PolicyEngine::from_mode(mode);
+            assert!(engine.allow_list().is_empty(), "{:?} should have no allows", mode);
+            assert!(engine.deny_list().is_empty(), "{:?} should have no denies", mode);
+            // Everything goes to default-deny without config
+            assert!(engine.check("ls -la /").is_denied());
+        }
     }
 
     #[test]

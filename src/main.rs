@@ -133,6 +133,14 @@ enum ServerCommands {
 
         #[arg(long = "no-llm", action = ArgAction::SetTrue, overrides_with = "llm")]
         no_llm: bool,
+
+        /// Disable output redaction (default: redaction enabled)
+        #[arg(long = "no-redact", action = ArgAction::SetTrue)]
+        no_redact: bool,
+
+        /// Path to custom system prompt file for the LLM evaluator
+        #[arg(long)]
+        system_prompt: Option<PathBuf>,
     },
     /// Connect to guard server and execute a command
     Connect {
@@ -269,6 +277,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm_timeout,
             llm,
             no_llm,
+            no_redact,
+            system_prompt,
         } => {
             tracing::info!("Starting guard server...");
 
@@ -338,6 +348,20 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.policy_path(PathBuf::from(policy_path));
             }
 
+            if let Some(ref prompt_path) = system_prompt {
+                tracing::info!("Loading system prompt from: {}", prompt_path.display());
+                eval_config = eval_config.system_prompt_path(prompt_path.clone());
+            }
+
+            // Collect known secret values for exact-match output redaction BEFORE
+            // moving eval_config into the evaluator.
+            let mut redact_secrets: Vec<String> = Vec::new();
+            if let Some(ref key) = eval_config.llm.api_key {
+                if !key.is_empty() {
+                    redact_secrets.push(key.clone());
+                }
+            }
+
             tracing::info!("Creating evaluator...");
             let evaluator =
                 evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
@@ -350,9 +374,9 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             let secrets = secrets::SecretManager::new(backend);
             tracing::info!("Secret backend ready");
 
-            let redact = std::env::var("SSH_GUARD_REDACT")
-                .map(|v| v != "false")
-                .unwrap_or(true);
+            // Redaction is server-side only, controlled by CLI flag.
+            // NOT readable from child env (prevents SSH_GUARD_REDACT=false bypass).
+            let redact = !no_redact;
 
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);
@@ -361,6 +385,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             let tool_count = tool_registry.list().count();
             if tool_count > 0 {
                 tracing::info!("Loaded {} tool config(s)", tool_count);
+            }
+            if let Some(ref token) = auth_token {
+                if !token.is_empty() {
+                    redact_secrets.push(token.clone());
+                }
             }
 
             tracing::info!("Creating server instance...");
@@ -375,6 +404,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 allowed_uids,
                 shim_dir,
                 tool_registry,
+                redact_secrets,
             );
             srv.run().await
         }
@@ -704,6 +734,8 @@ mod tests {
                 llm_timeout,
                 llm,
                 no_llm,
+                no_redact,
+                system_prompt,
             }) => ServerCommands::Start {
                 socket,
                 tcp_port,
@@ -718,6 +750,8 @@ mod tests {
                 llm_timeout,
                 llm,
                 no_llm,
+                no_redact,
+                system_prompt,
             },
             _ => panic!("expected server start args"),
         }

@@ -1,0 +1,106 @@
+# Example deny-only static policy for guard.
+#
+# Load with: guard serve --policy examples/deny-policy.yaml
+# Or place at: ~/.config/guard/policy.yaml
+#
+# IMPORTANT: Static glob patterns have significant limitations.
+# They match against flat command strings and cannot:
+#
+#   - Parse shell operators: "ls; rm -rf /" appears as one command starting
+#     with "ls;", so the "rm -rf /" part is invisible to deny patterns.
+#   - Understand quoting/escaping: "bas''h -c 'rm -rf /'" evades "bash -c *".
+#   - Evaluate semantics: "find / -name shadow" is benign but matches "find *"
+#     just like "find / -exec rm -rf {} \;".
+#
+# Use static policies only for DENY rules (fast-reject known-bad patterns).
+# Rely on the LLM evaluator for allow decisions.
+
+policy:
+  commands:
+    deny:
+      # Privilege escalation
+      - "sudo su*"
+      - "sudo -i*"
+      - "sudo -s*"
+      - "sudo bash*"
+      - "sudo /bin/bash*"
+      - "sudo /bin/sh*"
+      - "su root*"
+      - "su -*"
+      - "pkexec*"
+      - "doas*"
+
+      # Destructive operations
+      - "rm -rf /"
+      - "rm -rf /*"
+      - "dd *"
+      - "mkfs*"
+      - "shred *"
+      - "wipefs *"
+      - "sgdisk --zap*"
+
+      # Remote code execution / piping to shell
+      - "curl * | bash*"
+      - "wget * | sh*"
+      - "* | bash"
+      - "* | bash *"
+      - "* | sh"
+      - "* | sh *"
+      - "eval *"
+      - "bash -c *"
+      - "sh -c *"
+
+      # Language interpreter abuse
+      - "python -c *"
+      - "python3 -c *"
+      - "python2 -c *"
+      - "ruby -e *"
+      - "node -e *"
+      - "lua -e *"
+      - "php -r *"
+      - "perl -e *"
+
+      # Network tunneling / reverse shells
+      - "ssh -L*"
+      - "ssh -R*"
+      - "ssh -D*"
+      - "nc -e*"
+      - "nc * -e*"
+      - "ncat -e*"
+      - "bash -i*>*"
+
+      # System disruption
+      - ":(){:|:&};:*"
+      - "reboot*"
+      - "shutdown*"
+      - "poweroff*"
+      - "init 0*"
+      - "init 6*"
+      - "halt*"
+      - "kill -9 1"
+      - "killall*sshd*"
+      - "*sysrq*"
+      - "sysctl -w *"
+      - "chmod 000 /bin*"
+
+      # Service / firewall disruption
+      - "systemctl mask ssh*"
+      - "systemctl stop ssh*"
+      - "iptables -F*"
+      - "ufw disable*"
+
+      # Kubernetes destructive
+      - "kubectl delete namespace*"
+      - "kubectl drain*"
+
+      # Env exfiltration via procfs
+      - "cat /proc/*/environ*"
+      - "strings /proc/*/environ*"
+
+      # Find abuse
+      - "find * -exec*"
+      - "find * -delete*"
+
+      # Sensitive file access
+      - "* /etc/shadow*"
+      - "* /etc/sudoers*"

@@ -17,6 +17,25 @@ fn load_tests() -> Vec<TestCase> {
     tests
 }
 
+#[derive(Debug, Deserialize)]
+struct CtfScenario {
+    command: String,
+    category: String,
+    desc: String,
+    expect: String,
+}
+
+fn load_ctf_scenarios() -> Vec<CtfScenario> {
+    let yaml = include_str!("ctf_scenarios.yaml");
+    serde_yaml::from_str(yaml).expect("failed to parse ctf_scenarios.yaml")
+}
+
+/// Load the example deny policy from examples/deny-policy.yaml.
+fn load_deny_policy() -> PolicyEngine {
+    let yaml = include_str!("../examples/deny-policy.yaml");
+    PolicyEngine::load_yaml(yaml).expect("failed to parse deny-policy.yaml")
+}
+
 fn create_test_policy() -> PolicyEngine {
     PolicyEngine::new()
         .add_allow("whoami")
@@ -179,4 +198,99 @@ fn test_yaml_shadow_always_denied_by_static_policy() {
         "cat /etc/shadow should be denied even with pipe (static policy), got {:?}",
         result
     );
+}
+
+// === CTF scenario tests against example deny policy ===
+
+#[test]
+fn test_ctf_deny_policy() {
+    let engine = load_deny_policy();
+    let scenarios = load_ctf_scenarios();
+    let mut failures = Vec::new();
+
+    for scenario in &scenarios {
+        let result = engine.check(&scenario.command);
+        // "matched deny pattern: X" = explicit deny pattern match
+        // "default-deny: ..." = no pattern matched at all
+        let caught_by_deny = result.reason.contains("matched deny pattern");
+
+        match scenario.expect.as_str() {
+            "DENY" => {
+                if !caught_by_deny {
+                    failures.push(format!(
+                        "  [{}] {}: expected DENY (pattern match), got: {}\n    command: {}",
+                        scenario.category, scenario.desc, result.reason, scenario.command,
+                    ));
+                }
+            }
+            "PASS" => {
+                if caught_by_deny {
+                    failures.push(format!(
+                        "  [{}] {}: expected PASS (no deny match), but caught: {}\n    command: {}",
+                        scenario.category, scenario.desc, result.reason, scenario.command,
+                    ));
+                }
+            }
+            other => {
+                failures.push(format!(
+                    "  [{}] {}: unknown expect value: {}",
+                    scenario.category, scenario.desc, other,
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\nDeny policy test failures ({}/{}):\n{}",
+        failures.len(),
+        scenarios.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn test_ctf_scenarios_parsable() {
+    let scenarios = load_ctf_scenarios();
+    assert!(
+        scenarios.len() >= 55,
+        "should have at least 55 CTF scenarios, got {}",
+        scenarios.len()
+    );
+
+    let categories: std::collections::HashSet<_> =
+        scenarios.iter().map(|s| s.category.as_str()).collect();
+    assert!(
+        categories.len() >= 10,
+        "should have at least 10 categories, got {}",
+        categories.len()
+    );
+
+    for scenario in &scenarios {
+        assert!(
+            scenario.expect == "DENY" || scenario.expect == "PASS",
+            "scenario '{}' has invalid expect: {} (must be DENY or PASS)",
+            scenario.desc,
+            scenario.expect
+        );
+    }
+}
+
+#[test]
+fn test_empty_mode_engines_have_no_patterns() {
+    use ssh_guard::policy::PolicyMode;
+
+    for mode in [PolicyMode::Readonly, PolicyMode::Safe, PolicyMode::Paranoid] {
+        let engine = PolicyEngine::from_mode(mode);
+        assert!(
+            engine.allow_list().is_empty(),
+            "{:?} mode should have no allow patterns",
+            mode
+        );
+        assert!(
+            engine.deny_list().is_empty(),
+            "{:?} mode should have no deny patterns",
+            mode
+        );
+    }
 }

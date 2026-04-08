@@ -58,6 +58,18 @@ pub fn redact_output(text: &str) -> String {
     result
 }
 
+/// Redact exact secret values from output. This catches cases the regex patterns miss,
+/// like bare `env` output or `echo $VAR` where there's no `KEY=` prefix.
+pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
+    let mut result = text.to_string();
+    for secret in secrets {
+        if secret.len() >= 8 && !secret.is_empty() {
+            result = result.replace(*secret, "[REDACTED]");
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

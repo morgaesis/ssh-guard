@@ -10,7 +10,7 @@
 //! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
-use crate::redact::redact_output;
+use crate::redact::{redact_exact_secrets, redact_output};
 use crate::secrets::SecretManager;
 use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
@@ -99,6 +99,8 @@ pub struct ServerConfig {
     pub allowed_uids: Option<Vec<u32>>,
     pub shim_dir: Option<PathBuf>,
     pub tool_registry: Arc<RwLock<ToolRegistry>>,
+    /// Known secret values for exact-match output redaction.
+    pub redact_secrets: Vec<String>,
 }
 
 impl ServerConfig {
@@ -114,6 +116,7 @@ impl ServerConfig {
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
         tool_registry: ToolRegistry,
+        redact_secrets: Vec<String>,
     ) -> Self {
         Self {
             socket_path,
@@ -126,6 +129,7 @@ impl ServerConfig {
             allowed_uids,
             shim_dir,
             tool_registry: Arc::new(RwLock::new(tool_registry)),
+            redact_secrets,
         }
     }
 
@@ -195,19 +199,21 @@ impl Server {
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
         tool_registry: ToolRegistry,
+        redact_secrets: Vec<String>,
     ) -> Self {
-        let config = ServerConfig {
+        let config = ServerConfig::new(
             socket_path,
             tcp_port,
-            evaluator: Arc::new(evaluator),
-            secrets: Arc::new(secrets),
+            evaluator,
+            secrets,
             redact,
             auth_token,
             socket_group,
             allowed_uids,
             shim_dir,
-            tool_registry: Arc::new(RwLock::new(tool_registry)),
-        };
+            tool_registry,
+            redact_secrets,
+        );
         Self { config }
     }
 
@@ -615,6 +621,22 @@ async fn execute_command(
     cmd.args(&request.args);
     cmd.stdin(Stdio::null());
 
+    // SECURITY: Clear ALL inherited env vars. The child process gets only what we
+    // explicitly allow. This prevents leaking the guard's own secrets (API keys,
+    // auth tokens) via env, printenv, /proc/self/environ, or $VAR expansion.
+    cmd.env_clear();
+
+    // Allowlist: minimal set of env vars needed for child processes to function
+    for var in &[
+        "PATH", "HOME", "USER", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
+        "TERM", "TZ", "SHELL", "LOGNAME", "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK",     // needed for SSH agent forwarding
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
     // Inject server-side tool env/secrets (authoritative, cannot be overridden by clients)
     for (key, value) in &tool_env {
         cmd.env(key, value);
@@ -623,10 +645,10 @@ async fn execute_command(
     // Set recursion depth for nested shim evaluation
     cmd.env("GUARD_DEPTH", (depth + 1).to_string());
 
-    // Propagate shim directory in child PATH for nested evaluation
+    // Propagate shim directory in child PATH for nested evaluation (overrides inherited PATH)
     if let Some(ref shim_dir) = config.shim_dir {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{}", shim_dir.display(), current_path));
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{}", shim_dir.display(), base_path));
     }
 
     let output = cmd
@@ -634,13 +656,28 @@ async fn execute_command(
         .await
         .with_context(|| format!("failed to execute '{}'", request.binary))?;
 
+    // Build list of secret values for exact-match redaction
+    let secret_refs: Vec<&str> = config
+        .redact_secrets
+        .iter()
+        .map(|s| s.as_str())
+        .chain(tool_env.values().map(|s| s.as_str()))
+        .collect();
+
+    let redact_text = |s: String| -> String {
+        // First: exact-match redaction (catches bare secret values in output)
+        let s = redact_exact_secrets(&s, &secret_refs);
+        // Then: regex-based pattern redaction (catches KEY=value, PEM blocks, etc.)
+        s.lines().map(redact_output).collect::<Vec<_>>().join("\n")
+    };
+
     let stdout = if output.stdout.is_empty() {
         None
     } else {
         let raw = &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)];
         let s = String::from_utf8_lossy(raw).to_string();
         if config.redact {
-            Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
+            Some(redact_text(s))
         } else {
             Some(s)
         }
@@ -652,7 +689,7 @@ async fn execute_command(
         let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
         let s = String::from_utf8_lossy(raw).to_string();
         if config.redact {
-            Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
+            Some(redact_text(s))
         } else {
             Some(s)
         }
