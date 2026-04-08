@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 const JSONRPC_VERSION: &str = "2.0";
-const DEFAULT_TOOL_NAME: &str = "ssh_guard_run";
+const DEFAULT_TOOL_NAME: &str = "guard_run";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
 
 #[derive(Clone, Debug)]
@@ -16,14 +16,13 @@ pub struct McpConfig {
     pub socket_path: Option<PathBuf>,
     pub tcp_port: Option<u16>,
     pub auth_token: Option<String>,
-    pub default_user: Option<String>,
     pub tool_name: String,
 }
 
 impl McpConfig {
     pub fn validate(&self) -> Result<()> {
         if self.socket_path.is_none() && self.tcp_port.is_none() {
-            bail!("no ssh-guard server configured for MCP (set a socket or TCP port)");
+            bail!("no guard server configured for MCP (set a socket or TCP port)");
         }
 
         if self.tool_name.trim().is_empty() {
@@ -40,7 +39,6 @@ impl Default for McpConfig {
             socket_path: None,
             tcp_port: None,
             auth_token: None,
-            default_user: None,
             tool_name: DEFAULT_TOOL_NAME.to_string(),
         }
     }
@@ -48,12 +46,10 @@ impl Default for McpConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct GuardToolArgs {
-    target: String,
-    command: String,
+    binary: String,
+    args: Vec<String>,
     #[serde(default)]
-    user: Option<String>,
-    #[serde(default)]
-    identity_key: Option<String>,
+    env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,13 +83,11 @@ struct ClientExecutor {
     socket_path: Option<PathBuf>,
     tcp_port: Option<u16>,
     auth_token: Option<String>,
-    default_user: Option<String>,
 }
 
 #[async_trait]
 impl GuardExecutor for ClientExecutor {
     async fn execute(&self, args: GuardToolArgs) -> Result<GuardToolResponse> {
-        let user = args.user.or_else(|| self.default_user.clone());
         let client = if let Some(token) = &self.auth_token {
             server::Client::new(self.socket_path.clone(), self.tcp_port).with_auth(token.clone())
         } else {
@@ -101,14 +95,9 @@ impl GuardExecutor for ClientExecutor {
         };
 
         let response = client
-            .execute_with_options(
-                &args.target,
-                &args.command,
-                user.as_deref(),
-                args.identity_key.as_deref(),
-            )
+            .execute_with_env(&args.binary, &args.args, args.env)
             .await
-            .context("failed to execute command through ssh-guard server")?;
+            .context("failed to execute command through guard server")?;
 
         Ok(response.into())
     }
@@ -139,7 +128,6 @@ pub async fn serve(config: McpConfig) -> Result<()> {
         socket_path: config.socket_path.clone(),
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
-        default_user: config.default_user.clone(),
     });
     let mut server = McpServer::new(executor, config.tool_name);
 
@@ -285,13 +273,13 @@ impl<E: GuardExecutor> McpServer<E> {
                 }
             },
             "serverInfo": {
-                "name": "ssh-guard",
-                "title": "ssh-guard MCP",
+                "name": "guard",
+                "title": "guard MCP",
                 "version": env!("CARGO_PKG_VERSION"),
-                "description": "Expose ssh-guard command execution through MCP tools."
+                "description": "Policy-gated command execution through MCP tools."
             },
             "instructions": format!(
-                "Use the {} tool to execute a target command through the configured ssh-guard daemon. Denied commands are returned as tool errors so the model can revise them.",
+                "Use the {} tool to execute commands through the guard daemon. Commands are evaluated against security policy before execution. Denied commands are returned as tool errors so the model can revise them.",
                 self.tool_name
             )
         })
@@ -302,29 +290,27 @@ impl<E: GuardExecutor> McpServer<E> {
             "tools": [
                 {
                     "name": self.tool_name,
-                    "title": "Run Command Through ssh-guard",
-                    "description": "Execute a shell command on a target host through the configured ssh-guard server. The command is evaluated by ssh-guard policy before execution.",
+                    "title": "Run Command Through Guard",
+                    "description": "Execute a command through the guard daemon. The command is evaluated against security policy before execution.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "target": {
+                            "binary": {
                                 "type": "string",
-                                "description": "SSH target host, alias, or localhost."
+                                "description": "Binary to execute (e.g. ssh, kubectl, helm, aws)."
                             },
-                            "command": {
-                                "type": "string",
-                                "description": "Shell command to evaluate and execute."
+                            "args": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Arguments to pass to the binary."
                             },
-                            "user": {
-                                "type": "string",
-                                "description": "Optional remote username override."
-                            },
-                            "identity_key": {
-                                "type": "string",
-                                "description": "Optional ssh-guard secret name for an SSH identity key."
+                            "env": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" },
+                                "description": "Optional environment variables to inject into the command."
                             }
                         },
-                        "required": ["target", "command"]
+                        "required": ["binary", "args"]
                     },
                     "outputSchema": {
                         "type": "object",
@@ -569,7 +555,7 @@ mod tests {
         assert_eq!(response["result"]["tools"][0]["name"], DEFAULT_TOOL_NAME);
         assert_eq!(
             response["result"]["tools"][0]["inputSchema"]["required"],
-            json!(["target", "command"])
+            json!(["binary", "args"])
         );
     }
 
@@ -595,8 +581,8 @@ mod tests {
                 "params": {
                     "name": DEFAULT_TOOL_NAME,
                     "arguments": {
-                        "target": "prod",
-                        "command": "uptime"
+                        "binary": "ssh",
+                        "args": ["prod", "uptime"]
                     }
                 }
             }))
@@ -626,8 +612,8 @@ mod tests {
                 "params": {
                     "name": DEFAULT_TOOL_NAME,
                     "arguments": {
-                        "target": "prod",
-                        "command": "uptime"
+                        "binary": "ssh",
+                        "args": ["prod", "uptime"]
                     }
                 }
             }))

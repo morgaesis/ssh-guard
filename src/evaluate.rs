@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const SYSTEM_PROMPT: &str = r#"You evaluate SSH commands for safety. Your job is to block dangerous operations while letting agents get work done.
+const SYSTEM_PROMPT: &str = r#"You evaluate commands for safety. Your job is to block dangerous operations while letting agents get work done.
 
 Think about each command like a security guard reviewing a request:
 
@@ -281,7 +281,7 @@ impl Evaluator {
         }
     }
 
-    pub async fn evaluate(&self, command: &str, host: &str) -> EvalResult {
+    pub async fn evaluate(&self, command: &str) -> EvalResult {
         if let Some(ref engine) = self.policy_engine {
             let static_result = engine.check(command);
             if static_result.is_denied() {
@@ -294,7 +294,7 @@ impl Evaluator {
         }
 
         if self.llm_config.enabled {
-            return self.evaluate_llm(command, host).await;
+            return self.evaluate_llm(command).await;
         }
 
         if let Some(ref engine) = self.policy_engine {
@@ -313,7 +313,7 @@ impl Evaluator {
         }
     }
 
-    async fn evaluate_llm(&self, command: &str, host: &str) -> EvalResult {
+    async fn evaluate_llm(&self, command: &str) -> EvalResult {
         let api_key = match &self.llm_config.api_key {
             Some(k) => k.clone(),
             None => {
@@ -321,7 +321,7 @@ impl Evaluator {
             }
         };
 
-        let user_message = format!("Host: {}\nCommand: {}", host, command);
+        let user_message = format!("Command: {}", command);
 
         let body = serde_json::json!({
             "model": self.llm_config.model(),
