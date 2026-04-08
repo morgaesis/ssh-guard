@@ -333,47 +333,37 @@ impl Evaluator {
         });
 
         let api_url = self.llm_config.api_url();
-        let body_str = serde_json::to_string(&body).unwrap_or_default();
 
         tracing::debug!("LLM request to {}", api_url);
 
-        let output = tokio::process::Command::new("curl")
-            .args([
-                "-s",
-                "-X",
-                "POST",
-                &api_url,
-                "-H",
-                &format!("Authorization: Bearer {}", api_key),
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body_str,
-            ])
-            .output()
+        let response = self
+            .http_client
+            .post(&api_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
             .await;
 
-        let output = match output {
-            Ok(o) => o,
+        let response = match response {
+            Ok(r) => r,
             Err(e) => {
-                return EvalResult::Error(format!("failed to execute curl: {}", e));
+                return EvalResult::Error(format!("LLM request failed: {}", e));
             }
         };
 
-        let response_text = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let status = response.status();
+        let response_text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                return EvalResult::Error(format!("failed to read LLM response: {}", e));
+            }
+        };
 
-        tracing::debug!("LLM response: {}", response_text);
-        if !stderr.is_empty() {
-            tracing::warn!("LLM stderr: {}", stderr);
-        }
+        tracing::debug!("LLM response ({}): {}", status, response_text);
 
-        if !output.status.success() {
-            return EvalResult::Error(format!(
-                "LLM curl error ({}): {}",
-                output.status.code().unwrap_or(-1),
-                response_text
-            ));
+        if !status.is_success() {
+            return EvalResult::Error(format!("LLM API error ({}): {}", status, response_text));
         }
 
         let decision = match self.parse_llm_response(&response_text) {

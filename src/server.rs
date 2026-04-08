@@ -140,20 +140,22 @@ impl ServerConfig {
         Ok(())
     }
 
-    fn log_connection(
+    fn log_audit(
         &self,
         caller: &CallerIdentity,
         binary: &str,
         args: &[String],
         allowed: bool,
+        reason: &str,
     ) {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
         tracing::info!(
-            "[{}] caller={} cmd={} {}",
+            "[AUDIT] {} caller={} cmd=\"{} {}\" reason=\"{}\"",
             action,
             caller,
-            format!("{} {}", binary, args.join(" ")),
-            if allowed { "" } else { "- unauthorized" }
+            binary,
+            args.join(" "),
+            reason
         );
     }
 }
@@ -354,7 +356,13 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
         let caller = CallerIdentity::Unix { uid };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
-            config.log_connection(&caller, &request.binary, &request.args, false);
+            config.log_audit(
+                &caller,
+                &request.binary,
+                &request.args,
+                false,
+                "invalid auth token",
+            );
             let resp = ExecuteResponse {
                 allowed: false,
                 reason: "invalid auth token".to_string(),
@@ -371,7 +379,13 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
 
         let result = execute_command(request.clone(), config, &caller).await?;
 
-        config.log_connection(&caller, &request.binary, &request.args, result.allowed);
+        config.log_audit(
+            &caller,
+            &request.binary,
+            &request.args,
+            result.allowed,
+            &result.reason,
+        );
 
         let resp = ExecuteResponse {
             allowed: result.allowed,
@@ -414,7 +428,13 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
             let caller = CallerIdentity::Unknown;
-            config.log_connection(&caller, &request.binary, &request.args, false);
+            config.log_audit(
+                &caller,
+                &request.binary,
+                &request.args,
+                false,
+                "invalid auth token",
+            );
             let resp = ExecuteResponse {
                 allowed: false,
                 reason: "invalid auth token".to_string(),
@@ -437,7 +457,13 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
         };
         let result = execute_command(request.clone(), config, &caller).await?;
 
-        config.log_connection(&caller, &request.binary, &request.args, result.allowed);
+        config.log_audit(
+            &caller,
+            &request.binary,
+            &request.args,
+            result.allowed,
+            &result.reason,
+        );
 
         let resp = ExecuteResponse {
             allowed: result.allowed,
