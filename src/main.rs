@@ -9,6 +9,7 @@ mod secrets;
 mod server;
 mod shim;
 mod ssh;
+mod tool_config;
 
 use ssh_guard::evaluate;
 
@@ -48,6 +49,12 @@ enum MainArgs {
         /// Custom shim directory
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Inject an environment variable (KEY=VALUE, repeatable)
+        #[arg(long = "env", value_parser = parse_key_value)]
+        env_vars: Vec<(String, String)>,
+        /// Inject a secret as an env var (ENV_VAR=secret-name, repeatable)
+        #[arg(long = "secret", value_parser = parse_key_value)]
+        secret_vars: Vec<(String, String)>,
     },
     /// Manage client configuration
     #[clap(subcommand)]
@@ -55,6 +62,13 @@ enum MainArgs {
     /// Expose guard as an MCP server over stdio
     #[clap(subcommand)]
     Mcp(McpCommands),
+}
+
+fn parse_key_value(s: &str) -> Result<(String, String), String> {
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
+    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
 fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool {
@@ -208,7 +222,9 @@ async fn main() -> Result<()> {
             list,
             remove,
             path,
-        }) => handle_shim(tools, list, remove, path).await,
+            env_vars,
+            secret_vars,
+        }) => handle_shim(tools, list, remove, path, env_vars, secret_vars).await,
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Err(ref e)
@@ -333,6 +349,15 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .map(|v| v != "false")
                 .unwrap_or(true);
 
+            let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
+                tracing::warn!("Could not load tool config: {}", e);
+                tool_config::ToolRegistry::empty()
+            });
+            let tool_count = tool_registry.list().count();
+            if tool_count > 0 {
+                tracing::info!("Loaded {} tool config(s)", tool_count);
+            }
+
             tracing::info!("Creating server instance...");
             let srv = server::Server::new(
                 socket_path,
@@ -344,6 +369,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 socket_group,
                 allowed_uids,
                 shim_dir,
+                tool_registry,
             );
             srv.run().await
         }
@@ -535,6 +561,8 @@ async fn handle_shim(
     list: bool,
     remove: bool,
     path: Option<PathBuf>,
+    env_vars: Vec<(String, String)>,
+    secret_vars: Vec<(String, String)>,
 ) -> Result<()> {
     let shim_dir = path.unwrap_or_else(|| {
         dirs::home_dir()
@@ -548,8 +576,22 @@ async fn handle_shim(
         if installed.is_empty() {
             println!("No shims installed");
         } else {
+            let registry = tool_config::ToolRegistry::load_default()
+                .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
             for s in installed {
-                println!("  - {}", s);
+                print!("  - {}", s);
+                if let Some(tc) = registry.get(&s) {
+                    let parts: Vec<String> = tc
+                        .env
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .chain(tc.secrets.iter().map(|(k, v)| format!("{k}=<secret:{v}>")))
+                        .collect();
+                    if !parts.is_empty() {
+                        print!("  [{}]", parts.join(", "));
+                    }
+                }
+                println!();
             }
         }
         return Ok(());
@@ -560,6 +602,12 @@ async fn handle_shim(
         if let Some(tools) = tools {
             let tools_refs: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
             generator.remove(&tools_refs)?;
+            // Also remove tool configs
+            if let Ok(mut registry) = tool_config::ToolRegistry::load_default() {
+                for t in &tools_refs {
+                    let _ = registry.remove(t);
+                }
+            }
         } else {
             generator.remove_all()?;
         }
@@ -573,6 +621,32 @@ async fn handle_shim(
     let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
     generator.generate(&tools_refs)?;
     println!("Installed shims to: {}", shim_dir.display());
+
+    // Register tool configs if env/secret flags were provided
+    if !env_vars.is_empty() || !secret_vars.is_empty() {
+        let mut registry = tool_config::ToolRegistry::load_default()
+            .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
+
+        for tool_name in &tools_to_install {
+            let existing = registry.get(tool_name).cloned().unwrap_or_default();
+            let mut env = existing.env;
+            let mut secrets = existing.secrets;
+
+            for (k, v) in &env_vars {
+                env.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &secret_vars {
+                secrets.insert(k.clone(), v.clone());
+            }
+
+            registry.set(tool_name, tool_config::ToolConfig { env, secrets })?;
+        }
+        println!(
+            "Registered tool config for: {}",
+            tools_to_install.join(", ")
+        );
+    }
+
     Ok(())
 }
 

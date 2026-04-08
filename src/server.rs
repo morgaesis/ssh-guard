@@ -12,6 +12,7 @@
 use crate::evaluate::Evaluator;
 use crate::redact::redact_output;
 use crate::secrets::SecretManager;
+use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
+use tokio::sync::RwLock;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
@@ -60,6 +62,7 @@ pub struct ServerConfig {
     pub socket_group: Option<String>,
     pub allowed_uids: Option<Vec<u32>>,
     pub shim_dir: Option<PathBuf>,
+    pub tool_registry: Arc<RwLock<ToolRegistry>>,
 }
 
 impl ServerConfig {
@@ -74,6 +77,7 @@ impl ServerConfig {
         socket_group: Option<String>,
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
+        tool_registry: ToolRegistry,
     ) -> Self {
         Self {
             socket_path,
@@ -85,6 +89,7 @@ impl ServerConfig {
             socket_group,
             allowed_uids,
             shim_dir,
+            tool_registry: Arc::new(RwLock::new(tool_registry)),
         }
     }
 
@@ -147,6 +152,7 @@ impl Server {
         socket_group: Option<String>,
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
+        tool_registry: ToolRegistry,
     ) -> Self {
         let config = ServerConfig {
             socket_path,
@@ -158,6 +164,7 @@ impl Server {
             socket_group,
             allowed_uids,
             shim_dir,
+            tool_registry: Arc::new(RwLock::new(tool_registry)),
         };
         Self { config }
     }
@@ -487,13 +494,37 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
         }
     };
 
+    // Resolve tool-level env/secrets from registry
+    let tool_env = {
+        let mut reg = config.tool_registry.write().await;
+        let _ = reg.reload_if_stale();
+        reg.resolve_env(&request.binary, &config.secrets).await
+    };
+    let tool_env = match tool_env {
+        Ok(env) => env,
+        Err(e) => {
+            return Ok(ExecuteResult {
+                allowed: false,
+                reason: format!("tool config error: {}", e),
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+            });
+        }
+    };
+
     tracing::info!("Executing: {} {:?}", request.binary, request.args);
 
     let mut cmd = Command::new(&request.binary);
     cmd.args(&request.args);
     cmd.stdin(Stdio::null());
 
-    // Inject requested environment variables
+    // Inject tool-level env/secrets (from tools.yaml)
+    for (key, value) in &tool_env {
+        cmd.env(key, value);
+    }
+
+    // Inject per-request environment variables (overrides tool config)
     for (key, value) in &request.env {
         cmd.env(key, value);
     }
