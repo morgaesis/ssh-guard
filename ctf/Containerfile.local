@@ -1,0 +1,39 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client \
+    curl \
+    wget \
+    jq \
+    vim \
+    git \
+    procps \
+    net-tools \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create the agent user
+RUN useradd -m -s /bin/bash agent
+
+# Install guard binary
+COPY ssh-guard /usr/local/bin/ssh-guard
+RUN chmod 755 /usr/local/bin/ssh-guard
+
+# Set up guard client config
+RUN mkdir -p /home/agent/.config/guard /home/agent/.guard
+COPY client.yaml /home/agent/.config/ssh-guard/client.yaml
+
+# Set up guard shims and SSH dir
+RUN mkdir -p /home/agent/.guard/shims /home/agent/.ssh && \
+    chmod 700 /home/agent/.ssh
+
+# Set ownership
+RUN chown -R agent:agent /home/agent/.config /home/agent/.guard /home/agent/.ssh
+
+COPY entrypoint-local.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER agent
+WORKDIR /home/agent
+
+CMD ["/entrypoint.sh"]

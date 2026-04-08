@@ -29,24 +29,6 @@ const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
 const MAX_GUARD_DEPTH: u32 = 5;
 
-/// Environment variable names that clients are never allowed to set.
-/// These can be used to hijack binary behavior or escape the guard.
-const BLOCKED_CLIENT_ENV: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "PYTHONPATH",
-    "NODE_PATH",
-    "RUBYLIB",
-    "PERL5LIB",
-    "GUARD_DEPTH",
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-];
-
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
 pub enum CallerIdentity {

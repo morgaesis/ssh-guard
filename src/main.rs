@@ -27,6 +27,7 @@ enum MainArgs {
         /// Binary to execute
         binary: String,
         /// Arguments to pass to the binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Server management
