@@ -360,7 +360,11 @@ impl Evaluator {
             }
         };
 
-        tracing::debug!("LLM response ({}): {}", status, response_text);
+        tracing::debug!(
+            "LLM response ({}): {}...",
+            status,
+            &response_text[..response_text.len().min(200)]
+        );
 
         if !status.is_success() {
             return EvalResult::Error(format!("LLM API error ({}): {}", status, response_text));

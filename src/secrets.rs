@@ -167,18 +167,24 @@ impl SecretBackend for PassBackend {
     async fn set(&self, key: &str, value: &str) -> Result<()> {
         let path = self.pass_path(key);
 
-        // Use printf to pipe the secret to pass
-        let mut cmd = AsyncCommand::new("sh");
-        cmd.arg("-c").arg(format!(
-            "printf '%s' '{}' | pass insert --force --multifile '{}'",
-            value, path
-        ));
+        // Pipe the secret value via stdin to avoid shell injection
+        let mut cmd = AsyncCommand::new("pass");
+        cmd.args(["insert", "--force", "--multiline", &path]);
 
         if let Some(ref gpg_id) = self.gpg_id {
-            cmd.arg("--gpg-id").arg(gpg_id);
+            cmd.args(["--gpg-id", gpg_id]);
         }
 
-        let output = cmd.output().await?;
+        cmd.stdin(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(value.as_bytes()).await?;
+            // close stdin so pass knows the input is done
+        }
+
+        let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

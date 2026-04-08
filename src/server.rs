@@ -28,6 +28,8 @@ use tokio::sync::RwLock;
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
 const MAX_GUARD_DEPTH: u32 = 5;
+const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
+const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
 
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
@@ -52,7 +54,14 @@ impl std::fmt::Display for CallerIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unix { uid } => write!(f, "uid={}", uid),
-            Self::Tcp { token } => write!(f, "token={}", token),
+            Self::Tcp { token } => {
+                let redacted = if token.len() > 8 {
+                    format!("{}...{}", &token[..4], &token[token.len() - 4..])
+                } else {
+                    "***".to_string()
+                };
+                write!(f, "token={}", redacted)
+            }
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -132,8 +141,15 @@ impl ServerConfig {
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
         if let Some(ref expected) = self.auth_token {
-            let provided = token.unwrap_or("");
-            if provided != *expected {
+            let provided = token.unwrap_or("").as_bytes();
+            let expected = expected.as_bytes();
+            // Constant-time comparison to prevent timing side-channel
+            let len_match = provided.len() == expected.len();
+            let byte_match = provided
+                .iter()
+                .zip(expected.iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+            if !len_match || byte_match != 0 {
                 anyhow::bail!("invalid auth token");
             }
         }
@@ -334,7 +350,11 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
 
     tracing::info!("handle_client_unix: waiting for request...");
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!("handle_client_unix: received request: {}", line);
+        if line.len() > MAX_REQUEST_BYTES {
+            tracing::warn!("request too large ({} bytes), dropping", line.len());
+            continue;
+        }
+        tracing::debug!("handle_client_unix: received request (raw)");
         let request: ExecuteRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -408,6 +428,10 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
     let mut lines = BufReader::new(reader).lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
+        if line.len() > MAX_REQUEST_BYTES {
+            tracing::warn!("request too large ({} bytes), dropping", line.len());
+            continue;
+        }
         let request: ExecuteRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -509,6 +533,21 @@ async fn execute_command(
         });
     }
 
+    // Validate binary name: reject paths, traversal, and shell metacharacters
+    if request.binary.contains('/')
+        || request.binary.contains("..")
+        || request.binary.contains('\0')
+        || request.binary.is_empty()
+    {
+        return Ok(ExecuteResult {
+            allowed: false,
+            reason: format!("invalid binary name: '{}'", request.binary),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+        });
+    }
+
     // Reconstruct full command line for policy evaluation
     let command_line = if request.args.is_empty() {
         request.binary.clone()
@@ -598,7 +637,8 @@ async fn execute_command(
     let stdout = if output.stdout.is_empty() {
         None
     } else {
-        let s = String::from_utf8_lossy(&output.stdout).to_string();
+        let raw = &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)];
+        let s = String::from_utf8_lossy(raw).to_string();
         if config.redact {
             Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
         } else {
@@ -609,7 +649,8 @@ async fn execute_command(
     let stderr = if output.stderr.is_empty() {
         None
     } else {
-        let s = String::from_utf8_lossy(&output.stderr).to_string();
+        let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
+        let s = String::from_utf8_lossy(raw).to_string();
         if config.redact {
             Some(s.lines().map(redact_output).collect::<Vec<_>>().join("\n"))
         } else {
