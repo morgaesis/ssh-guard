@@ -48,8 +48,6 @@ impl Default for McpConfig {
 struct GuardToolArgs {
     binary: String,
     args: Vec<String>,
-    #[serde(default)]
-    env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +93,7 @@ impl GuardExecutor for ClientExecutor {
         };
 
         let response = client
-            .execute_with_env(&args.binary, &args.args, args.env)
+            .execute(&args.binary, &args.args)
             .await
             .context("failed to execute command through guard server")?;
 
@@ -303,11 +301,6 @@ impl<E: GuardExecutor> McpServer<E> {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Arguments to pass to the binary."
-                            },
-                            "env": {
-                                "type": "object",
-                                "additionalProperties": { "type": "string" },
-                                "description": "Optional environment variables to inject into the command."
                             }
                         },
                         "required": ["binary", "args"]

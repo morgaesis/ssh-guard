@@ -29,12 +29,57 @@ const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
 const MAX_GUARD_DEPTH: u32 = 5;
 
+/// Environment variable names that clients are never allowed to set.
+/// These can be used to hijack binary behavior or escape the guard.
+const BLOCKED_CLIENT_ENV: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "NODE_PATH",
+    "RUBYLIB",
+    "PERL5LIB",
+    "GUARD_DEPTH",
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+];
+
+/// Identifies the caller for per-user secret injection.
+#[derive(Debug, Clone)]
+pub enum CallerIdentity {
+    Unix { uid: u32 },
+    Tcp { token: String },
+    Unknown,
+}
+
+impl CallerIdentity {
+    /// Returns the key used to look up per-user config in tools.yaml.
+    pub fn user_key(&self) -> Option<String> {
+        match self {
+            Self::Unix { uid } => Some(uid.to_string()),
+            Self::Tcp { token } => Some(token.clone()),
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CallerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unix { uid } => write!(f, "uid={}", uid),
+            Self::Tcp { token } => write!(f, "token={}", token),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub binary: String,
     pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
 }
@@ -115,20 +160,17 @@ impl ServerConfig {
 
     fn log_connection(
         &self,
-        uid: u32,
-        token_name: &str,
+        caller: &CallerIdentity,
         binary: &str,
         args: &[String],
         allowed: bool,
     ) {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
         tracing::info!(
-            "[{}] uid={} token={} cmd={} {} {}",
+            "[{}] caller={} cmd={} {}",
             action,
-            uid,
-            token_name,
-            binary,
-            args.join(" "),
+            caller,
+            format!("{} {}", binary, args.join(" ")),
             if allowed { "" } else { "- unauthorized" }
         );
     }
@@ -327,8 +369,10 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
             }
         };
 
+        let caller = CallerIdentity::Unix { uid };
+
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
-            config.log_connection(uid, "<invalid>", &request.binary, &request.args, false);
+            config.log_connection(&caller, &request.binary, &request.args, false);
             let resp = ExecuteResponse {
                 allowed: false,
                 reason: "invalid auth token".to_string(),
@@ -343,16 +387,9 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
             continue;
         }
 
-        let token_name = request.auth_token.as_deref().unwrap_or("<none>");
-        let result = execute_command(request.clone(), config).await?;
+        let result = execute_command(request.clone(), config, &caller).await?;
 
-        config.log_connection(
-            uid,
-            token_name,
-            &request.binary,
-            &request.args,
-            result.allowed,
-        );
+        config.log_connection(&caller, &request.binary, &request.args, result.allowed);
 
         let resp = ExecuteResponse {
             allowed: result.allowed,
@@ -394,6 +431,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
         };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
+            let caller = CallerIdentity::Unknown;
+            config.log_connection(&caller, &request.binary, &request.args, false);
             let resp = ExecuteResponse {
                 allowed: false,
                 reason: "invalid auth token".to_string(),
@@ -408,16 +447,15 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
             continue;
         }
 
-        let token_name = request.auth_token.as_deref().unwrap_or("<none>");
-        let result = execute_command(request.clone(), config).await?;
+        let caller = CallerIdentity::Tcp {
+            token: request
+                .auth_token
+                .clone()
+                .unwrap_or_else(|| "<none>".to_string()),
+        };
+        let result = execute_command(request.clone(), config, &caller).await?;
 
-        config.log_connection(
-            0,
-            token_name,
-            &request.binary,
-            &request.args,
-            result.allowed,
-        );
+        config.log_connection(&caller, &request.binary, &request.args, result.allowed);
 
         let resp = ExecuteResponse {
             allowed: result.allowed,
@@ -443,7 +481,11 @@ struct ExecuteResult {
     stderr: Option<String>,
 }
 
-async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Result<ExecuteResult> {
+async fn execute_command(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+) -> Result<ExecuteResult> {
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
         .ok()
@@ -494,11 +536,13 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
         }
     };
 
-    // Resolve tool-level env/secrets from registry
+    // Resolve tool-level env/secrets from registry (includes per-user overrides)
+    let user_key = caller.user_key();
     let tool_env = {
         let mut reg = config.tool_registry.write().await;
         let _ = reg.reload_if_stale();
-        reg.resolve_env(&request.binary, &config.secrets).await
+        reg.resolve_env(&request.binary, &config.secrets, user_key.as_deref())
+            .await
     };
     let tool_env = match tool_env {
         Ok(env) => env,
@@ -513,19 +557,19 @@ async fn execute_command(request: ExecuteRequest, config: &ServerConfig) -> Resu
         }
     };
 
-    tracing::info!("Executing: {} {:?}", request.binary, request.args);
+    tracing::info!(
+        "Executing: {} {:?} ({})",
+        request.binary,
+        request.args,
+        caller
+    );
 
     let mut cmd = Command::new(&request.binary);
     cmd.args(&request.args);
     cmd.stdin(Stdio::null());
 
-    // Inject tool-level env/secrets (from tools.yaml)
+    // Inject server-side tool env/secrets (authoritative, cannot be overridden by clients)
     for (key, value) in &tool_env {
-        cmd.env(key, value);
-    }
-
-    // Inject per-request environment variables (overrides tool config)
-    for (key, value) in &request.env {
         cmd.env(key, value);
     }
 
@@ -595,19 +639,9 @@ impl Client {
     }
 
     pub async fn execute(&self, binary: &str, args: &[String]) -> Result<ExecuteResponse> {
-        self.execute_with_env(binary, args, HashMap::new()).await
-    }
-
-    pub async fn execute_with_env(
-        &self,
-        binary: &str,
-        args: &[String],
-        env: HashMap<String, String>,
-    ) -> Result<ExecuteResponse> {
         let request = ExecuteRequest {
             binary: binary.to_string(),
             args: args.to_vec(),
-            env,
             auth_token: self.auth_token.clone(),
         };
 

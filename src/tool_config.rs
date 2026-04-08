@@ -6,16 +6,26 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolConfig {
+pub struct UserToolOverride {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub secrets: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolConfig {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub secrets: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub users: HashMap<String, UserToolOverride>,
+}
+
 impl ToolConfig {
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.secrets.is_empty()
+        self.env.is_empty() && self.secrets.is_empty() && self.users.is_empty()
     }
 }
 
@@ -119,20 +129,23 @@ impl ToolRegistry {
         Ok(true)
     }
 
-    /// Resolve all environment variables for a tool: static env + secrets from the store.
+    /// Resolve all environment variables for a tool: base env + secrets, then per-user overrides.
     /// Returns an empty map if the tool is not registered.
     /// Fails if a referenced secret key is not found in the store.
     pub async fn resolve_env(
         &self,
         tool: &str,
         secrets: &SecretManager,
+        user_key: Option<&str>,
     ) -> Result<HashMap<String, String>> {
         let Some(tool_config) = self.get(tool) else {
             return Ok(HashMap::new());
         };
 
+        // Start with base tool env
         let mut env = tool_config.env.clone();
 
+        // Resolve base secrets
         for (env_var, secret_key) in &tool_config.secrets {
             let value = secrets
                 .get(secret_key)
@@ -146,6 +159,30 @@ impl ToolRegistry {
                     )
                 })?;
             env.insert(env_var.clone(), value);
+        }
+
+        // Overlay per-user overrides if caller matches
+        if let Some(user_key) = user_key {
+            if let Some(user_override) = tool_config.users.get(user_key) {
+                for (k, v) in &user_override.env {
+                    env.insert(k.clone(), v.clone());
+                }
+                for (env_var, secret_key) in &user_override.secrets {
+                    let value = secrets
+                        .get(secret_key)
+                        .await
+                        .with_context(|| format!("failed to read secret '{secret_key}'"))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "secret not found: '{}' (required by tool '{}' for user '{}')",
+                                secret_key,
+                                tool,
+                                user_key
+                            )
+                        })?;
+                    env.insert(env_var.clone(), value);
+                }
+            }
         }
 
         Ok(env)
@@ -189,6 +226,7 @@ mod tests {
         let config = ToolConfig {
             env: HashMap::from([("FOO".into(), "bar".into())]),
             secrets: HashMap::from([("SECRET".into(), "my-key".into())]),
+            ..Default::default()
         };
         reg.set("aws", config).unwrap();
 

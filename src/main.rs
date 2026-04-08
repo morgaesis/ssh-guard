@@ -55,6 +55,9 @@ enum MainArgs {
         /// Inject a secret as an env var (ENV_VAR=secret-name, repeatable)
         #[arg(long = "secret", value_parser = parse_key_value)]
         secret_vars: Vec<(String, String)>,
+        /// Apply env/secret config to a specific user (UID or token name)
+        #[arg(long)]
+        user: Option<String>,
     },
     /// Manage client configuration
     #[clap(subcommand)]
@@ -224,7 +227,8 @@ async fn main() -> Result<()> {
             path,
             env_vars,
             secret_vars,
-        }) => handle_shim(tools, list, remove, path, env_vars, secret_vars).await,
+            user,
+        }) => handle_shim(tools, list, remove, path, env_vars, secret_vars, user).await,
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Err(ref e)
@@ -563,6 +567,7 @@ async fn handle_shim(
     path: Option<PathBuf>,
     env_vars: Vec<(String, String)>,
     secret_vars: Vec<(String, String)>,
+    user: Option<String>,
 ) -> Result<()> {
     let shim_dir = path.unwrap_or_else(|| {
         dirs::home_dir()
@@ -589,6 +594,22 @@ async fn handle_shim(
                         .collect();
                     if !parts.is_empty() {
                         print!("  [{}]", parts.join(", "));
+                    }
+                    for (uid, user_override) in &tc.users {
+                        let user_parts: Vec<String> = user_override
+                            .env
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .chain(
+                                user_override
+                                    .secrets
+                                    .iter()
+                                    .map(|(k, v)| format!("{k}=<secret:{v}>")),
+                            )
+                            .collect();
+                        if !user_parts.is_empty() {
+                            print!("  user({uid}): [{}]", user_parts.join(", "));
+                        }
                     }
                 }
                 println!();
@@ -628,23 +649,35 @@ async fn handle_shim(
             .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
 
         for tool_name in &tools_to_install {
-            let existing = registry.get(tool_name).cloned().unwrap_or_default();
-            let mut env = existing.env;
-            let mut secrets = existing.secrets;
+            let mut existing = registry.get(tool_name).cloned().unwrap_or_default();
 
-            for (k, v) in &env_vars {
-                env.insert(k.clone(), v.clone());
-            }
-            for (k, v) in &secret_vars {
-                secrets.insert(k.clone(), v.clone());
+            if let Some(ref user_key) = user {
+                // Per-user override: store under users.<user_key>
+                let user_override = existing.users.entry(user_key.clone()).or_default();
+
+                for (k, v) in &env_vars {
+                    user_override.env.insert(k.clone(), v.clone());
+                }
+                for (k, v) in &secret_vars {
+                    user_override.secrets.insert(k.clone(), v.clone());
+                }
+                println!(
+                    "Registered per-user ({}) config for: {}",
+                    user_key, tool_name
+                );
+            } else {
+                // Base tool config
+                for (k, v) in &env_vars {
+                    existing.env.insert(k.clone(), v.clone());
+                }
+                for (k, v) in &secret_vars {
+                    existing.secrets.insert(k.clone(), v.clone());
+                }
+                println!("Registered tool config for: {}", tool_name);
             }
 
-            registry.set(tool_name, tool_config::ToolConfig { env, secrets })?;
+            registry.set(tool_name, existing)?;
         }
-        println!(
-            "Registered tool config for: {}",
-            tools_to_install.join(", ")
-        );
     }
 
     Ok(())
