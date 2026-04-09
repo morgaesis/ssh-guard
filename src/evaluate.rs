@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Default system prompt, loaded from config/system-prompt.txt at compile time.
+/// Default system prompt (balanced mode), compiled from config/system-prompt.md.
 /// Override at runtime with `--system-prompt <path>` or `~/.config/guard/system-prompt.txt`.
 const SYSTEM_PROMPT: &str = include_str!("../config/system-prompt.md");
+
+/// SAFE mode prompt: allow almost everything, rely on env_clear + output redaction.
+const SYSTEM_PROMPT_SAFE: &str = include_str!("../config/system-prompt-safe.md");
+
+/// PARANOID mode prompt: block everything except basic read-only inspection.
+const SYSTEM_PROMPT_PARANOID: &str = include_str!("../config/system-prompt-paranoid.md");
 
 const DEFAULT_MODEL: &str = "google/gemini-3-flash-preview";
 const DEFAULT_TIMEOUT: u64 = 10;
@@ -179,12 +185,14 @@ impl Evaluator {
             config.mode.map(PolicyEngine::from_mode)
         };
 
-        // Load system prompt: external file takes priority, then default config path, then embedded
+        // Load system prompt. Priority:
+        // 1. --system-prompt <path> (explicit override)
+        // 2. ~/.config/guard/system-prompt.txt (user customization)
+        // 3. Mode-specific compiled prompt (safe/paranoid/default)
         let system_prompt = if let Some(ref path) = config.system_prompt_path {
             std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read system prompt from {}", path.display()))?
         } else {
-            // Try default config location
             let default_path =
                 dirs::config_dir().map(|d| d.join("guard").join("system-prompt.txt"));
             match default_path {
@@ -194,7 +202,20 @@ impl Evaluator {
                         format!("failed to read system prompt from {}", p.display())
                     })?
                 }
-                _ => SYSTEM_PROMPT.to_string(),
+                _ => {
+                    // Select compiled prompt based on mode
+                    match config.mode {
+                        Some(PolicyMode::Safe) => {
+                            tracing::info!("Using SAFE mode system prompt");
+                            SYSTEM_PROMPT_SAFE.to_string()
+                        }
+                        Some(PolicyMode::Paranoid) => {
+                            tracing::info!("Using PARANOID mode system prompt");
+                            SYSTEM_PROMPT_PARANOID.to_string()
+                        }
+                        _ => SYSTEM_PROMPT.to_string(),
+                    }
+                }
             }
         };
 

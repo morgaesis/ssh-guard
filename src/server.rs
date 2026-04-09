@@ -403,7 +403,19 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
             continue;
         }
 
-        let result = execute_command(request.clone(), config, &caller).await?;
+        let result = match execute_command(request.clone(), config, &caller).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("execute_command error: {}", e);
+                ExecuteResult {
+                    allowed: false,
+                    reason: format!("execution error: {}", e),
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                }
+            }
+        };
 
         config.log_audit(
             &caller,
@@ -485,7 +497,19 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 .clone()
                 .unwrap_or_else(|| "<none>".to_string()),
         };
-        let result = execute_command(request.clone(), config, &caller).await?;
+        let result = match execute_command(request.clone(), config, &caller).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("execute_command error: {}", e);
+                ExecuteResult {
+                    allowed: false,
+                    reason: format!("execution error: {}", e),
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                }
+            }
+        };
 
         config.log_audit(
             &caller,
