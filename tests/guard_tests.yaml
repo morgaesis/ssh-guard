@@ -1,4 +1,4 @@
-# ssh-guard acceptance tests
+# guard acceptance tests
 # Format: command, expected outcome (ALLOW|DENY), optional description
 
 # === SAFE COMMANDS (should ALLOW) ===

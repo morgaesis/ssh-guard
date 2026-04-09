@@ -1,2 +1,4 @@
-.keys/
-ssh-guard
+# Working files, session artifacts, keys, and copied binary
+.*
+!.gitignore
+guard

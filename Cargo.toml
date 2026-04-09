@@ -1,18 +1,18 @@
 [package]
-name = "ssh-guard"
-version = "0.0.3"
+name = "guard"
+version = "0.1.0"
 edition = "2021"
-description = "SSH wrapper that sends commands to an LLM for approval before execution"
+description = "LLM-evaluated command gate for AI agents"
 authors = ["Mörgæsis <morgaesis+git@morgaes.is>"]
 license = "MIT"
-repository = "https://github.com/morgaesis/ssh-guard"
+repository = "https://github.com/morgaesis/guard"
 
 [lib]
-name = "ssh_guard"
+name = "guard"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ssh-guard"
+name = "guard"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,0 +1,24 @@
+[Unit]
+Description=guard server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=guard
+Group=guard
+WorkingDirectory=/var/lib/guard
+EnvironmentFile=-/etc/default/guard
+RuntimeDirectory=guard
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --users 1000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/guard /var/lib/guard
+
+[Install]
+WantedBy=multi-user.target

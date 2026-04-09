@@ -1,6 +1,7 @@
 .env
+.codex
 .cache/
 tmp/
 *.log
 /target/
-/ctf/
+/docs/demo.svg

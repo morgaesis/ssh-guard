@@ -2,18 +2,52 @@
 
 Source of truth hierarchy:
 
-1. `src/server.rs` defines the privileged guard daemon, request protocol, policy evaluation, and command execution path.
-2. `src/main.rs` defines operator-facing CLI entrypoints and how client configuration is resolved.
-3. `src/mcp.rs` defines the stdio MCP facade that exposes the existing guard daemon as a tool for agent clients.
+1. `src/server.rs` -- privileged guard daemon: request protocol, policy evaluation, command execution, environment isolation, and output redaction.
+2. `src/evaluate.rs` -- LLM evaluator: prompt selection, OpenAI-compatible API calls, response parsing, token usage tracking.
+3. `src/main.rs` -- operator-facing CLI: server start, client commands, shim management, MCP server, secret management.
+4. `src/mcp.rs` -- stdio MCP facade: exposes `guard_run` tool for agent clients, backed by the daemon protocol.
 
-Current shape:
+## Execution flow
 
-- `ssh-guard server start` runs the long-lived daemon over a UNIX socket or localhost TCP port.
-- `ssh-guard <target> <command>` and `ssh-guard server connect ...` are thin clients over that daemon protocol.
-- `ssh-guard mcp serve` is another thin client surface. It does not execute commands directly. It forwards MCP tool calls into the same daemon client path so policy, redaction, secrets, and SSH execution stay centralized.
+```
+Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
+                                                    |
+                                              Static Policy (optional)
+                                                    |
+                                              Execute command
+                                                    |
+                                              env_clear + allowlist
+                                                    |
+                                              Output redaction
+                                                    |
+                                              Response to agent
+```
 
-Design constraints:
+## Security layers
 
-- Guard policy and command execution should exist in one place. New agent integrations should wrap the existing daemon rather than reimplement approval logic.
-- MCP transport is stdio only in this repository. Network MCP transport would add a second auth and lifecycle surface and should be introduced only with a clear deployment requirement.
-- Tool responses should preserve both raw command output and structured fields so clients can use either text-only or schema-aware handling.
+1. **Environment isolation**: `cmd.env_clear()` strips all environment variables from child processes. Only safe variables are re-injected (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TZ`, `SHELL`, `LOGNAME`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`). API keys and secrets never reach executed commands.
+
+2. **Output redaction**: Known secret values (API key, auth token, tool-injected secrets) are exact-match redacted from stdout/stderr. Regex patterns catch common secret formats (`*_TOKEN=`, `*_KEY=`, PEM blocks, JWTs, `sk-*` strings).
+
+3. **LLM evaluation**: Commands are sent to an LLM with a mode-specific system prompt. The LLM analyzes intent, chained operations, obfuscation, tool side-channels, and prompt injection attempts. Returns `APPROVE`/`DENY` with risk score.
+
+4. **Static policy** (optional): Glob-pattern deny lists for fast rejection of known-bad patterns. Checked before LLM evaluation. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics.
+
+## Prompt architecture
+
+System prompts live in `config/*.md` files and are compiled into the binary via `include_str!()`. Three prompts ship by default:
+
+- `config/system-prompt.md` -- balanced default mode
+- `config/system-prompt-safe.md` -- permissive safe mode
+- `config/system-prompt-paranoid.md` -- restrictive paranoid mode
+
+Override priority: `--system-prompt` flag > `~/.config/guard/system-prompt.txt` > mode-specific compiled prompt.
+
+Additive prompts (`--system-prompt-append` or `SSH_GUARD_PROMPT_APPEND`) append text to whichever base prompt is active, letting operators customize behavior without maintaining a prompt fork.
+
+## Design constraints
+
+- Policy evaluation and command execution exist in one place (the server). New agent integrations wrap the daemon rather than reimplementing approval logic.
+- MCP transport is stdio only. Network MCP transport adds a second auth surface and should be introduced only with a clear deployment requirement.
+- Tool responses preserve both raw command output and structured fields so clients can use either text-only or schema-aware handling.
+- The guard binary name is `guard`. Environment variables retain the `SSH_GUARD_*` prefix for backwards compatibility.

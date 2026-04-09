@@ -1,4 +1,4 @@
-//! Guard - policy-gated command execution for AI agents
+//! guard - LLM-evaluated command gate for AI agents
 //!
 #![allow(unused)]
 
@@ -11,11 +11,11 @@ mod shim;
 mod ssh;
 mod tool_config;
 
-use ssh_guard::evaluate;
+use guard::evaluate;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use ssh_guard::policy::PolicyMode;
+use guard::policy::PolicyMode;
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -141,6 +141,10 @@ enum ServerCommands {
         /// Path to custom system prompt file for the LLM evaluator
         #[arg(long)]
         system_prompt: Option<PathBuf>,
+
+        /// Path to additive prompt file (appended to base prompt)
+        #[arg(long)]
+        system_prompt_append: Option<PathBuf>,
     },
     /// Connect to guard server and execute a command
     Connect {
@@ -279,6 +283,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_llm,
             no_redact,
             system_prompt,
+            system_prompt_append,
         } => {
             tracing::info!("Starting guard server...");
 
@@ -312,10 +317,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let api_key = llm_api_key
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .or_else(|| std::env::var("SSH_GUARD_API_KEY").ok());
+                .or_else(|| std::env::var("SSH_GUARD_LLM_API_KEY").ok())
+                .or_else(|| std::env::var("SSH_GUARD_API_KEY").ok()); // deprecated fallback
 
             if llm_enabled && api_key.is_none() {
-                tracing::warn!("No LLM API key provided (set OPENROUTER_API_KEY or --llm-api-key)");
+                tracing::warn!("No LLM API key provided (set SSH_GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
             }
 
             let mut eval_config = evaluate::EvalConfig::default()
@@ -351,6 +357,19 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(ref prompt_path) = system_prompt {
                 tracing::info!("Loading system prompt from: {}", prompt_path.display());
                 eval_config = eval_config.system_prompt_path(prompt_path.clone());
+            }
+
+            // Additive prompt: append to base prompt without replacing it.
+            // Priority: --system-prompt-append flag > SSH_GUARD_PROMPT_APPEND env var
+            let append_path = system_prompt_append.or_else(|| {
+                std::env::var("SSH_GUARD_PROMPT_APPEND")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            });
+            if let Some(ref path) = append_path {
+                tracing::info!("Appending additive prompt from: {}", path.display());
+                eval_config = eval_config.system_prompt_append_path(path.clone());
             }
 
             // Collect known secret values for exact-match output redaction BEFORE
@@ -736,6 +755,7 @@ mod tests {
                 no_llm,
                 no_redact,
                 system_prompt,
+                system_prompt_append,
             }) => ServerCommands::Start {
                 socket,
                 tcp_port,
@@ -752,6 +772,7 @@ mod tests {
                 no_llm,
                 no_redact,
                 system_prompt,
+                system_prompt_append,
             },
             _ => panic!("expected server start args"),
         }
@@ -767,42 +788,22 @@ mod tests {
 
     #[test]
     fn test_server_start_llm_defaults_true() {
-        assert!(resolved_llm(&["ssh-guard", "server", "start"]));
+        assert!(resolved_llm(&["guard", "server", "start"]));
     }
 
     #[test]
     fn test_server_start_llm_positive_forms() {
-        assert!(resolved_llm(&["ssh-guard", "server", "start", "--llm"]));
-        assert!(resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm=true"
-        ]));
-        assert!(resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm",
-            "true"
-        ]));
+        assert!(resolved_llm(&["guard", "server", "start", "--llm"]));
+        assert!(resolved_llm(&["guard", "server", "start", "--llm=true"]));
+        assert!(resolved_llm(&["guard", "server", "start", "--llm", "true"]));
     }
 
     #[test]
     fn test_server_start_llm_negative_forms() {
-        assert!(!resolved_llm(&["ssh-guard", "server", "start", "--no-llm"]));
+        assert!(!resolved_llm(&["guard", "server", "start", "--no-llm"]));
+        assert!(!resolved_llm(&["guard", "server", "start", "--llm=false"]));
         assert!(!resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm=false"
-        ]));
-        assert!(!resolved_llm(&[
-            "ssh-guard",
-            "server",
-            "start",
-            "--llm",
-            "false"
+            "guard", "server", "start", "--llm", "false"
         ]));
     }
 

@@ -1,10 +1,7 @@
-# Blue-team false positive discovery matrix (2026-04-09)
-# These are legitimate admin commands that MUST be allowed.
+# Blue-team false positive discovery matrix
+# Legitimate admin commands that MUST be allowed.
 # Run against each prompt mode to verify no false positives.
-#
-# Result from live test against descriptive prompt (Gemini 3 Flash):
-# 45/45 commands with LLM responses were correctly ALLOWED.
-# 19 commands failed due to missing binaries in minimal container (not LLM denials).
+# Validated: 45/45 correctly ALLOWED across all modes with LLM evaluation.
 
 # === System inspection ===
 

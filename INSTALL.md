@@ -1,6 +1,6 @@
 # Install
 
-`ssh-guard` is a single binary. There is no installer script in this repository.
+Guard is a single binary with no runtime dependencies beyond an LLM API key.
 
 ## Options
 
@@ -13,17 +13,17 @@ cargo install --path .
 Build locally without installing:
 
 ```bash
-cargo build --release
-./target/release/ssh-guard --version
+cargo build --quiet --release
+./target/release/guard --version
 ```
 
 Install from a GitHub release artifact:
 
 ```bash
 # Example for Linux x86_64
-curl -fsSLO https://github.com/morgaesis/ssh-guard/releases/download/v0.0.3/ssh-guard-v0.0.3-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf ssh-guard-v0.0.3-x86_64-unknown-linux-gnu.tar.gz
-install -m 0755 ssh-guard ~/.local/bin/ssh-guard
+curl -fsSLO https://github.com/morgaesis/guard/releases/download/v0.1.0/guard-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf guard-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+install -m 0755 guard ~/.local/bin/guard
 ```
 
 Choose the release asset that matches the target platform:
@@ -33,12 +33,12 @@ Choose the release asset that matches the target platform:
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-## Basic Setup
+## Basic setup
 
 Set an API key before use:
 
 ```bash
-export SSH_GUARD_API_KEY="..."
+export SSH_GUARD_LLM_API_KEY="..."
 ```
 
 Or:
@@ -50,22 +50,21 @@ export OPENROUTER_API_KEY="..."
 Verify the binary:
 
 ```bash
-ssh-guard --version
-ssh-guard myserver 'uptime'
+guard --version
+guard server start &
+guard run uptime
 ```
 
 ## Configuration
 
-Configuration is environment-driven.
+Configuration is environment-driven. See [`.env.example`](.env.example) for all available variables.
 
-Common variables:
+Key variables:
 
-- `SSH_GUARD_API_KEY`
-- `OPENROUTER_API_KEY`
-- `SSH_GUARD_API_URL`
-- `SSH_GUARD_MODEL`
-- `SSH_GUARD_MODE`
-- `SSH_GUARD_REDACT`
-- `SSH_GUARD_TIMEOUT`
+- `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` -- LLM API key (required)
+- `SSH_GUARD_API_URL` -- LLM endpoint (default: OpenRouter)
+- `SSH_GUARD_MODEL` -- Model (default: `google/gemini-3-flash-preview`)
+- `SSH_GUARD_MODE` -- Evaluation mode (default: `default`)
+- `SSH_GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `10`)
 
-For long-running service deployment, systemd examples are in [DEPLOYMENT.md](DEPLOYMENT.md) and [`deployment/systemd/ssh-guard.service`](deployment/systemd/ssh-guard.service).
+For long-running service deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).

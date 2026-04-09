@@ -29,11 +29,11 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     // Set environment variables for the build
-    println!("cargo:rustc-env=SSH_GUARD_GIT_COMMIT={}", commit);
-    println!("cargo:rustc-env=SSH_GUARD_GIT_BRANCH={}", branch);
+    println!("cargo:rustc-env=GUARD_GIT_COMMIT={}", commit);
+    println!("cargo:rustc-env=GUARD_GIT_BRANCH={}", branch);
 
     if let Some(tag) = tag {
-        println!("cargo:rustc-env=SSH_GUARD_GIT_TAG={}", tag);
+        println!("cargo:rustc-env=GUARD_GIT_TAG={}", tag);
     }
 
     // Rebuild if git changes

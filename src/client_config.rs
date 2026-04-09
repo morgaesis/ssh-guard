@@ -12,7 +12,7 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("ssh-guard").join("client.yaml"))
+        dirs::config_dir().map(|p| p.join("guard").join("client.yaml"))
     }
 
     pub fn load() -> Result<Self> {

@@ -65,6 +65,10 @@ pub struct EvalConfig {
     pub llm: LlmConfig,
     /// Path to a custom system prompt file. If set, overrides the compiled-in prompt.
     pub system_prompt_path: Option<PathBuf>,
+    /// Path to an additive prompt file. Contents are appended to the base prompt
+    /// (whether compiled-in or custom), letting operators add environment-specific
+    /// instructions without replacing the built-in prompts.
+    pub system_prompt_append_path: Option<PathBuf>,
 }
 
 impl EvalConfig {
@@ -105,6 +109,11 @@ impl EvalConfig {
 
     pub fn system_prompt_path(mut self, path: PathBuf) -> Self {
         self.system_prompt_path = Some(path);
+        self
+    }
+
+    pub fn system_prompt_append_path(mut self, path: PathBuf) -> Self {
+        self.system_prompt_append_path = Some(path);
         self
     }
 }
@@ -217,6 +226,20 @@ impl Evaluator {
                     }
                 }
             }
+        };
+
+        // Append additive prompt if configured
+        let system_prompt = if let Some(ref append_path) = config.system_prompt_append_path {
+            let append_text = std::fs::read_to_string(append_path).with_context(|| {
+                format!(
+                    "failed to read additive prompt from {}",
+                    append_path.display()
+                )
+            })?;
+            tracing::info!("Appending additive prompt from {}", append_path.display());
+            format!("{}\n\n{}", system_prompt, append_text)
+        } else {
+            system_prompt
         };
 
         let http_client = Client::builder()

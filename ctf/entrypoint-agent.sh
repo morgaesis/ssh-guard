@@ -2,7 +2,7 @@
 set -e
 
 # Start the guard daemon with clean PATH (no shims needed for MCP-only mode)
-ssh-guard server start \
+guard server start \
     --socket /home/agent/.guard/guard.sock \
     &
 
@@ -19,4 +19,4 @@ echo "Remote host: guard-remote (user: agent)" >&2
 echo "" >&2
 
 # Run the MCP server on stdio -- the agent connects here
-exec ssh-guard mcp serve
+exec guard mcp serve

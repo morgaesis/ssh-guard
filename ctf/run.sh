@@ -4,14 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 NETWORK="guard-net"
-BINARY="$PROJECT_DIR/target/release/ssh-guard"
+BINARY="$PROJECT_DIR/target/release/guard"
 
 # Require API key
-if [ -z "${SSH_GUARD_API_KEY:-}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    echo "Error: Set SSH_GUARD_API_KEY or OPENROUTER_API_KEY"
+if [ -z "${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-}}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "Error: Set SSH_GUARD_LLM_API_KEY or OPENROUTER_API_KEY"
     exit 1
 fi
-API_KEY="${SSH_GUARD_API_KEY:-$OPENROUTER_API_KEY}"
+API_KEY="${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}"
 
 # Resolve external DNS for container use
 OPENROUTER_IP=$(dig +short openrouter.ai A | head -1)
@@ -44,7 +44,7 @@ if [ ! -f "$KEYDIR/agent_key" ]; then
 fi
 
 # Copy binary to build context
-cp "$BINARY" "$SCRIPT_DIR/ssh-guard"
+cp "$BINARY" "$SCRIPT_DIR/guard"
 
 # Build containers
 echo "Building guard-remote..."
@@ -56,7 +56,7 @@ podman build -t guard-local -f "$SCRIPT_DIR/Containerfile.local" "$SCRIPT_DIR"
 echo "Building guard-agent (MCP-only mode)..."
 podman build -t guard-agent -f "$SCRIPT_DIR/Containerfile.agent" "$SCRIPT_DIR"
 
-rm -f "$SCRIPT_DIR/ssh-guard"
+rm -f "$SCRIPT_DIR/guard"
 
 # Start remote
 echo "Starting guard-remote..."
@@ -76,7 +76,7 @@ podman run -d \
     --network "$NETWORK" \
     --hostname guard-local \
     --add-host openrouter.ai:$OPENROUTER_IP \
-    -e "SSH_GUARD_API_KEY=$API_KEY" \
+    -e "SSH_GUARD_LLM_API_KEY=$API_KEY" \
     -v "$KEYDIR/agent_key:/home/agent/.ssh/id_ed25519:ro" \
     -v "$KEYDIR/agent_key.pub:/home/agent/.ssh/id_ed25519.pub:ro" \
     guard-local
@@ -92,7 +92,7 @@ echo "=== Usage ==="
 echo "Shell mode:    podman exec -it guard-local bash"
 echo "MCP-only CTF:  podman run -i --rm --name guard-agent --network $NETWORK --hostname guard-agent \\"
 echo "                 --add-host openrouter.ai:$OPENROUTER_IP \\"
-echo "                 -e SSH_GUARD_API_KEY=\$SSH_GUARD_API_KEY \\"
+echo "                 -e SSH_GUARD_LLM_API_KEY=\$SSH_GUARD_LLM_API_KEY \\"
 echo "                 -v $KEYDIR/agent_key:/home/agent/.ssh/id_ed25519:ro \\"
 echo "                 guard-agent"
 echo "View logs:     podman logs guard-local"

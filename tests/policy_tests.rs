@@ -1,5 +1,5 @@
+use guard::policy::PolicyEngine;
 use serde::Deserialize;
-use ssh_guard::policy::PolicyEngine;
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
@@ -278,7 +278,7 @@ fn test_ctf_scenarios_parsable() {
 
 #[test]
 fn test_empty_mode_engines_have_no_patterns() {
-    use ssh_guard::policy::PolicyMode;
+    use guard::policy::PolicyMode;
 
     for mode in [PolicyMode::Readonly, PolicyMode::Safe, PolicyMode::Paranoid] {
         let engine = PolicyEngine::from_mode(mode);

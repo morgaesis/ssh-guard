@@ -1,26 +1,23 @@
-# ssh-guard
+# guard
 
-SSH wrapper that sends every command to an LLM for approval before execution. Give your AI agents SSH access without giving them the keys to the kingdom.
+LLM-evaluated command gate for AI agents. Every command gets evaluated by a fast LLM call before execution. Approved commands run normally. Denied commands return an explanation.
 
-```bash
-ssh-guard prod-server 'ls -la /etc/nginx/'
-# drwxr-xr-x 8 root root 4096 Mar 10 14:22 .
-# -rw-r--r-- 1 root root 1482 Mar 10 14:22 nginx.conf
-# ...
-
-ssh-guard prod-server 'rm -rf /etc/nginx/'
-# ssh-guard: DENIED (risk=9) - Recursive deletion of system config directory.
 ```
+$ guard run ls -la /etc/nginx/
+drwxr-xr-x 8 root root 4096 Mar 10 14:22 .
+-rw-r--r-- 1 root root 1482 Mar 10 14:22 nginx.conf
 
-Zero output on approval. Denied commands print the reason and risk score.
-
-![ssh-guard demo](./docs/demo.svg)
+$ guard run rm -rf /etc/nginx/
+DENIED: Recursive deletion of system config directory.
+```
 
 ## Why
 
-AI agents (Claude Code, Aider, OpenHands, CrewAI, LangChain, etc.) increasingly need SSH access to remote servers for debugging, log analysis, and ops tasks. But a single hallucinated `rm -rf` or `kubectl delete namespace` can take down production.
+AI agents (Claude Code, Codex, Aider, OpenHands, CrewAI, etc.) increasingly need command execution access for debugging, log analysis, and ops tasks. A single hallucinated `rm -rf` or `kubectl delete namespace` can take down production.
 
-ssh-guard sits between the agent and SSH. Every command gets evaluated by a fast, cheap LLM call (Gemini Flash by default via OpenRouter, ~0.001c per decision) before it reaches the server. Approved commands run silently. Denied commands return an error with explanation.
+Guard sits between the agent and the shell. Every command gets evaluated by an LLM (Gemini 3 Flash via OpenRouter by default) before it reaches the system. The LLM analyzes intent and risk, not just pattern matching, so it catches obfuscated attacks and novel command chains that static policies miss.
+
+Cost is negligible: each evaluation uses roughly 800-1200 tokens, costing $0.00005-0.00015 per decision with Gemini 3 Flash. A full 60-command CTF adversarial test suite runs for under $0.01 total.
 
 ## Install
 
@@ -36,114 +33,227 @@ See [INSTALL.md](INSTALL.md) for install options and [DEPLOYMENT.md](DEPLOYMENT.
 
 ```bash
 # Set your API key (OpenRouter, or any OpenAI-compatible endpoint)
-export SSH_GUARD_API_KEY="your-key-here"
-# Or: export OPENROUTER_API_KEY="your-key-here"
+export SSH_GUARD_LLM_API_KEY="your-key-here"
 
-# Use it like ssh
-ssh-guard myserver 'uptime'
-ssh-guard myserver 'cat /var/log/syslog'
-ssh-guard myserver 'sudo systemctl status nginx'
+# Start the server
+guard server start &
 
-# These will be denied in readonly mode:
-ssh-guard myserver 'rm -rf /tmp/*'
-ssh-guard myserver 'systemctl restart nginx'
+# Execute commands through the guard
+guard run uptime
+guard run cat /var/log/syslog
+guard run ps aux
+
+# These will be denied:
+guard run rm -rf /tmp/*
+guard run sudo su
 ```
 
 ## Modes
 
-Three built-in policies, set via `SSH_GUARD_MODE`:
+Set via `SSH_GUARD_MODE`:
 
-| Mode       | Default | Use case                                                                                                                                                  |
-| ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `readonly` | Yes     | Agents that only need to observe. Blocks all writes, installs, service changes.                                                                           |
-| `paranoid` |         | Like readonly, but also blocks reading file contents, env vars, logs. Only structural metadata (ls, ps, df, etc). Prevents secret exfiltration.           |
-| `safe`     |         | Agents that need to do work. Allows targeted writes and service restarts, blocks destructive/broad operations (rm -rf, reboot, kubectl delete namespace). |
+| Mode | Description |
+|---|---|
+| `default` | Balanced. Blocks destructive operations, privilege escalation, reverse shells, and obfuscated payloads. Allows routine admin commands like `ls`, `ps`, `cat`, `grep`, `df`. |
+| `safe` | Permissive. Only blocks commands with clear destructive or escalation intent. Relies on architectural defenses (`env_clear`, output redaction) for secret protection. Allows reading any file. |
+| `paranoid` | Restrictive. Blocks writes, sensitive file reads, network connections, shells, interpreters, and chained commands. Only allows basic read-only inspection (`id`, `hostname`, `uname`, `ls`, `ps`, `df`). |
 
 ```bash
-SSH_GUARD_MODE=safe ssh-guard server 'systemctl restart myapp'  # allowed
-SSH_GUARD_MODE=paranoid ssh-guard server 'cat /etc/passwd'      # denied
+SSH_GUARD_MODE=safe guard run cat /etc/shadow     # allowed (output redacted)
+SSH_GUARD_MODE=paranoid guard run cat /etc/shadow  # denied
 ```
 
-All modes evaluate `sudo` by the underlying command, not the keyword itself:
+All modes evaluate `sudo` by the underlying command:
 
 ```bash
-sudo ls /etc/nginx/        # readonly: allowed (read operation)
-sudo rm -rf /etc/nginx/    # readonly: denied  (write operation)
-sudo systemctl restart app # safe: allowed     (targeted restart)
+guard run sudo ls /etc/nginx/        # default: allowed (read operation)
+guard run sudo rm -rf /etc/nginx/    # default: denied  (destructive)
+guard run sudo systemctl restart app # safe: allowed     (targeted restart)
 ```
 
 ## Configuration
 
-All configuration via environment variables or `.env` files.
+All configuration via environment variables, CLI flags, or `.env` files.
 
-ssh-guard walks up from your current directory to `/` looking for `.env` files (closest wins), so you can scope config per project.
+Guard walks up from your current directory to `/` looking for `.env` files (closest wins), so you can scope config per project.
 
-| Variable                | Default                                         | Description                            |
-| ----------------------- | ----------------------------------------------- | -------------------------------------- |
-| `SSH_GUARD_API_KEY`     | `$OPENROUTER_API_KEY`                           | LLM API key (required)                 |
-| `SSH_GUARD_API_URL`     | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint         |
-| `SSH_GUARD_MODEL`       | `google/gemini-2.0-flash-001`                   | Model for command evaluation           |
-| `SSH_GUARD_API_TYPE`    | `openai`                                        | `openai` or `anthropic`                |
-| `SSH_GUARD_MODE`        | `readonly`                                      | `readonly`, `paranoid`, or `safe`      |
-| `SSH_GUARD_PROMPT`      | (per mode)                                      | Custom system prompt (overrides mode)  |
-| `SSH_GUARD_PASSTHROUGH` | (none)                                          | Always-allow commands, comma-separated |
-| `SSH_GUARD_LOG`         | (none)                                          | Audit log file path                    |
-| `SSH_GUARD_REDACT`      | `true`                                          | Redact secrets from command output     |
-| `SSH_GUARD_SSH_BIN`     | `/usr/bin/ssh`                                  | Path to real ssh binary                |
-| `SSH_GUARD_TIMEOUT`     | `30`                                            | LLM call timeout (seconds)             |
-| `SSH_GUARD_MAX_TOKENS`  | `512`                                           | Max LLM response tokens                |
+| Variable | Default | Description |
+|---|---|---|
+| `SSH_GUARD_LLM_API_KEY` | `$OPENROUTER_API_KEY` | LLM API key (required) |
+| `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `SSH_GUARD_MODEL` | `google/gemini-3-flash-preview` | Model for command evaluation |
+| `SSH_GUARD_MODE` | `default` | `default`, `safe`, or `paranoid` |
+| `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
+| `SSH_GUARD_TIMEOUT` | `10` | LLM call timeout (seconds) |
+| `SSH_GUARD_GPG_ID` | (none) | GPG key ID for secret encryption |
+| `SSH_GUARD_BACKEND` | (auto) | Secret backend (`file`, `gpg`) |
 
 See [`.env.example`](.env.example) for a copyable template.
 
-## Agent integration
+## Examples
 
-Point your agent's SSH command at `ssh-guard` instead of `ssh`.
+### Basic server with default mode
 
-## MCP server
-
-`ssh-guard` can also run as a stdio MCP server so agents call a tool instead of shelling out to the CLI directly.
+Start the guard server and execute commands through it:
 
 ```bash
-# Reuse the existing guard daemon configuration
-ssh-guard config set-server ~/.guard/guard.sock
+export SSH_GUARD_LLM_API_KEY="sk-or-v1-..."
 
-# Start MCP over stdio
-ssh-guard mcp serve
+guard server start --socket /tmp/guard.sock &
+guard config set-server /tmp/guard.sock
+
+# Allowed: routine inspection
+guard run hostname
+# guard-host
+
+guard run ps aux
+# USER  PID %CPU %MEM    VSZ   RSS TTY STAT START   TIME COMMAND
+# root    1  0.0  0.0   4624  3456 ?   Ss   10:00   0:00 /sbin/init
+
+# Denied: destructive
+guard run rm -rf /
+# DENIED: Recursive deletion of root filesystem
+
+# Denied: obfuscated attack
+guard run bash -c 'eval $(echo cm0gLXJmIC8= | base64 -d)'
+# DENIED: Base64-decoded payload piped through eval
 ```
 
-The server exposes one tool, `ssh_guard_run`, with this input shape:
+### Safe mode with output redaction
+
+Safe mode allows almost everything, relying on architectural defenses for secret protection:
+
+```bash
+SSH_GUARD_MODE=safe guard server start --socket /tmp/guard.sock &
+
+# Allowed: reading files (secrets in output are redacted)
+guard run cat /etc/hosts
+# 127.0.0.1 localhost
+
+guard run cat /app/.env
+# DB_HOST=localhost
+# DB_PASSWORD=[REDACTED]
+# API_TOKEN=[REDACTED]
+
+# Still denied: privilege escalation
+guard run sudo su
+# DENIED: Escalation to root shell
+```
+
+### Paranoid mode for untrusted agents
+
+Paranoid mode locks down to basic read-only inspection:
+
+```bash
+SSH_GUARD_MODE=paranoid guard server start --socket /tmp/guard.sock &
+
+# Allowed: basic system state
+guard run id
+# uid=1000(agent) gid=1000(agent) groups=1000(agent)
+
+guard run df -h
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/sda1       100G   45G   55G  45% /
+
+# Denied: file reading
+guard run cat /etc/passwd
+# DENIED: File reading blocked in paranoid mode
+
+# Denied: environment inspection
+guard run env
+# DENIED: Environment variable dump blocked in paranoid mode
+```
+
+### Static deny policy
+
+For fast-reject of known-bad patterns without an LLM call, add a static deny policy:
+
+```bash
+guard server start --policy examples/deny-policy.yaml --socket /tmp/guard.sock &
+```
+
+Static patterns are checked first. If a command matches a deny pattern, it is rejected immediately without an LLM call. Commands that pass static policy are then evaluated by the LLM.
+
+See [`examples/deny-policy.yaml`](examples/deny-policy.yaml) for a reference policy with documented limitations of static glob matching.
+
+### Custom system prompt
+
+Replace the built-in prompt entirely for a specific deployment:
+
+```bash
+guard server start --system-prompt /etc/guard/my-prompt.txt --socket /tmp/guard.sock &
+```
+
+Or place a prompt file at `~/.config/guard/system-prompt.txt` to override automatically.
+
+### Additive prompt
+
+Append environment-specific instructions to the built-in prompt without replacing it:
+
+```bash
+# Via CLI flag
+guard server start --system-prompt-append /etc/guard/extra-rules.txt &
+
+# Or via environment variable
+SSH_GUARD_PROMPT_APPEND=/etc/guard/extra-rules.txt guard server start &
+```
+
+Example additive prompt (`extra-rules.txt`):
+
+```
+Additional rules for this environment:
+
+- This server runs a PostgreSQL database. Allow SELECT queries via psql but deny DROP, DELETE, or TRUNCATE.
+- The /opt/app directory contains the application. Allow reads but deny writes.
+- Allow docker ps and docker logs but deny docker exec, docker run, and docker rm.
+```
+
+The additive prompt is appended to whichever base prompt is active (default, safe, paranoid, or custom), letting operators customize behavior without maintaining a full prompt fork.
+
+## Agent integration
+
+Point your agent's command execution at `guard run` instead of direct execution.
+
+### MCP server
+
+Guard can run as a stdio MCP server so agents call a tool instead of shelling out:
+
+```bash
+guard config set-server ~/.guard/guard.sock
+guard mcp serve
+```
+
+The server exposes a `guard_run` tool:
 
 ```json
 {
-  "target": "prod-server",
-  "command": "journalctl -u nginx --no-pager -n 50",
-  "user": "deploy",
-  "identity_key": "prod_deploy_key"
+  "binary": "ps",
+  "args": ["aux"]
 }
 ```
 
-The tool returns structured fields matching the existing guard response:
+Response:
 
 ```json
 {
   "allowed": true,
-  "reason": "Allowed by policy",
+  "reason": "Read-only process listing",
   "exit_code": 0,
-  "stdout": "...",
+  "stdout": "USER  PID ...",
   "stderr": null
 }
 ```
 
-If the guard daemon denies a command, the MCP tool returns `isError: true` with the denial reason, so the agent can revise the command instead of guessing from process exit codes.
+Denied commands return `isError: true` with the denial reason, so the agent can revise the command.
 
 <details>
 <summary><b>Claude Code (CLAUDE.md)</b></summary>
 
 ```markdown
-# SSH Access
+# Command Execution
 
-Use `ssh-guard` instead of `ssh` for all remote commands.
-Never use interactive SSH sessions.
+Use the guard MCP server for all command execution.
+Never use interactive sessions.
 ```
 
 </details>
@@ -152,10 +262,9 @@ Never use interactive SSH sessions.
 <summary><b>OpenHands / SWE-Agent</b></summary>
 
 ```bash
-# In agent config or sandbox setup
-export SSH_GUARD_API_KEY="..."
-export SSH_GUARD_MODE=readonly
-alias ssh=ssh-guard
+export SSH_GUARD_LLM_API_KEY="..."
+export SSH_GUARD_MODE=default
+alias ssh=guard
 ```
 
 </details>
@@ -166,12 +275,11 @@ alias ssh=ssh-guard
 ```python
 import subprocess
 
-def ssh_command(host: str, command: str) -> str:
-    """Execute a command on a remote host via ssh-guard."""
+def guarded_command(command: str, args: list[str]) -> str:
+    """Execute a command through the guard."""
     result = subprocess.run(
-        ["ssh-guard", host, command],
+        ["guard", "run", command] + args,
         capture_output=True, text=True, timeout=60,
-        env={**os.environ, "SSH_GUARD_MODE": "readonly"}
     )
     if result.returncode != 0:
         return f"DENIED: {result.stderr.strip()}"
@@ -180,59 +288,37 @@ def ssh_command(host: str, command: str) -> str:
 
 </details>
 
-<details>
-<summary><b>Generic: alias ssh to ssh-guard</b></summary>
+## Security model
 
-```bash
-# In the agent's shell init or .env
-alias ssh=ssh-guard
-export SSH_GUARD_API_KEY="..."
-```
+Guard provides defense in depth through three layers:
 
-</details>
+1. **Environment isolation** (`env_clear`): Child processes inherit only safe environment variables (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, etc.). API keys and secrets are not accessible to executed commands.
 
-## Output redaction
+2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets) are exact-match redacted from stdout/stderr before returning to the agent. Regex patterns catch `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, PEM blocks, and JWTs.
 
-When `SSH_GUARD_REDACT=true` (default), command output is filtered through pattern-based redaction before reaching the agent:
-
-```CFG
-DB_PASSWORD=hunter2         ->  DB_PASSWORD=[REDACTED]
-export API_TOKEN="sk-..."   ->  export API_TOKEN="[REDACTED]"
------BEGIN PRIVATE KEY----  ->  -----BEGIN PRIVATE KEY---- [REDACTED]
-```
-
-Patterns matched: `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL`, `bearer`, PEM blocks, `sk-*` prefixed strings, JWTs.
+3. **LLM evaluation**: Each command is analyzed for destructive intent, privilege escalation, reverse shells, obfuscated payloads, tool side-channel abuse, and prompt injection. The LLM evaluates the full command including all chained parts.
 
 ## Audit logging
 
+Guard logs all decisions via `tracing`. Configure log level with `RUST_LOG`:
+
 ```bash
-export SSH_GUARD_LOG=/var/log/ssh-guard.log
+RUST_LOG=info guard server start    # decisions + token usage
+RUST_LOG=debug guard server start   # verbose request/response logging
 ```
 
-Logs denials always. Logs approvals only when risk score >= 4. Format:
+LLM token usage is logged per evaluation:
 
-```logs
-[2025-03-12T14:22:01+00:00] DENIED risk=9 cmd=rm -rf / reason=Recursive deletion of root filesystem
-[2025-03-12T14:22:15+00:00] APPROVED risk=4 cmd=sudo cat /etc/hosts reason=Reading system config file
+```
+[LLM_USAGE] model=google/gemini-3-flash-preview prompt_tokens=892 completion_tokens=45 total_tokens=937
 ```
 
 ## Limitations
 
-Be honest about what this is and isn't:
-
-- **Not a sandbox.** ssh-guard is a policy gate, not an isolation boundary. A sufficiently creative command chain might get past the LLM. Use it as defense-in-depth alongside proper IAM, restricted users, and network segmentation.
-- **No interactive sessions.** Agents get command execution only. Humans should use `ssh` directly.
-- **LLM latency.** Each command adds ~0.5-2s for the LLM call. Use `SSH_GUARD_PASSTHROUGH` for commands you know are safe to skip the check.
+- **Not a sandbox.** Guard is a policy gate, not an isolation boundary. Defense-in-depth (seccomp, read-only FS, restricted users, network segmentation) is still needed for adversarial environments.
+- **No interactive sessions.** Agents get command execution only.
+- **LLM latency.** Each command adds ~0.5-2s for the LLM call.
 - **Fail-closed.** If the LLM call fails or returns unparseable output, the command is denied.
-
-## Recording a demo
-
-A [VHS tape file](./demo.tape) is included for generating the terminal recording:
-
-```bash
-# Install VHS: https://github.com/charmbracelet/vhs
-vhs demo.tape  # produces docs/demo.svg
-```
 
 ## License
 

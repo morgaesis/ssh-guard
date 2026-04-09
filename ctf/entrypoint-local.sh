@@ -5,11 +5,11 @@ set -e
 CLEAN_PATH="$PATH"
 
 # Generate shims for guarded commands
-ssh-guard shim ssh,scp,curl,wget
+guard shim ssh,scp,curl,wget
 
 # Start the guard daemon with CLEAN PATH (no shims)
 # so the daemon's own curl/network calls bypass the guard
-PATH="$CLEAN_PATH" ssh-guard server start \
+PATH="$CLEAN_PATH" guard server start \
     --socket /home/agent/.guard/guard.sock \
     --shim-dir /home/agent/.guard/shims \
     &

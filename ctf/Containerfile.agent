@@ -10,12 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -s /bin/false agent
 
 # Install guard binary
-COPY ssh-guard /usr/local/bin/ssh-guard
-RUN chmod 755 /usr/local/bin/ssh-guard
+COPY guard /usr/local/bin/guard
+RUN chmod 755 /usr/local/bin/guard
 
 # Client config
-RUN mkdir -p /home/agent/.config/ssh-guard /home/agent/.guard /home/agent/.ssh
-COPY client.yaml /home/agent/.config/ssh-guard/client.yaml
+RUN mkdir -p /home/agent/.config/guard /home/agent/.guard /home/agent/.ssh
+COPY client.yaml /home/agent/.config/guard/client.yaml
 
 RUN chown -R agent:agent /home/agent
 
