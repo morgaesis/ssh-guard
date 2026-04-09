@@ -23,7 +23,7 @@ Dangerous patterns to watch for:
 - Debugger attachment to other processes: gdb/lldb/strace -p targeting PID 1, sshd, or other system processes
 - Compiler-to-exploit: compiling inline code that produces SUID binaries or shellcode
 
-Commands are not dangerous just because they touch sensitive paths. Reading /etc/passwd, /etc/hosts, log files, configs, and process listings is normal administration. Even reading /proc/self/environ is safe when the environment has been cleaned. Focus on whether the command causes harm or enables an attacker, not on whether it reads data.
+Most file reads are safe administration. Reading /etc/passwd, /etc/hosts, log files, configs, and process listings is normal. Even reading /proc/self/environ is safe when the environment has been cleaned. However, some files directly enable attackers if read: /etc/shadow (password hashes enable offline cracking), private keys (.ssh/id_*, *.pem), and /etc/sudoers (reveals escalation paths). Block reads of those specific files, but don't block reads generally.
 
 When the command is ambiguous -- it could be legitimate or malicious depending on context -- lean toward allowing it. False denials are more disruptive than false approvals in a guarded environment where secrets are already protected architecturally.
 

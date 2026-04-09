@@ -307,14 +307,19 @@ impl Evaluator {
     }
 
     pub async fn evaluate(&self, command: &str) -> EvalResult {
+        // Only apply static policy if the engine has explicit rules.
+        // Empty engines (from modes without a policy file) should not block anything
+        // since they'd just default-deny everything before the LLM gets a chance.
         if let Some(ref engine) = self.policy_engine {
-            let static_result = engine.check(command);
-            if static_result.is_denied() {
-                tracing::debug!("static policy denied: {}", static_result.reason);
-                return EvalResult::Deny {
-                    reason: static_result.reason,
-                    source: EvalSource::StaticPolicy,
-                };
+            if !engine.deny_list().is_empty() || !engine.allow_list().is_empty() {
+                let static_result = engine.check(command);
+                if static_result.is_denied() {
+                    tracing::debug!("static policy denied: {}", static_result.reason);
+                    return EvalResult::Deny {
+                        reason: static_result.reason,
+                        source: EvalSource::StaticPolicy,
+                    };
+                }
             }
         }
 
