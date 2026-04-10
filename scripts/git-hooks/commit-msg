@@ -1,0 +1,42 @@
+#!/bin/sh
+# Conventional Commits validator (no dependencies).
+# Install: ln -sf ../../scripts/git-hooks/commit-msg .git/hooks/commit-msg
+
+set -e
+
+msg_file="$1"
+first_line=$(head -n1 "$msg_file")
+
+# Allow merges, reverts, fixups, and bot commits to bypass.
+case "$first_line" in
+    "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+esac
+
+# Allow empty commits (cherry-pick edge cases).
+[ -z "$first_line" ] && exit 0
+
+types="feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+pattern="^(${types})(\([a-z0-9_/.-]+\))?!?: .+"
+
+if ! printf '%s' "$first_line" | grep -qE "$pattern"; then
+    cat >&2 <<EOF
+ERROR: commit message does not follow Conventional Commits.
+
+Got:
+    $first_line
+
+Expected format:
+    <type>(<optional scope>): <subject>
+
+Allowed types:
+    feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+
+Examples:
+    feat(server): add additive prompt support
+    fix(evaluate): handle empty policy engine
+    chore(deps): bump tokio to 1.40
+
+See https://www.conventionalcommits.org/
+EOF
+    exit 1
+fi

@@ -16,9 +16,39 @@ A `.pre-commit-config.yaml` is included. Install with:
 ```bash
 pip install pre-commit
 pre-commit install
+pre-commit install --hook-type commit-msg
 ```
 
-This runs `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo audit` on each commit.
+This runs `cargo fmt`, `cargo clippy`, `cargo test`, `cargo audit`, and validates commit messages against Conventional Commits format.
+
+## Conventional commits
+
+Commit messages must follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<optional scope>): <subject>
+```
+
+Allowed types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+
+Examples:
+
+```
+feat(server): add additive prompt support
+fix(evaluate): handle empty policy engine
+docs(readme): update pricing for Gemini 3 Flash
+chore(deps): bump tokio to 1.40
+```
+
+### Installing the commit-msg hook (without pre-commit framework)
+
+If you don't want to install the Python `pre-commit` framework, a standalone shell script is available at `scripts/git-hooks/commit-msg`. Install it locally with:
+
+```bash
+ln -sf ../../scripts/git-hooks/commit-msg .git/hooks/commit-msg
+```
+
+The symlink picks up changes to the tracked script automatically. The standalone hook has no dependencies beyond `sh` and `grep`.
 
 ## Recording a demo
 
