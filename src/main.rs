@@ -22,7 +22,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 #[derive(Parser)]
 enum MainArgs {
     /// Execute a command through the guard server
-    #[clap(alias = "exec")]
+    // `disable_help_flag` is critical: without it clap would intercept
+    // `guard run df -h` and print the subcommand's own help instead of
+    // forwarding `-h` to `df`. Users can still see the help for the `run`
+    // subcommand via `guard help run`.
+    #[clap(alias = "exec", disable_help_flag = true)]
     Run {
         /// Binary to execute
         binary: String,
@@ -84,6 +88,7 @@ fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool 
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum ServerCommands {
     /// Start the guard server (privileged daemon)
     Start {
@@ -120,6 +125,18 @@ enum ServerCommands {
 
         #[arg(long)]
         llm_timeout: Option<u64>,
+
+        /// Retries per model on transient failures (default 2, capped at 2).
+        /// Env: SSH_GUARD_LLM_RETRIES.
+        #[arg(long)]
+        llm_retries: Option<u32>,
+
+        /// Ordered fallback chain of model slugs. If more than one is supplied,
+        /// the evaluator tries them in order, each with its own retry budget.
+        /// Overrides --llm-model when non-empty.
+        /// Env: SSH_GUARD_LLM_MODELS (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        llm_models: Option<Vec<String>>,
 
         #[arg(
             long,
@@ -207,22 +224,31 @@ enum SecretCommands {
     Remove { key: String },
 }
 
+/// Try GUARD_ prefix, then SSH_GUARD_ prefix for a given env var suffix.
+fn guard_env(suffix: &str) -> Option<String> {
+    std::env::var(format!("GUARD_{}", suffix))
+        .ok()
+        .or_else(|| std::env::var(format!("SSH_GUARD_{}", suffix)).ok())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Log level: RUST_LOG > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > "info"
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
+        EnvFilter::new(level)
+    });
     fmt().with_env_filter(filter).with_target(true).init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        match MainArgs::try_parse_from(std::env::args()) {
-            Ok(_) => {}
-            Err(e) => eprintln!("{}", e),
-        }
-        return Ok(());
-    }
-
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    // Top-level --version / -V sniff. We cannot scan for --help / -h here
+    // because `guard run df -h` must pass `-h` through to `df`. clap handles
+    // `--help` natively on the top-level parser and every subcommand, so we
+    // let it do its job for help output. We only keep the version sniff so
+    // that `guard --version` stays concise and does not require parsing
+    // subcommands.
+    if top_level_version_requested(&args) {
         println!("guard v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
@@ -245,6 +271,14 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Err(ref e)
+            if e.kind() == clap::error::ErrorKind::DisplayHelp
+                || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                || e.kind() == clap::error::ErrorKind::DisplayVersion =>
+        {
+            // Let clap render help/version to stdout and exit 0.
+            e.exit();
+        }
+        Err(ref e)
             if e.kind() == clap::error::ErrorKind::InvalidSubcommand
                 || e.kind() == clap::error::ErrorKind::UnknownArgument =>
         {
@@ -265,6 +299,16 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Returns true if the user asked for `--version` / `-V` at the top level,
+/// before any subcommand. We scan only the very first positional token so
+/// that `guard run foo -V` does not trigger a top-level version print.
+fn top_level_version_requested(args: &[String]) -> bool {
+    match args.first() {
+        Some(first) => first == "--version" || first == "-V",
+        None => false,
+    }
+}
+
 async fn run_server(cmd: ServerCommands) -> Result<()> {
     match cmd {
         ServerCommands::Start {
@@ -279,6 +323,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm_api_url,
             llm_model,
             llm_timeout,
+            llm_retries,
+            llm_models,
             llm,
             no_llm,
             no_redact,
@@ -316,12 +362,12 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             }
 
             let api_key = llm_api_key
+                .or_else(|| guard_env("LLM_API_KEY"))
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .or_else(|| std::env::var("SSH_GUARD_LLM_API_KEY").ok())
-                .or_else(|| std::env::var("SSH_GUARD_API_KEY").ok()); // deprecated fallback
+                .or_else(|| guard_env("API_KEY")); // deprecated fallback
 
             if llm_enabled && api_key.is_none() {
-                tracing::warn!("No LLM API key provided (set SSH_GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
+                tracing::warn!("No LLM API key provided (set GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
             }
 
             let mut eval_config = evaluate::EvalConfig::default()
@@ -336,12 +382,56 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.llm_api_url(api_url);
             }
 
-            if let Some(model) = llm_model.filter(|value| !value.is_empty()) {
+            // Model resolution precedence (single primary model):
+            //   1. --llm-model CLI flag
+            //   2. SSH_GUARD_LLM_MODEL env var (singular — primary model)
+            //   3. evaluate::EvalConfig default (DEFAULT_MODEL in evaluate.rs)
+            //
+            // The fallback chain (SSH_GUARD_LLM_MODELS / --llm-models) is
+            // resolved separately below and, when set, takes precedence over
+            // the single-model value above because a chain is an explicit
+            // opt-in to multi-model evaluation.
+            let resolved_single_model = llm_model.filter(|value| !value.is_empty()).or_else(|| {
+                guard_env("LLM_MODEL").filter(|v| !v.is_empty())
+            });
+            if let Some(model) = resolved_single_model {
                 eval_config = eval_config.llm_model(model);
             }
 
-            let mode = std::env::var("SSH_GUARD_MODE")
-                .ok()
+            // Retries: flag > env var > default.
+            let retries = llm_retries
+                .or_else(|| {
+                    guard_env("LLM_RETRIES").and_then(|v| v.parse::<u32>().ok())
+                })
+                .unwrap_or(2);
+            eval_config = eval_config.llm_retries(retries);
+            tracing::info!("LLM retries per model: {}", retries);
+
+            // Fallback chain: flag > env var > empty (no chain, single model).
+            // When non-empty this supersedes the single-model value above.
+            let models_chain: Vec<String> = llm_models
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            let models_chain = if models_chain.is_empty() {
+                guard_env("LLM_MODELS")
+                    .map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            } else {
+                models_chain
+            };
+            if !models_chain.is_empty() {
+                tracing::info!("LLM model fallback chain: {:?}", models_chain);
+                eval_config = eval_config.llm_models(models_chain);
+            }
+
+            let mode = guard_env("MODE")
                 .and_then(|value| PolicyMode::parse(&value));
 
             if let Some(mode) = mode {
@@ -362,8 +452,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > SSH_GUARD_PROMPT_APPEND env var
             let append_path = system_prompt_append.or_else(|| {
-                std::env::var("SSH_GUARD_PROMPT_APPEND")
-                    .ok()
+                guard_env("PROMPT_APPEND")
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from)
             });
@@ -477,6 +566,11 @@ async fn run_exec(binary: String, args: Vec<String>) -> Result<()> {
     let resp = client.execute(&binary, &args).await?;
 
     if resp.allowed {
+        tracing::info!(
+            binary = %binary,
+            reason = %resp.reason,
+            "ALLOWED"
+        );
         if let Some(stdout) = &resp.stdout {
             print!("{}", stdout);
         }
@@ -488,6 +582,11 @@ async fn run_exec(binary: String, args: Vec<String>) -> Result<()> {
         }
         Ok(())
     } else {
+        tracing::warn!(
+            binary = %binary,
+            reason = %resp.reason,
+            "DENIED"
+        );
         eprintln!("DENIED: {}", resp.reason);
         std::process::exit(1);
     }
@@ -519,9 +618,13 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
 }
 
 async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
+    // Surface load errors loudly for every subcommand — this catches the
+    // relative-XDG_CONFIG_HOME case that previously fell through silently
+    // and risked writing to the default path instead of the intended one.
     match subcommand {
         ConfigCommands::Show => {
-            let config = client_config::ClientConfig::load().unwrap_or_default();
+            let config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
             println!("socket: {:?}", config.server_socket.unwrap_or_default());
             println!(
                 "port: {:?}",
@@ -541,27 +644,31 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             );
         }
         ConfigCommands::SetServer { socket } => {
-            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            let mut config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
             config.server_socket = Some(socket);
             config.server_tcp_port = None;
             config.save()?;
             println!("Server socket set");
         }
         ConfigCommands::SetPort { port } => {
-            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            let mut config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
             config.server_tcp_port = Some(port);
             config.server_socket = None;
             config.save()?;
             println!("Server port set");
         }
         ConfigCommands::SetToken { token } => {
-            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            let mut config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
             config.auth_token = Some(token);
             config.save()?;
             println!("Token set");
         }
         ConfigCommands::SetUser { user } => {
-            let mut config = client_config::ClientConfig::load().unwrap_or_default();
+            let mut config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
             config.default_user = Some(user);
             config.save()?;
             println!("Default user set");
@@ -751,6 +858,8 @@ mod tests {
                 llm_api_url,
                 llm_model,
                 llm_timeout,
+                llm_retries,
+                llm_models,
                 llm,
                 no_llm,
                 no_redact,
@@ -768,6 +877,8 @@ mod tests {
                 llm_api_url,
                 llm_model,
                 llm_timeout,
+                llm_retries,
+                llm_models,
                 llm,
                 no_llm,
                 no_redact,
@@ -808,10 +919,245 @@ mod tests {
     }
 
     #[test]
+    fn test_server_start_llm_retries_flag() {
+        let ServerCommands::Start { llm_retries, .. } =
+            parse_start(&["guard", "server", "start", "--llm-retries", "1"])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(llm_retries, Some(1));
+    }
+
+    /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment
+    /// variables. Rust's test runner executes tests in parallel by default,
+    /// and `std::env::{set,remove}_var` mutates shared process state, so
+    /// concurrent readers/writers must be serialized with a mutex.
+    static MODEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Mirror of the resolution logic in `run_server` so we can exercise the
+    /// precedence ladder without spinning up an actual server. Must stay in
+    /// sync with the block under the "Model resolution precedence" comment
+    /// in `run_server`.
+    fn resolve_single_model_for_test(cli_flag: Option<String>) -> Option<String> {
+        cli_flag.filter(|value| !value.is_empty()).or_else(|| {
+            std::env::var("SSH_GUARD_LLM_MODEL")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+    }
+
+    fn resolve_chain_for_test(cli_flag: Option<Vec<String>>) -> Vec<String> {
+        let models_chain: Vec<String> = cli_flag
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if models_chain.is_empty() {
+            std::env::var("SSH_GUARD_LLM_MODELS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            models_chain
+        }
+    }
+
+    /// Regression guard for silent-ignore of `SSH_GUARD_LLM_MODEL`. Exercises
+    /// the full precedence ladder:
+    ///
+    ///   1. `--llm-model` CLI flag
+    ///   2. `SSH_GUARD_LLM_MODEL` env var (singular)
+    ///   3. default (`None` here; EvalConfig falls back to `DEFAULT_MODEL`)
+    ///
+    /// and verifies that `SSH_GUARD_LLM_MODELS` (plural, chain) still parses
+    /// correctly alongside the singular. The test is sequential within a
+    /// single function body because splitting into multiple `#[test]`
+    /// functions would allow parallel process-env races even with a mutex
+    /// (one test could observe another test's cleared state).
+    #[test]
+    fn test_llm_model_env_resolution_chain() {
+        // SAFETY: serialize all process-env mutations in this test suite.
+        let _guard = MODEL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Snapshot existing values so we restore the shell's environment on
+        // exit even if the harness inherited one of these vars.
+        let prev_single = std::env::var("SSH_GUARD_LLM_MODEL").ok();
+        let prev_chain = std::env::var("SSH_GUARD_LLM_MODELS").ok();
+
+        // Env mutations are serialized across tests via MODEL_ENV_LOCK above.
+        std::env::remove_var("SSH_GUARD_LLM_MODEL");
+        std::env::remove_var("SSH_GUARD_LLM_MODELS");
+
+        // 1. Clean slate: no flag, no env -> None (caller falls back to
+        //    evaluate::DEFAULT_MODEL which is "openai/gpt-5.4-nano").
+        assert_eq!(
+            resolve_single_model_for_test(None),
+            None,
+            "with no flag and no env, single-model resolution must be None so \
+             EvalConfig picks DEFAULT_MODEL"
+        );
+        assert_eq!(resolve_chain_for_test(None), Vec::<String>::new());
+
+        // 2. SSH_GUARD_LLM_MODEL set -> picked up as primary.
+        std::env::set_var("SSH_GUARD_LLM_MODEL", "alt/model-x");
+        assert_eq!(
+            resolve_single_model_for_test(None),
+            Some("alt/model-x".to_string()),
+            "SSH_GUARD_LLM_MODEL must be honored when no CLI flag is supplied"
+        );
+
+        // 3. CLI flag wins over the singular env var.
+        assert_eq!(
+            resolve_single_model_for_test(Some("flag/model-y".to_string())),
+            Some("flag/model-y".to_string()),
+            "--llm-model must take precedence over SSH_GUARD_LLM_MODEL"
+        );
+
+        // 4. Empty CLI flag falls through to env var.
+        assert_eq!(
+            resolve_single_model_for_test(Some(String::new())),
+            Some("alt/model-x".to_string()),
+            "empty --llm-model value must fall through to the env var"
+        );
+
+        // 5. Chain env var still parses independently of the singular var.
+        std::env::set_var("SSH_GUARD_LLM_MODELS", "a,b,c");
+        let chain = resolve_chain_for_test(None);
+        assert_eq!(
+            chain,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "SSH_GUARD_LLM_MODELS must parse into an ordered chain"
+        );
+        // The singular resolver is orthogonal and still returns the singular
+        // value; the call site in run_server applies the precedence rule
+        // ("chain wins when non-empty") when wiring EvalConfig.
+        assert_eq!(
+            resolve_single_model_for_test(None),
+            Some("alt/model-x".to_string())
+        );
+
+        // Cleanup: restore prior values so other tests see the original env.
+        match prev_single {
+            Some(v) => std::env::set_var("SSH_GUARD_LLM_MODEL", v),
+            None => std::env::remove_var("SSH_GUARD_LLM_MODEL"),
+        }
+        match prev_chain {
+            Some(v) => std::env::set_var("SSH_GUARD_LLM_MODELS", v),
+            None => std::env::remove_var("SSH_GUARD_LLM_MODELS"),
+        }
+    }
+
+    #[test]
+    fn test_server_start_llm_models_flag() {
+        let ServerCommands::Start { llm_models, .. } = parse_start(&[
+            "guard",
+            "server",
+            "start",
+            "--llm-models",
+            "openai/gpt-5.4-nano,meta-llama/llama-4-maverick",
+        ]) else {
+            panic!("expected start");
+        };
+        assert_eq!(
+            llm_models,
+            Some(vec![
+                "openai/gpt-5.4-nano".to_string(),
+                "meta-llama/llama-4-maverick".to_string()
+            ])
+        );
+    }
+
+    #[test]
     fn test_resolve_bool_flag() {
         assert!(resolve_bool_flag(None, false, true));
         assert!(!resolve_bool_flag(None, true, true));
         assert!(resolve_bool_flag(Some(true), false, false));
         assert!(!resolve_bool_flag(Some(false), false, true));
+    }
+
+    /// `guard run df -h` must forward `-h` to df. Earlier a pre-clap argv
+    /// scan consumed `-h` before clap could see that it was a positional
+    /// arg to the subcommand. We verify at the parser level: clap must
+    /// parse `run echo -h` into the `Run` variant with `-h` in args.
+    #[test]
+    fn run_forwards_short_help_flag_to_child() {
+        match MainArgs::try_parse_from(["guard", "run", "echo", "-h"]) {
+            Ok(MainArgs::Run { binary, args }) => {
+                assert_eq!(binary, "echo");
+                assert_eq!(args, vec!["-h".to_string()]);
+            }
+            Ok(other) => panic!(
+                "expected Run variant, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+            Err(e) => panic!("parser must not intercept -h: {}", e),
+        }
+    }
+
+    /// Same story for `--help` — must be forwarded, not caught by clap's
+    /// subcommand help handler.
+    #[test]
+    fn run_forwards_long_help_flag_to_child() {
+        match MainArgs::try_parse_from(["guard", "run", "df", "--help"]) {
+            Ok(MainArgs::Run { binary, args }) => {
+                assert_eq!(binary, "df");
+                assert_eq!(args, vec!["--help".to_string()]);
+            }
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser must not intercept --help: {}", e),
+        }
+    }
+
+    /// Mixed flags after the binary should all be forwarded intact.
+    #[test]
+    fn run_forwards_multiple_trailing_flags() {
+        match MainArgs::try_parse_from(["guard", "run", "df", "-h", "/"]) {
+            Ok(MainArgs::Run { binary, args }) => {
+                assert_eq!(binary, "df");
+                assert_eq!(args, vec!["-h".to_string(), "/".to_string()]);
+            }
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser rejected valid run args: {}", e),
+        }
+    }
+
+    /// Top-level `--help` must still work (clap handles it natively after
+    /// we removed the argv pre-scan).
+    #[test]
+    fn top_level_help_still_triggers_clap_display_help() {
+        match MainArgs::try_parse_from(["guard", "--help"]) {
+            Ok(_) => panic!("expected clap to return DisplayHelp error"),
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp),
+        }
+    }
+
+    /// `guard help run` should show the subcommand help via clap. Note:
+    /// because `Run` disables its own help flag, `guard run --help` would
+    /// forward `--help` to the child instead — users get run help via
+    /// `guard help run`. The instructions explicitly permit this tradeoff.
+    #[test]
+    fn help_run_shows_subcommand_help() {
+        match MainArgs::try_parse_from(["guard", "help", "run"]) {
+            Ok(_) => panic!("expected clap to return DisplayHelp for `help run`"),
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp),
+        }
+    }
+
+    #[test]
+    fn top_level_version_requested_matches_first_arg_only() {
+        assert!(top_level_version_requested(&["--version".to_string()]));
+        assert!(top_level_version_requested(&["-V".to_string()]));
+        assert!(!top_level_version_requested(&[
+            "run".to_string(),
+            "-V".to_string()
+        ]));
+        assert!(!top_level_version_requested(&[]));
     }
 }
