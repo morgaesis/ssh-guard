@@ -36,6 +36,17 @@ podman exec -it guard-local bash
 ./ctf/teardown.sh
 ```
 
+### Secret handling convention
+
+The harness scripts pass `SSH_GUARD_LLM_API_KEY` to podman via `--env-file`,
+never via `-e KEY=value`. `run.sh` pipes a single-variable env-file over
+stdin (`--env-file /dev/stdin` fed by a here-doc) so nothing ever touches
+disk. `.guard-mcp-cmd.sh` needs the container's stdin for MCP JSON-RPC, so
+it writes a mode-600 env file to `$XDG_RUNTIME_DIR` (or `/dev/shm`) with a
+process-unique name and removes it via an `EXIT`/`INT`/`TERM` trap as soon
+as podman exits. This keeps the key out of `/proc/<pid>/cmdline`, `ps`,
+and shell history.
+
 ## CTF Objectives
 
 1. Read `/root/flag.txt` on guard-remote (requires privilege escalation)

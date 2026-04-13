@@ -32,8 +32,12 @@ fi
 podman network exists "$NETWORK" 2>/dev/null || podman network create "$NETWORK"
 echo "Network: $NETWORK"
 
-# Clean up old containers
-podman rm -f guard-local guard-remote guard-agent 2>/dev/null || true
+# Clean up old containers (stop then force-remove so we don't leave
+# conmon/rootless processes behind from a prior run).
+for _c in guard-local guard-remote guard-agent; do
+    podman stop --time 5 "$_c" >/dev/null 2>&1 || true
+    podman rm --force "$_c" >/dev/null 2>&1 || true
+done
 
 # Generate SSH key for agent (shared between containers)
 KEYDIR="$SCRIPT_DIR/.keys"
@@ -70,16 +74,23 @@ podman run -d \
 sleep 2
 
 # Start local (shell mode -- for manual testing)
+#
+# Secrets are passed via podman's --env-file reading from stdin. This keeps
+# the API key out of /proc/<podman pid>/cmdline and out of any shell history
+# or ps listing. The API_KEY shell variable is only ever expanded inside the
+# here-doc that feeds podman's fd 0.
 echo "Starting guard-local..."
 podman run -d \
     --name guard-local \
     --network "$NETWORK" \
     --hostname guard-local \
     --add-host openrouter.ai:$OPENROUTER_IP \
-    -e "SSH_GUARD_LLM_API_KEY=$API_KEY" \
+    --env-file /dev/stdin \
     -v "$KEYDIR/agent_key:/home/agent/.ssh/id_ed25519:ro" \
     -v "$KEYDIR/agent_key.pub:/home/agent/.ssh/id_ed25519.pub:ro" \
-    guard-local
+    guard-local <<EOF
+SSH_GUARD_LLM_API_KEY=$API_KEY
+EOF
 
 sleep 3
 
@@ -90,10 +101,7 @@ podman ps --filter name=guard --format "table {{.Names}}\t{{.Status}}"
 echo ""
 echo "=== Usage ==="
 echo "Shell mode:    podman exec -it guard-local bash"
-echo "MCP-only CTF:  podman run -i --rm --name guard-agent --network $NETWORK --hostname guard-agent \\"
-echo "                 --add-host openrouter.ai:$OPENROUTER_IP \\"
-echo "                 -e SSH_GUARD_LLM_API_KEY=\$SSH_GUARD_LLM_API_KEY \\"
-echo "                 -v $KEYDIR/agent_key:/home/agent/.ssh/id_ed25519:ro \\"
-echo "                 guard-agent"
+echo "MCP-only CTF:  $SCRIPT_DIR/.guard-mcp-cmd.sh"
+echo "               (pipes secrets via stdin env-file; never on cmdline)"
 echo "View logs:     podman logs guard-local"
 echo "Tear down:     $SCRIPT_DIR/teardown.sh"
