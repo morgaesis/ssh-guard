@@ -432,12 +432,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             }
 
             let mode = guard_env("MODE")
-                .and_then(|value| PolicyMode::parse(&value));
+                .and_then(|value| PolicyMode::parse(&value))
+                .unwrap_or(PolicyMode::Readonly);
 
-            if let Some(mode) = mode {
-                tracing::info!("Using built-in {} policy mode", mode.as_str());
-                eval_config = eval_config.mode(mode);
-            }
+            tracing::info!("Using built-in {} policy mode", mode.as_str());
+            eval_config = eval_config.mode(mode);
 
             if let Some(ref policy_path) = policy {
                 tracing::info!("Loading static policy from: {}", policy_path);

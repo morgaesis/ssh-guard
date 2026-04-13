@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Default system prompt (balanced mode), compiled from config/system-prompt.md.
-/// Override at runtime with `--system-prompt <path>` or `~/.config/guard/system-prompt.txt`.
-const SYSTEM_PROMPT: &str = include_str!("../config/system-prompt.md");
+/// Readonly mode system prompt (read-only-biased evaluation), compiled from
+/// config/system-prompt-readonly.md. Override at runtime with
+/// `--system-prompt <path>` or `~/.config/guard/system-prompt.txt`.
+const SYSTEM_PROMPT_READONLY: &str = include_str!("../config/system-prompt-readonly.md");
 
 /// SAFE mode prompt: allow almost everything, rely on env_clear + output redaction.
 const SYSTEM_PROMPT_SAFE: &str = include_str!("../config/system-prompt-safe.md");
@@ -299,7 +300,7 @@ impl Evaluator {
         // Load system prompt. Priority:
         // 1. --system-prompt <path> (explicit override)
         // 2. ~/.config/guard/system-prompt.txt (user customization)
-        // 3. Mode-specific compiled prompt (safe/paranoid/default)
+        // 3. Mode-specific compiled prompt (readonly/safe/paranoid)
         let system_prompt = if let Some(ref path) = config.system_prompt_path {
             std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read system prompt from {}", path.display()))?
@@ -324,7 +325,10 @@ impl Evaluator {
                             tracing::info!("Using PARANOID mode system prompt");
                             SYSTEM_PROMPT_PARANOID.to_string()
                         }
-                        _ => SYSTEM_PROMPT.to_string(),
+                        Some(PolicyMode::Readonly) | None => {
+                            tracing::info!("Using READONLY mode system prompt");
+                            SYSTEM_PROMPT_READONLY.to_string()
+                        }
                     }
                 }
             }

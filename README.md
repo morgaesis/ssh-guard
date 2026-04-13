@@ -54,7 +54,7 @@ Set via `SSH_GUARD_MODE`:
 
 | Mode | Description |
 |---|---|
-| `default` | Balanced. Blocks destructive operations, privilege escalation, reverse shells, and obfuscated payloads. Allows routine admin commands like `ls`, `ps`, `cat`, `grep`, `df`. |
+| `readonly` | Balanced read-only-biased evaluation. Blocks destructive operations, privilege escalation, reverse shells, and obfuscated payloads. Allows routine admin commands like `ls`, `ps`, `cat`, `grep`, `df`. |
 | `safe` | Permissive. Only blocks commands with clear destructive or escalation intent. Relies on architectural defenses (`env_clear`, output redaction) for secret protection. Allows reading any file. |
 | `paranoid` | Restrictive. Blocks writes, sensitive file reads, network connections, shells, interpreters, and chained commands. Only allows basic read-only inspection (`id`, `hostname`, `uname`, `ls`, `ps`, `df`). |
 
@@ -66,8 +66,8 @@ SSH_GUARD_MODE=paranoid guard run cat /etc/shadow  # denied
 All modes evaluate `sudo` by the underlying command:
 
 ```bash
-guard run sudo ls /etc/nginx/        # default: allowed (read operation)
-guard run sudo rm -rf /etc/nginx/    # default: denied  (destructive)
+guard run sudo ls /etc/nginx/        # readonly: allowed (read operation)
+guard run sudo rm -rf /etc/nginx/    # readonly: denied  (destructive)
 guard run sudo systemctl restart app # safe: allowed     (targeted restart)
 ```
 
@@ -104,7 +104,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
 | `SSH_GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
 | `SSH_GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
-| `SSH_GUARD_MODE` | `default` | `default`, `safe`, or `paranoid` |
+| `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `SSH_GUARD_GPG_ID` | (none) | GPG key ID for secret encryption |
 | `SSH_GUARD_BACKEND` | (auto) | Secret backend (`file`, `gpg`) |
@@ -118,7 +118,7 @@ See [`.env.example`](.env.example) for a copyable template.
 
 ## Examples
 
-### Basic server with default mode
+### Basic server with readonly mode
 
 Start the guard server and execute commands through it:
 

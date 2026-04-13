@@ -64,7 +64,7 @@ Key variables:
 - `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` -- LLM API key (required)
 - `SSH_GUARD_API_URL` -- LLM endpoint (default: OpenRouter)
 - `SSH_GUARD_LLM_MODEL` -- Primary model (default: `openai/gpt-5.4-nano`). For a fallback chain, use `SSH_GUARD_LLM_MODELS` with a comma-separated list; the chain takes precedence over this single-model value when set.
-- `SSH_GUARD_MODE` -- Evaluation mode (default: `default`)
+- `SSH_GUARD_MODE` -- Evaluation mode (default: `readonly`)
 - `SSH_GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `10`)
 
 For long-running service deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).

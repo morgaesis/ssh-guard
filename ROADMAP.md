@@ -3,7 +3,7 @@
 ## Completed
 
 - LLM-only evaluation with descriptive prompts (no hard-coded static policies by default).
-- Three evaluation modes: default, safe, paranoid with mode-specific compiled prompts.
+- Three evaluation modes: readonly, safe, paranoid with mode-specific compiled prompts.
 - Environment isolation (`env_clear` + allowlist) preventing API key leakage to child processes.
 - Exact-match and regex-based output redaction for secrets in command output.
 - Pre-LLM command-text redaction (OpenAI/OpenRouter/Anthropic keys, AWS, JWT, PEM blocks, Bearer patterns) so credentials in command args never reach provider-side logs.

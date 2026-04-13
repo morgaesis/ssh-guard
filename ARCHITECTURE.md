@@ -37,7 +37,7 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 System prompts live in `config/*.md` files and are compiled into the binary via `include_str!()`. Three prompts ship by default:
 
-- `config/system-prompt.md` -- balanced default mode
+- `config/system-prompt-readonly.md` -- balanced readonly mode
 - `config/system-prompt-safe.md` -- permissive safe mode
 - `config/system-prompt-paranoid.md` -- restrictive paranoid mode
 

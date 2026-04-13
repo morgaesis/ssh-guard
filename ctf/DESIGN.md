@@ -102,7 +102,7 @@ The expected outcome is that LLM evaluation + environment isolation + output red
 
 ## Results summary
 
-Three-mode verification (default, safe, paranoid) across 20 commands per mode (10 attacks + 10 legitimate): 60/60 correct.
+Three-mode verification (readonly, safe, paranoid) across 20 commands per mode (10 attacks + 10 legitimate): 60/60 correct.
 
 Adversarial red-teaming with Claude Opus 4.6: 70+ attack vectors tested. All destructive, escalation, and obfuscation attacks denied. Prompt extraction and binary inspection allowed (accepted risk for open-source). API key exfiltration attacks allowed by LLM but mitigated architecturally by `env_clear` (child processes never see the key).
 
