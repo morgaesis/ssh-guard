@@ -1,10 +1,20 @@
-# Example deny-only static policy for guard.
+# EXAMPLE deny-only static policy for guard. NOT the default.
 #
-# Load with: guard serve --policy examples/deny-policy.yaml
+# Guard's default is LLM-only evaluation (single call to openai/gpt-5.4-nano
+# via OpenRouter, function-calling, with retries). Static policies are an
+# opt-in feature for deployments that want to fast-reject known-bad patterns
+# without paying for an LLM round-trip on obvious rejections.
+#
+# Load with: guard server start --policy examples/deny-policy.yaml
 # Or place at: ~/.config/guard/policy.yaml
 #
-# IMPORTANT: Static glob patterns have significant limitations.
-# They match against flat command strings and cannot:
+# RECOMMENDED USAGE: keep this as a pre-LLM fast-reject layer. Commands that
+# match a deny pattern here are rejected immediately without an LLM call.
+# Commands that do not match fall through to the LLM evaluator, which remains
+# the authoritative decision-maker for everything else.
+#
+# LIMITATIONS: static glob patterns match against flat command strings and
+# cannot:
 #
 #   - Parse shell operators: "ls; rm -rf /" appears as one command starting
 #     with "ls;", so the "rm -rf /" part is invisible to deny patterns.
@@ -13,7 +23,9 @@
 #     just like "find / -exec rm -rf {} \;".
 #
 # Use static policies only for DENY rules (fast-reject known-bad patterns).
-# Rely on the LLM evaluator for allow decisions.
+# Rely on the LLM evaluator for allow decisions. For an allow-bypass example
+# see examples/allow-policy.yaml; for a combined pattern see
+# examples/hybrid-policy.yaml.
 
 policy:
   commands:

@@ -1,0 +1,142 @@
+# EXAMPLE hybrid (allow + deny + LLM fallback) policy for guard. NOT the default.
+#
+# Guard's default is LLM-only evaluation (single call to openai/gpt-5.4-nano
+# via OpenRouter, function-calling, with retries). This file is the opt-in
+# "production hardened" pattern for latency-sensitive deployments: a narrow
+# allowlist short-circuits safe inspection commands, a broad denylist fast-
+# rejects known-bad patterns, and everything else falls through to the LLM.
+#
+# Load with: guard server start --policy examples/hybrid-policy.yaml
+# Or place at: ~/.config/guard/policy.yaml
+#
+# EVALUATION ORDER (per src/policy.rs):
+#   1. Deny patterns  -- matched first; matching commands are rejected with
+#                        no LLM call.
+#   2. Allow patterns -- matched next; matching commands execute with no LLM
+#                        call.
+#   3. LLM evaluator  -- authoritative decision for everything else.
+#
+# WHEN TO USE: read-heavy agent workloads where dozens of identical `ls`,
+# `ps`, or `kubectl get` calls would each incur a 0.5-2s LLM round-trip. The
+# allowlist cuts that latency to zero for deterministic cases while the
+# denylist keeps obvious footguns off the LLM's plate. Everything ambiguous
+# still reaches the LLM, so novel attacks and obfuscated payloads remain
+# covered.
+#
+# LIMITATIONS: static glob patterns cannot parse shell operators, quoting, or
+# semantics. See examples/deny-policy.yaml for the detailed caveats. Keep the
+# allowlist narrow and fully-qualified; never allow patterns that could be
+# chained with `;`, `&&`, `||`, or `|`.
+
+policy:
+  commands:
+    allow:
+      # Identity / host state (deterministic, no args)
+      - "id"
+      - "whoami"
+      - "hostname"
+      - "uname -a"
+      - "uptime"
+      - "date"
+
+      # Resource inspection
+      - "ps aux"
+      - "df -h"
+      - "free -h"
+
+      # Filesystem listing (safe roots only)
+      - "ls"
+      - "ls -la"
+      - "pwd"
+
+      # Fixed safe file reads
+      - "cat /etc/hosts"
+      - "cat /etc/os-release"
+
+      # Kubernetes read-only
+      - "kubectl get *"
+      - "kubectl describe *"
+      - "kubectl logs *"
+
+      # Git read-only
+      - "git status"
+      - "git log --oneline -20"
+      - "git branch"
+      - "git diff"
+
+      # Systemd read-only
+      - "systemctl status *"
+      - "journalctl -u * --no-pager -n 100"
+
+    deny:
+      # Privilege escalation
+      - "sudo su*"
+      - "sudo -i*"
+      - "sudo -s*"
+      - "sudo bash*"
+      - "sudo /bin/bash*"
+      - "sudo /bin/sh*"
+      - "su root*"
+      - "su -*"
+      - "pkexec*"
+      - "doas*"
+
+      # Destructive operations
+      - "rm -rf /"
+      - "rm -rf /*"
+      - "dd *"
+      - "mkfs*"
+      - "shred *"
+      - "wipefs *"
+
+      # Remote code execution / piping to shell
+      - "curl * | bash*"
+      - "wget * | sh*"
+      - "* | bash"
+      - "* | bash *"
+      - "* | sh"
+      - "* | sh *"
+      - "eval *"
+      - "bash -c *"
+      - "sh -c *"
+
+      # Interpreter abuse
+      - "python -c *"
+      - "python3 -c *"
+      - "ruby -e *"
+      - "node -e *"
+      - "perl -e *"
+
+      # Reverse shells / tunnels
+      - "ssh -L*"
+      - "ssh -R*"
+      - "ssh -D*"
+      - "nc -e*"
+      - "ncat -e*"
+      - "bash -i*>*"
+
+      # System disruption
+      - "reboot*"
+      - "shutdown*"
+      - "poweroff*"
+      - "halt*"
+      - "kill -9 1"
+      - "killall*sshd*"
+
+      # Service / firewall disruption
+      - "systemctl mask ssh*"
+      - "systemctl stop ssh*"
+      - "iptables -F*"
+      - "ufw disable*"
+
+      # Kubernetes destructive
+      - "kubectl delete namespace*"
+      - "kubectl drain*"
+
+      # Env exfiltration via procfs
+      - "cat /proc/*/environ*"
+      - "strings /proc/*/environ*"
+
+      # Sensitive file access
+      - "* /etc/shadow*"
+      - "* /etc/sudoers*"

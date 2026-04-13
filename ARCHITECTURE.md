@@ -31,7 +31,7 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 3. **LLM evaluation**: Commands are sent to an LLM with a mode-specific system prompt. The LLM analyzes intent, chained operations, obfuscation, tool side-channels, and prompt injection attempts. Returns `APPROVE`/`DENY` with risk score.
 
-4. **Static policy** (optional): Glob-pattern deny lists for fast rejection of known-bad patterns. Checked before LLM evaluation. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics.
+4. **Static policy** (optional, opt-in): Glob-pattern allow and deny lists for fast decisions on deterministically safe or unsafe commands. Allow matches skip the LLM; deny matches reject without an LLM call. Everything else falls through to the LLM evaluator. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics. See `examples/` for reference policies.
 
 ## Prompt architecture
 
@@ -44,6 +44,8 @@ System prompts live in `config/*.md` files and are compiled into the binary via 
 Override priority: `--system-prompt` flag > `~/.config/guard/system-prompt.txt` > mode-specific compiled prompt.
 
 Additive prompts (`--system-prompt-append` or `SSH_GUARD_PROMPT_APPEND`) append text to whichever base prompt is active, letting operators customize behavior without maintaining a prompt fork.
+
+The default evaluator is a single LLM call per command with bounded retries before failing closed. A multi-model fallback chain (`SSH_GUARD_LLM_MODELS`) is available as an opt-in for deployments that need to survive provider-specific outages; when unset, guard uses a single model with retries. See `examples/fallback-models.env`.
 
 ## Design constraints
 
