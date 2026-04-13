@@ -277,7 +277,7 @@ impl<E: GuardExecutor> McpServer<E> {
                 "description": "Policy-gated command execution through MCP tools."
             },
             "instructions": format!(
-                "Use the {} tool to execute commands through the guard daemon. Commands are evaluated against security policy before execution. Denied commands are returned as tool errors so the model can revise them.",
+                "Use the {} tool to execute commands through the guard daemon. Commands are evaluated against security policy before execution. Denied commands are returned as tool errors so the model can revise them. Environment variables (SSH_AUTH_SOCK, PATH, HOME, etc.) are managed server-side and cannot be set by the client.",
                 self.tool_name
             )
         })
@@ -289,7 +289,7 @@ impl<E: GuardExecutor> McpServer<E> {
                 {
                     "name": self.tool_name,
                     "title": "Run Command Through Guard",
-                    "description": "Execute a command through the guard daemon. The command is evaluated against security policy before execution.",
+                    "description": "Execute a command through the guard daemon. The command is evaluated against security policy before execution. Do not attempt to set environment variables; the execution environment is fully controlled by the server.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
