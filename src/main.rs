@@ -391,18 +391,16 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             // resolved separately below and, when set, takes precedence over
             // the single-model value above because a chain is an explicit
             // opt-in to multi-model evaluation.
-            let resolved_single_model = llm_model.filter(|value| !value.is_empty()).or_else(|| {
-                guard_env("LLM_MODEL").filter(|v| !v.is_empty())
-            });
+            let resolved_single_model = llm_model
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_MODEL").filter(|v| !v.is_empty()));
             if let Some(model) = resolved_single_model {
                 eval_config = eval_config.llm_model(model);
             }
 
             // Retries: flag > env var > default.
             let retries = llm_retries
-                .or_else(|| {
-                    guard_env("LLM_RETRIES").and_then(|v| v.parse::<u32>().ok())
-                })
+                .or_else(|| guard_env("LLM_RETRIES").and_then(|v| v.parse::<u32>().ok()))
                 .unwrap_or(2);
             eval_config = eval_config.llm_retries(retries);
             tracing::info!("LLM retries per model: {}", retries);
