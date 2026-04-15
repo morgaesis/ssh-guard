@@ -48,19 +48,27 @@ guard run rm -rf /tmp/*
 guard run sudo su
 ```
 
+To test policy decisions without executing approved commands, start a separate
+dry-run server:
+
+```bash
+guard server start --dry-run --socket .cache/guard-dry-run.sock
+guard server connect --socket .cache/guard-dry-run.sock bash -- -c 'sudo id'
+```
+
 ## Modes
 
 Set via `SSH_GUARD_MODE`:
 
 | Mode | Description |
 |---|---|
-| `readonly` | Balanced read-only-biased evaluation. Blocks destructive operations, privilege escalation, reverse shells, and obfuscated payloads. Allows routine admin commands like `ls`, `ps`, `cat`, `grep`, `df`. |
-| `safe` | Permissive. Only blocks commands with clear destructive or escalation intent. Relies on architectural defenses (`env_clear`, output redaction) for secret protection. Allows reading any file. |
-| `paranoid` | Restrictive. Blocks writes, sensitive file reads, network connections, shells, interpreters, and chained commands. Only allows basic read-only inspection (`id`, `hostname`, `uname`, `ls`, `ps`, `df`). |
+| `readonly` | Read-only evaluation. Blocks file writes, system or service state changes, package changes, privilege escalation, reverse shells, and obfuscated payloads. Allows routine inspection commands like `ls`, `ps`, `cat`, `grep`, `df`. |
+| `safe` | Permissive administrative evaluation. Allows visible, bounded troubleshooting and admin work, but blocks credential-material reads, destructive operations, privilege escalation, unauthorized network pivots, and hidden payloads. |
+| `paranoid` | Restrictive. Blocks writes, sensitive file reads, network connections, shells, interpreters, side-channel execution, and chained commands. Only allows basic non-sensitive inspection (`id`, `hostname`, `pwd`, `ls`, `ps`, `df`, limited `git status`). |
 
 ```bash
-SSH_GUARD_MODE=safe guard run cat /etc/shadow     # allowed (output redacted)
-SSH_GUARD_MODE=paranoid guard run cat /etc/shadow  # denied
+SSH_GUARD_MODE=safe guard run sudo systemctl status ssh --no-pager  # allowed
+SSH_GUARD_MODE=paranoid guard run sudo systemctl status ssh --no-pager  # denied
 ```
 
 All modes evaluate `sudo` by the underlying command:
@@ -105,6 +113,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `SSH_GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
 | `SSH_GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
 | `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
+| `SSH_GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `SSH_GUARD_GPG_ID` | (none) | GPG key ID for secret encryption |
 | `SSH_GUARD_BACKEND` | (auto) | Secret backend (`file`, `gpg`) |
@@ -125,8 +134,8 @@ Start the guard server and execute commands through it:
 ```bash
 export SSH_GUARD_LLM_API_KEY="sk-or-v1-..."
 
-guard server start --socket /tmp/guard.sock &
-guard config set-server /tmp/guard.sock
+guard server start --socket .cache/guard.sock &
+guard config set-server .cache/guard.sock
 
 # Allowed: routine inspection
 guard run hostname
@@ -145,27 +154,28 @@ guard run bash -c 'eval $(echo cm0gLXJmIC8= | base64 -d)'
 # DENIED: Base64-decoded payload piped through eval
 ```
 
-When using `guard server connect` directly (rather than `guard run`), put a
-`--` separator between the target binary and its flags so clap does not
-swallow them as `connect` options: `guard server connect --socket /tmp/guard.sock df -- -h`
-works; `guard server connect --socket /tmp/guard.sock df -h` reports a
-misleading "No server configured" error.
+When using `guard server connect` directly (rather than `guard run`), target
+arguments are forwarded after the target binary:
+`guard server connect --socket .cache/guard.sock df -h`.
 
-### Safe mode with output redaction
+### Safe mode
 
-Safe mode allows almost everything, relying on architectural defenses for secret protection:
+Safe mode allows visible, bounded administration while still blocking direct
+credential-material reads and obvious escalation paths:
 
 ```bash
-SSH_GUARD_MODE=safe guard server start --socket /tmp/guard.sock &
+SSH_GUARD_MODE=safe guard server start --socket .cache/guard.sock &
 
-# Allowed: reading files (secrets in output are redacted)
+# Allowed: ordinary inspection and work files
 guard run cat /etc/hosts
 # 127.0.0.1 localhost
 
+guard run cp README.md .cache/readme-copy
+# copied
+
+# Denied: credential material
 guard run cat /app/.env
-# DB_HOST=localhost
-# DB_PASSWORD=[REDACTED]
-# API_TOKEN=[REDACTED]
+# DENIED: Credential material read
 
 # Still denied: privilege escalation
 guard run sudo su
@@ -177,7 +187,7 @@ guard run sudo su
 Paranoid mode locks down to basic read-only inspection:
 
 ```bash
-SSH_GUARD_MODE=paranoid guard server start --socket /tmp/guard.sock &
+SSH_GUARD_MODE=paranoid guard server start --socket .cache/guard.sock &
 
 # Allowed: basic system state
 guard run id
@@ -201,7 +211,7 @@ guard run env
 For fast-reject of known-bad patterns without an LLM call, add a static deny policy:
 
 ```bash
-guard server start --policy examples/deny-policy.yaml --socket /tmp/guard.sock &
+guard server start --policy examples/deny-policy.yaml --socket .cache/guard.sock &
 ```
 
 Static patterns are checked first. If a command matches a deny pattern, it is rejected immediately without an LLM call. Commands that pass static policy are then evaluated by the LLM.
@@ -213,7 +223,7 @@ See [`examples/deny-policy.yaml`](examples/deny-policy.yaml) for a reference pol
 Replace the built-in prompt entirely for a specific deployment:
 
 ```bash
-guard server start --system-prompt /etc/guard/my-prompt.txt --socket /tmp/guard.sock &
+guard server start --system-prompt /etc/guard/my-prompt.txt --socket .cache/guard.sock &
 ```
 
 Or place a prompt file at `~/.config/guard/system-prompt.txt` to override automatically.

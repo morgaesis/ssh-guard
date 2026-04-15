@@ -87,6 +87,13 @@ fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool 
     }
 }
 
+fn parse_env_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum ServerCommands {
@@ -155,6 +162,11 @@ enum ServerCommands {
         #[arg(long = "no-redact", action = ArgAction::SetTrue)]
         no_redact: bool,
 
+        /// Evaluate policy but do not execute approved commands.
+        /// Env: SSH_GUARD_DRY_RUN.
+        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        dry_run: bool,
+
         /// Path to custom system prompt file for the LLM evaluator
         #[arg(long)]
         system_prompt: Option<PathBuf>,
@@ -178,7 +190,7 @@ enum ServerCommands {
         binary: String,
 
         /// Arguments to pass to the binary
-        #[arg(last = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 }
@@ -328,6 +340,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm,
             no_llm,
             no_redact,
+            dry_run,
             system_prompt,
             system_prompt_append,
         } => {
@@ -355,6 +368,15 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             let allowed_uids: Option<Vec<u32>> =
                 users.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
             tracing::info!("Allowed UIDs: {:?}", allowed_uids);
+
+            let dry_run = dry_run
+                || guard_env("DRY_RUN")
+                    .as_deref()
+                    .map(parse_env_bool)
+                    .unwrap_or(false);
+            if dry_run {
+                tracing::warn!("Dry-run mode enabled: approved commands will not be executed");
+            }
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
             if !llm_enabled {
@@ -508,6 +530,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 socket_group,
                 allowed_uids,
                 shim_dir,
+                dry_run,
                 tool_registry,
                 redact_secrets,
             );
@@ -860,6 +883,7 @@ mod tests {
                 llm,
                 no_llm,
                 no_redact,
+                dry_run,
                 system_prompt,
                 system_prompt_append,
             }) => ServerCommands::Start {
@@ -879,6 +903,7 @@ mod tests {
                 llm,
                 no_llm,
                 no_redact,
+                dry_run,
                 system_prompt,
                 system_prompt_append,
             },
@@ -1122,6 +1147,57 @@ mod tests {
             }
             Ok(_) => panic!("expected Run variant"),
             Err(e) => panic!("parser rejected valid run args: {}", e),
+        }
+    }
+
+    #[test]
+    fn server_connect_accepts_command_args_without_separator() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "server",
+            "connect",
+            "--socket",
+            ".cache/guard.sock",
+            "cp",
+            "README.md",
+            ".cache/copy",
+        ]) {
+            Ok(MainArgs::Server(ServerCommands::Connect {
+                socket,
+                binary,
+                args,
+                ..
+            })) => {
+                assert_eq!(socket, Some(".cache/guard.sock".to_string()));
+                assert_eq!(binary, "cp");
+                assert_eq!(
+                    args,
+                    vec!["README.md".to_string(), ".cache/copy".to_string()]
+                );
+            }
+            Ok(_) => panic!("expected server connect variant"),
+            Err(e) => panic!("parser rejected valid server connect args: {}", e),
+        }
+    }
+
+    #[test]
+    fn server_connect_forwards_hyphen_args_without_separator() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "server",
+            "connect",
+            "--socket",
+            ".cache/guard.sock",
+            "bash",
+            "-lc",
+            "id",
+        ]) {
+            Ok(MainArgs::Server(ServerCommands::Connect { binary, args, .. })) => {
+                assert_eq!(binary, "bash");
+                assert_eq!(args, vec!["-lc".to_string(), "id".to_string()]);
+            }
+            Ok(_) => panic!("expected server connect variant"),
+            Err(e) => panic!("parser rejected valid server connect args: {}", e),
         }
     }
 

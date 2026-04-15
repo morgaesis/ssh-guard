@@ -98,6 +98,7 @@ pub struct ServerConfig {
     pub socket_group: Option<String>,
     pub allowed_uids: Option<Vec<u32>>,
     pub shim_dir: Option<PathBuf>,
+    pub dry_run: bool,
     pub tool_registry: Arc<RwLock<ToolRegistry>>,
     /// Known secret values for exact-match output redaction.
     pub redact_secrets: Vec<String>,
@@ -115,6 +116,7 @@ impl ServerConfig {
         socket_group: Option<String>,
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
+        dry_run: bool,
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
     ) -> Self {
@@ -128,6 +130,7 @@ impl ServerConfig {
             socket_group,
             allowed_uids,
             shim_dir,
+            dry_run,
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
         }
@@ -224,6 +227,7 @@ impl Server {
         socket_group: Option<String>,
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
+        dry_run: bool,
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
     ) -> Self {
@@ -237,6 +241,7 @@ impl Server {
             socket_group,
             allowed_uids,
             shim_dir,
+            dry_run,
             tool_registry,
             redact_secrets,
         );
@@ -565,6 +570,8 @@ enum ExecOutcome {
     /// Policy approved, but spawning/running the child failed. `reason`
     /// describes the OS-level error (e.g. ENOENT on the binary).
     Failed { reason: String },
+    /// Policy approved, but the server intentionally did not spawn the child.
+    DryRun,
 }
 
 struct ExecuteResult {
@@ -613,6 +620,15 @@ impl ExecuteResult {
         }
     }
 
+    fn dry_run(reason: impl Into<String>) -> Self {
+        Self {
+            policy: PolicyOutcome::Allowed {
+                reason: reason.into(),
+            },
+            exec: ExecOutcome::DryRun,
+        }
+    }
+
     /// True if the policy approved the command. Note: this does NOT mean
     /// the command actually ran — check the exec outcome for that.
     fn policy_allowed(&self) -> bool {
@@ -655,6 +671,16 @@ impl ExecuteResult {
                 reason: format!("execution error: {}", exec_msg),
                 exit_code: None,
                 stdout: None,
+                stderr: None,
+            },
+            ExecOutcome::DryRun => ExecuteResponse {
+                allowed: true,
+                reason: match self.policy {
+                    PolicyOutcome::Allowed { reason } => reason,
+                    PolicyOutcome::Denied { reason } => reason,
+                },
+                exit_code: Some(0),
+                stdout: Some("[DRY-RUN] policy allowed; command was not executed\n".to_string()),
                 stderr: None,
             },
             ExecOutcome::NotAttempted => ExecuteResponse {
@@ -724,6 +750,16 @@ async fn execute_command(
     // exec-level failure, not a policy denial, and must be reported as such
     // so the audit stream can distinguish "LLM said no" from "LLM said yes
     // but the kernel refused".
+
+    if config.dry_run {
+        tracing::info!(
+            "Dry-run: not executing {} {:?} ({})",
+            request.binary,
+            request.args,
+            caller
+        );
+        return ExecuteResult::dry_run(allow_reason);
+    }
 
     // Resolve tool-level env/secrets from registry (includes per-user overrides)
     let user_key = caller.user_key();
@@ -1017,6 +1053,19 @@ mod tests {
     }
 
     #[test]
+    fn into_response_for_dry_run_sets_allowed_true_without_child_output() {
+        let resp = ExecuteResult::dry_run("llm ok").into_response();
+        assert!(resp.allowed);
+        assert_eq!(resp.reason, "llm ok");
+        assert_eq!(resp.exit_code, Some(0));
+        assert_eq!(
+            resp.stdout.as_deref(),
+            Some("[DRY-RUN] policy allowed; command was not executed\n")
+        );
+        assert!(resp.stderr.is_none());
+    }
+
+    #[test]
     fn into_response_for_completed_carries_exit_and_streams() {
         let resp = ExecuteResult::completed("ok", Some(7), Some("hi".into()), None).into_response();
         assert!(resp.allowed);
@@ -1064,6 +1113,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             ToolRegistry::empty(),
             Vec::new(),
         );

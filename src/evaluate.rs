@@ -768,7 +768,7 @@ fn build_function_call_body(model: &str, system_prompt: &str, command: &str) -> 
                         "decision": {
                             "type": "string",
                             "enum": ["APPROVE", "DENY"],
-                            "description": "APPROVE if the command is safe to execute, DENY otherwise"
+                            "description": "APPROVE if the command is allowed under the active mode policy, DENY if the active mode policy blocks it"
                         },
                         "reason": {
                             "type": "string",

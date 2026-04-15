@@ -33,12 +33,29 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 4. **Static policy** (optional, opt-in): Glob-pattern allow and deny lists for fast decisions on deterministically safe or unsafe commands. Allow matches skip the LLM; deny matches reject without an LLM call. Everything else falls through to the LLM evaluator. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics. See `examples/` for reference policies.
 
+## Execution authority
+
+The server executes approved commands as the daemon process identity. It
+authenticates local clients by peer UID (`--users`) but does not currently
+impersonate that UID before exec. An unprivileged, hardened service is a policy
+gate and secret broker for commands that service identity can already run. A
+root service is a privileged command broker: approved local commands run with
+root authority, similar to a sudo policy boundary.
+
+Systemd hardening changes what approved commands can do. In particular,
+`NoNewPrivileges=true` prevents setuid helpers such as `sudo` from elevating,
+and user-service sandboxing may place the daemon in a user namespace where
+root-owned files appear unmapped. Operators who need sudo-like local execution
+must choose a privileged system-service deployment deliberately and compensate
+with strict caller restrictions, environment isolation, output redaction, and
+audit logging.
+
 ## Prompt architecture
 
 System prompts live in `config/*.md` files and are compiled into the binary via `include_str!()`. Three prompts ship by default:
 
-- `config/system-prompt-readonly.md` -- balanced readonly mode
-- `config/system-prompt-safe.md` -- permissive safe mode
+- `config/system-prompt-readonly.md` -- read-only inspection mode
+- `config/system-prompt-safe.md` -- permissive administrative mode
 - `config/system-prompt-paranoid.md` -- restrictive paranoid mode
 
 Override priority: `--system-prompt` flag > `~/.config/guard/system-prompt.txt` > mode-specific compiled prompt.
@@ -46,6 +63,17 @@ Override priority: `--system-prompt` flag > `~/.config/guard/system-prompt.txt` 
 Additive prompts (`--system-prompt-append` or `SSH_GUARD_PROMPT_APPEND`) append text to whichever base prompt is active, letting operators customize behavior without maintaining a prompt fork.
 
 The default evaluator is a single LLM call per command with bounded retries before failing closed. A multi-model fallback chain (`SSH_GUARD_LLM_MODELS`) is available as an opt-in for deployments that need to survive provider-specific outages; when unset, guard uses a single model with retries. See `examples/fallback-models.env`.
+
+Dry-run mode (`--dry-run` or `SSH_GUARD_DRY_RUN=true`) keeps the same evaluator
+and audit path but stops after an allow decision. Approved commands return a
+successful dry-run response and are not spawned. Denied commands behave the same
+as normal mode.
+
+Execution requests currently carry only `binary` and `args`. They do not carry
+the client's current working directory as structured metadata. Relative paths
+therefore resolve in the daemon process working directory when a command is
+actually executed, and the evaluator only sees the relative path text supplied
+in the command.
 
 ## Design constraints
 
