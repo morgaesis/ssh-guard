@@ -46,6 +46,23 @@ fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
     })
 }
 
+fn yaml_secret_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)^\s*[+-]?\s*-\s*name\s*:\s*["']?[^"'\n]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[^"'\n]*["']?\s*$"#,
+        )
+        .unwrap()
+    })
+}
+
+fn yaml_value_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)^(\s*[+-]?\s*(?:-\s*)?value\s*:\s*["']?)([^"'\n]*)(["']?\s*)$"#).unwrap()
+    })
+}
+
 /// Apply redaction patterns to the given text, replacing sensitive values with [REDACTED].
 pub fn redact_output(text: &str) -> String {
     let patterns = redaction_patterns();
@@ -56,6 +73,51 @@ pub fn redact_output(text: &str) -> String {
     }
 
     result
+}
+
+#[derive(Debug, Default)]
+pub struct RedactionState {
+    yaml_secret_value_pending: bool,
+}
+
+/// Redact one output line while preserving context from previous lines.
+///
+/// Kubernetes and Helm render environment variables as adjacent `name:` and
+/// `value:` lines. The `value:` line alone is too generic to classify safely:
+/// it may hold a git SHA, UUID, URL, or actual token. Stateful redaction only
+/// masks the value when the preceding env var name is secret-bearing.
+pub fn redact_output_with_state(line: &str, state: &mut RedactionState) -> String {
+    let should_redact_yaml_value =
+        state.yaml_secret_value_pending && yaml_value_pattern().is_match(line);
+
+    let context_redacted = if should_redact_yaml_value {
+        yaml_value_pattern()
+            .replace(line, "${1}[REDACTED]${3}")
+            .to_string()
+    } else {
+        line.to_string()
+    };
+
+    state.yaml_secret_value_pending = yaml_secret_name_pattern().is_match(line)
+        || (state.yaml_secret_value_pending && line.trim().is_empty());
+
+    redact_output(&context_redacted)
+}
+
+pub fn redact_output_text(text: &str) -> String {
+    let had_trailing_newline = text.ends_with('\n');
+    let mut state = RedactionState::default();
+    let mut redacted = text
+        .lines()
+        .map(|line| redact_output_with_state(line, &mut state))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if had_trailing_newline {
+        redacted.push('\n');
+    }
+
+    redacted
 }
 
 /// Redact exact secret values from output. This catches cases the regex patterns miss,
@@ -182,6 +244,60 @@ mod tests {
         let input = "SESSION_ID=a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5 \n";
         let output = redact_output(input);
         assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_kubernetes_yaml_value_token() {
+        let input = r#"        - name: NETDATA_CLAIM_TOKEN
+          value: "ExampleSyntheticTokenValue1234567890"
+"#;
+        let output = redact_output_text(input);
+        assert!(output.contains("NETDATA_CLAIM_TOKEN"), "got: {output}");
+        assert!(output.contains("value: \"[REDACTED]\""), "got: {output}");
+        assert!(
+            !output.contains("ExampleSyntheticTokenValue"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_do_not_redact_kubernetes_yaml_url_value() {
+        let input = r#"        - name: NETDATA_CLAIM_URL
+          value: "https://api.netdata.cloud"
+"#;
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_do_not_redact_kubernetes_yaml_git_sha_value() {
+        let input = r#"        - name: APP_GIT_SHA
+          value: "0123456789abcdef0123456789abcdef01234567"
+"#;
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_do_not_redact_kubernetes_yaml_uuid_value() {
+        let input = r#"        - name: RESOURCE_UID
+          value: "123e4567-e89b-12d3-a456-426614174000"
+"#;
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_redact_streaming_kubernetes_yaml_value_token() {
+        let mut state = RedactionState::default();
+        let name = redact_output_with_state("        - name: SERVICE_AUTH_TOKEN", &mut state);
+        let value = redact_output_with_state(
+            "          value: \"AnotherSyntheticTokenValue1234567890\"",
+            &mut state,
+        );
+
+        assert_eq!(name, "        - name: SERVICE_AUTH_TOKEN");
+        assert_eq!(value, "          value: \"[REDACTED]\"");
     }
 
     #[test]
