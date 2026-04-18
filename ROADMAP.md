@@ -25,10 +25,12 @@
 - CTF harness secret hygiene: `ctf/run.sh` now passes `SSH_GUARD_LLM_API_KEY` via `--env-file` instead of `podman run -e VAR=value` (previously visible via `/proc/<pid>/cmdline`), and `ctf/teardown.sh` actually stops the running container.
 - Client config hardening: `src/client_config.rs` refuses a relative `XDG_CONFIG_HOME` with a loud error instead of silently falling back to `$HOME/.config`.
 - CLI arg parsing fix: `guard run df -h` and similar forms now pass `-h` through to the child binary instead of being eaten by a global help-flag sniff in `src/main.rs`.
+- Streaming command output for `guard run` and `guard server connect`, preserving single-response behavior for non-streaming protocol clients.
+- Pre-LLM executable validation rejects unknown binaries, preventing natural-language command text from being approved as harmless prose.
+- Compiled credential preflight denies known credential-disclosure paths and tool side-channels before execution, including kubeconfig raw output and Kubernetes Secret/token access.
 
 ## Next
 
-- `guard server connect` UX: without an explicit `--` separator between binary and args, clap reports a misleading "No server configured" error (e.g. `guard server connect --socket X ps aux` fails; `... ps -- aux` works). Either document the `--` requirement in README or apply `trailing_var_arg(true)` to the clap positional.
 - Live integration test for 429 / `Retry-After` mocking (the unit test suite already covers the retry rules; an HTTP-mock integration test would catch wire-format regressions).
 - Binary allowlist for the server (restrict which binaries can be executed, not just what arguments are passed).
 - Seccomp/AppArmor profile generation for containerized deployments.

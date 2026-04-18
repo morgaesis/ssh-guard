@@ -66,6 +66,13 @@ Set via `SSH_GUARD_MODE`:
 | `safe` | Permissive administrative evaluation. Allows visible, bounded troubleshooting and admin work, but blocks credential-material reads, destructive operations, privilege escalation, unauthorized network pivots, and hidden payloads. |
 | `paranoid` | Restrictive. Blocks writes, sensitive file reads, network connections, shells, interpreters, side-channel execution, and chained commands. Only allows basic non-sensitive inspection (`id`, `hostname`, `pwd`, `ls`, `ps`, `df`, limited `git status`). |
 
+Use `readonly` when agents should investigate production state without changing
+it. Use `safe` when an operator is supervising real sysadmin work and wants
+bounded writes, targeted restarts, and ordinary maintenance to be possible while
+still blocking destructive or credential-seeking commands. Use `paranoid` for
+untrusted agents, adversarial testing, or first contact with an unfamiliar
+workspace where even broad reads and network access should be treated as risky.
+
 ```bash
 SSH_GUARD_MODE=safe guard run sudo systemctl status ssh --no-pager  # allowed
 SSH_GUARD_MODE=paranoid guard run sudo systemctl status ssh --no-pager  # denied
@@ -250,7 +257,7 @@ Additional rules for this environment:
 - Allow docker ps and docker logs but deny docker exec, docker run, and docker rm.
 ```
 
-The additive prompt is appended to whichever base prompt is active (default, safe, paranoid, or custom), letting operators customize behavior without maintaining a full prompt fork.
+The additive prompt is appended to whichever base prompt is active (readonly, safe, paranoid, or custom), letting operators customize behavior without maintaining a full prompt fork.
 
 ## Agent integration
 
@@ -305,7 +312,7 @@ Never use interactive sessions.
 
 ```bash
 export SSH_GUARD_LLM_API_KEY="..."
-export SSH_GUARD_MODE=default
+export SSH_GUARD_MODE=readonly
 alias ssh=guard
 ```
 
