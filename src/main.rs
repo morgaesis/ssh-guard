@@ -291,19 +291,11 @@ async fn main() -> Result<()> {
             // Let clap render help/version to stdout and exit 0.
             e.exit();
         }
-        Err(ref e)
-            if e.kind() == clap::error::ErrorKind::InvalidSubcommand
-                || e.kind() == clap::error::ErrorKind::UnknownArgument =>
-        {
+        Err(ref e) if should_fallback_to_run(&args, e.kind()) => {
             // Fallback: treat unknown subcommands as `run <binary> <args...>`
-            if args.len() >= 2 && !args[0].starts_with('-') {
-                let binary = args[0].clone();
-                let cmd_args = args[1..].to_vec();
-                run_exec(binary, cmd_args).await
-            } else {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
+            let binary = args[0].clone();
+            let cmd_args = args[1..].to_vec();
+            run_exec(binary, cmd_args).await
         }
         Err(e) => {
             eprintln!("{}", e);
@@ -320,6 +312,22 @@ fn top_level_version_requested(args: &[String]) -> bool {
         Some(first) => first == "--version" || first == "-V",
         None => false,
     }
+}
+
+fn should_fallback_to_run(args: &[String], kind: clap::error::ErrorKind) -> bool {
+    matches!(
+        kind,
+        clap::error::ErrorKind::InvalidSubcommand | clap::error::ErrorKind::UnknownArgument
+    ) && args.len() >= 2
+        && !args[0].starts_with('-')
+        && !is_guard_cli_keyword(&args[0])
+}
+
+fn is_guard_cli_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "run" | "exec" | "server" | "secrets" | "shim" | "config" | "mcp" | "help"
+    )
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
@@ -1280,5 +1288,29 @@ mod tests {
             "-V".to_string()
         ]));
         assert!(!top_level_version_requested(&[]));
+    }
+
+    #[test]
+    fn unknown_top_level_command_with_args_falls_back_to_run() {
+        assert!(should_fallback_to_run(
+            &["ssh".to_string(), "host".to_string(), "id".to_string()],
+            clap::error::ErrorKind::InvalidSubcommand
+        ));
+    }
+
+    #[test]
+    fn known_cli_subcommand_error_does_not_fallback_to_run() {
+        assert!(!should_fallback_to_run(
+            &["server".to_string(), "hlep".to_string()],
+            clap::error::ErrorKind::InvalidSubcommand
+        ));
+        assert!(!should_fallback_to_run(
+            &[
+                "server".to_string(),
+                "start".to_string(),
+                "--bogus".to_string()
+            ],
+            clap::error::ErrorKind::UnknownArgument
+        ));
     }
 }
