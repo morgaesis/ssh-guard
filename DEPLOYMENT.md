@@ -100,6 +100,7 @@ ls -l /run/guard/guard.sock
 - Restrict access with `--users` to the client UIDs that should be able to submit requests.
 - For LLM-backed evaluation, provide credentials through the environment file rather than command-line arguments.
 - For static-policy-only deployments, use `--no-llm` and provide a `--policy` file.
+- Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `SSH_GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
 - For prompt and policy testing, run a separate `--dry-run` server on its own
   socket so approved commands are evaluated but not executed.
 - Audit logs are emitted via `tracing` to stderr (captured by systemd journal). Set `RUST_LOG=info` in the environment file for standard logging.

@@ -122,6 +122,10 @@ pub struct ServerConfig {
     pub tool_registry: Arc<RwLock<ToolRegistry>>,
     /// Known secret values for exact-match output redaction.
     pub redact_secrets: Vec<String>,
+    /// When true, run deterministic pre-LLM checks (executable existence on
+    /// PATH, credential-disclosure pattern deny). When false, the evaluator
+    /// is the only authority on whether a command is allowed.
+    pub preflight: bool,
 }
 
 impl ServerConfig {
@@ -139,6 +143,7 @@ impl ServerConfig {
         dry_run: bool,
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
+        preflight: bool,
     ) -> Self {
         Self {
             socket_path,
@@ -153,6 +158,7 @@ impl ServerConfig {
             dry_run,
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
+            preflight,
         }
     }
 
@@ -250,6 +256,7 @@ impl Server {
         dry_run: bool,
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
+        preflight: bool,
     ) -> Self {
         let config = ServerConfig::new(
             socket_path,
@@ -264,6 +271,7 @@ impl Server {
             dry_run,
             tool_registry,
             redact_secrets,
+            preflight,
         );
         Self { config }
     }
@@ -833,7 +841,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return ExecuteResult::denied(reason);
     }
 
-    if !binary_exists_on_path(&request.binary) {
+    if config.preflight && !binary_exists_on_path(&request.binary) {
         let reason = format!(
             "unknown binary: '{}' is not available on the guard server PATH",
             request.binary
@@ -850,10 +858,12 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         format!("{} {}", request.binary, request.args.join(" "))
     };
 
-    if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-        return ExecuteResult::denied(reason);
+    if config.preflight {
+        if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
+            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            return ExecuteResult::denied(reason);
+        }
     }
 
     let eval_result = config.evaluator.evaluate(&command_line).await;
@@ -1787,6 +1797,7 @@ mod tests {
             false,
             ToolRegistry::empty(),
             Vec::new(),
+            false,
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)

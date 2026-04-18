@@ -163,6 +163,12 @@ enum ServerCommands {
         #[arg(long = "no-redact", action = ArgAction::SetTrue)]
         no_redact: bool,
 
+        /// Enable deterministic pre-LLM checks: executable-exists on PATH
+        /// and credential-disclosure pattern deny. Default off. Env:
+        /// SSH_GUARD_PREFLIGHT.
+        #[arg(long = "preflight", action = ArgAction::SetTrue)]
+        preflight: bool,
+
         /// Evaluate policy but do not execute approved commands.
         /// Env: SSH_GUARD_DRY_RUN.
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
@@ -349,6 +355,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             llm,
             no_llm,
             no_redact,
+            preflight,
             dry_run,
             system_prompt,
             system_prompt_append,
@@ -514,6 +521,15 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             // NOT readable from child env (prevents SSH_GUARD_REDACT=false bypass).
             let redact = !no_redact;
 
+            let preflight = preflight
+                || guard_env("PREFLIGHT")
+                    .as_deref()
+                    .map(parse_env_bool)
+                    .unwrap_or(false);
+            if preflight {
+                tracing::info!("Preflight checks enabled (executable validation, credential pattern deny)");
+            }
+
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);
                 tool_config::ToolRegistry::empty()
@@ -542,6 +558,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 dry_run,
                 tool_registry,
                 redact_secrets,
+                preflight,
             );
             srv.run().await
         }
@@ -939,6 +956,7 @@ mod tests {
                 llm,
                 no_llm,
                 no_redact,
+                preflight,
                 dry_run,
                 system_prompt,
                 system_prompt_append,
@@ -959,6 +977,7 @@ mod tests {
                 llm,
                 no_llm,
                 no_redact,
+                preflight,
                 dry_run,
                 system_prompt,
                 system_prompt_append,
