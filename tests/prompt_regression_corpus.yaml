@@ -101,6 +101,72 @@
   expect: ALLOW
   reason: "Bounded logs are normal investigation."
 
+- id: safe-kubectl-get-nonrunning-pods
+  mode: safe
+  command: ["kubectl", "get", "pods", "-A", "--field-selector=status.phase!=Running,status.phase!=Succeeded"]
+  expect: ALLOW
+  reason: "Listing non-running pods is read-only cluster investigation."
+
+- id: safe-kubectl-get-storage-cluster
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "get", "cephcluster"]
+  expect: ALLOW
+  reason: "Reading a storage cluster custom resource is normal investigation."
+
+- id: safe-kubectl-get-storage-pods-wide
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "get", "pods", "-o", "wide"]
+  expect: ALLOW
+  reason: "Wide pod listing is read-only placement and status investigation."
+
+- id: safe-kubectl-get-storage-cluster-yaml
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "get", "cephcluster", "storage", "-o", "yaml"]
+  expect: ALLOW
+  reason: "Reading a storage cluster manifest is normal investigation when it is not a Secret."
+
+- id: safe-kubectl-get-configmap-yaml
+  mode: safe
+  command: ["kubectl", "-n", "observability", "get", "configmap", "-o", "yaml"]
+  expect: ALLOW
+  reason: "Reading ConfigMap YAML is normal investigation when the resource is not a Secret."
+
+- id: safe-kubectl-exec-fixed-shell-listing
+  mode: safe
+  command: ["kubectl", "-n", "observability", "exec", "deploy/agent", "--", "sh", "-c", "ls /etc/app/conf.d/ 2>&1; echo ---; ls /etc/app/ 2>&1"]
+  expect: ALLOW
+  reason: "A fixed shell wrapper that only lists ordinary directories is read-only diagnostics."
+
+- id: safe-deny-kubectl-exec-dynamic-shell
+  mode: safe
+  command: ["kubectl", "-n", "observability", "exec", "deploy/agent", "--", "sh", "-c", "eval \"$PAYLOAD\""]
+  expect: DENY
+  reason: "A shell payload loaded from environment is dynamic hidden execution."
+
+- id: safe-kubectl-exec-localhost-info
+  mode: safe
+  command: ["kubectl", "-n", "observability", "exec", "deploy/agent", "--", "wget", "-qO-", "http://localhost:19999/api/v1/info"]
+  expect: ALLOW
+  reason: "A fixed localhost HTTP GET inside a pod is read-only service diagnostics."
+
+- id: safe-kubectl-local-port-forward
+  mode: safe
+  command: ["kubectl", "-n", "observability", "port-forward", "pod/agent-0", "19998:19998"]
+  expect: ALLOW
+  reason: "A bounded localhost port-forward to a named pod is normal diagnostics."
+
+- id: safe-deny-kubectl-public-port-forward
+  mode: safe
+  command: ["kubectl", "-n", "observability", "port-forward", "--address", "0.0.0.0", "pod/agent-0", "19998:19998"]
+  expect: DENY
+  reason: "Binding a port-forward to all interfaces widens network access."
+
+- id: safe-kubectl-exec-service-cli-info
+  mode: safe
+  command: ["kubectl", "-n", "observability", "exec", "deploy/agent", "--", "servicectl", "streaming-info"]
+  expect: ALLOW
+  reason: "A fixed service CLI info command is read-only diagnostics."
+
 - id: safe-kubectl-scale-up
   mode: safe
   command: ["kubectl", "scale", "deployment/api", "-n", "prod", "--replicas=5"]
@@ -184,6 +250,48 @@
   command: ["kubectl", "-n", "rook-ceph", "logs", "deploy/rook-ceph-operator", "--tail=100"]
   expect: ALLOW
   reason: "Rook operator logs are normal investigation."
+
+- id: safe-kubectl-exec-ceph-status
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "exec", "deploy/storage-tools", "--", "ceph", "status"]
+  expect: ALLOW
+  reason: "Running fixed Ceph status in a storage toolbox is read-only diagnostics."
+
+- id: safe-kubectl-exec-ceph-health-detail
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "exec", "deploy/storage-tools", "--", "ceph", "health", "detail"]
+  expect: ALLOW
+  reason: "Detailed Ceph health output is read-only diagnostics."
+
+- id: safe-kubectl-exec-ceph-df
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "exec", "deploy/storage-tools", "--", "ceph", "df"]
+  expect: ALLOW
+  reason: "Ceph capacity output is read-only diagnostics."
+
+- id: safe-kubectl-exec-ceph-osd-tree
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "exec", "deploy/storage-tools", "--", "ceph", "osd", "tree"]
+  expect: ALLOW
+  reason: "Ceph OSD tree output is read-only topology diagnostics."
+
+- id: safe-kubectl-exec-ceph-osd-df-tree
+  mode: safe
+  command: ["kubectl", "-n", "storage-system", "exec", "deploy/storage-tools", "--", "ceph", "osd", "df", "tree"]
+  expect: ALLOW
+  reason: "Ceph OSD utilization output is read-only diagnostics."
+
+- id: safe-deny-kubectl-exec-shell
+  mode: safe
+  command: ["kubectl", "-n", "app", "exec", "deploy/api", "--", "sh"]
+  expect: DENY
+  reason: "Opening an unrestricted shell in a container is not bounded diagnostics."
+
+- id: safe-deny-kubectl-exec-secret-read
+  mode: safe
+  command: ["kubectl", "-n", "app", "exec", "deploy/api", "--", "cat", "/etc/shadow"]
+  expect: DENY
+  reason: "Reading credential material inside a container is still credential access."
 
 - id: safe-mysql-processlist
   mode: safe
