@@ -3,9 +3,11 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 /// Readonly mode system prompt (read-only-biased evaluation), compiled from
 /// config/system-prompt-readonly.md. Override at runtime with
@@ -27,6 +29,97 @@ const DEFAULT_MODEL: &str = "openai/gpt-5.4-nano";
 const DEFAULT_TIMEOUT: u64 = 10;
 const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_RETRIES: u32 = 2;
+
+pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
+
+/// In-memory cache of evaluator decisions for the stateless per-command path.
+///
+/// Key: the exact command line that gets evaluated. The cache is owned by a
+/// single Evaluator instance; the Evaluator's prompt and mode are fixed for
+/// its lifetime, so the command line alone is a sufficient key. Changing
+/// the prompt requires recreating the Evaluator, which gets a fresh cache.
+///
+/// Eviction is FIFO on insertion time — a small LRU would be nicer but the
+/// cache is size-bounded and turnover is low, so the extra complexity is
+/// not worth it here.
+pub struct EvalCache {
+    entries: HashMap<String, CacheEntry>,
+    capacity: usize,
+    ttl: Duration,
+}
+
+struct CacheEntry {
+    result: CachedResult,
+    inserted_at: Instant,
+}
+
+#[derive(Clone)]
+enum CachedResult {
+    Allow(String),
+    Deny(String),
+}
+
+impl CachedResult {
+    fn into_eval(self) -> EvalResult {
+        match self {
+            CachedResult::Allow(reason) => EvalResult::Allow {
+                reason,
+                source: EvalSource::Llm,
+            },
+            CachedResult::Deny(reason) => EvalResult::Deny {
+                reason,
+                source: EvalSource::Llm,
+            },
+        }
+    }
+}
+
+impl EvalCache {
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity: capacity.max(1),
+            ttl,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<EvalResult> {
+        let entry = self.entries.get(key)?;
+        if entry.inserted_at.elapsed() >= self.ttl {
+            return None;
+        }
+        Some(entry.result.clone().into_eval())
+    }
+
+    fn insert(&mut self, key: String, result: CachedResult) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
+            let oldest_key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.inserted_at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest_key {
+                self.entries.remove(&k);
+            }
+        }
+        self.entries.insert(
+            key,
+            CacheEntry {
+                result,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// Per-attempt backoff schedule (seconds). Index = attempt number (0 = first retry).
 /// The initial attempt is not delayed.
@@ -94,7 +187,7 @@ impl LlmConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EvalConfig {
     pub policy_path: Option<PathBuf>,
     pub mode: Option<PolicyMode>,
@@ -105,6 +198,26 @@ pub struct EvalConfig {
     /// (whether compiled-in or custom), letting operators add environment-specific
     /// instructions without replacing the built-in prompts.
     pub system_prompt_append_path: Option<PathBuf>,
+    /// Cache LLM decisions in-memory. Keyed on command line; TTL-bounded.
+    /// Disable to force fresh evaluation on every request.
+    pub cache_enabled: bool,
+    pub cache_capacity: usize,
+    pub cache_ttl: Duration,
+}
+
+impl Default for EvalConfig {
+    fn default() -> Self {
+        Self {
+            policy_path: None,
+            mode: None,
+            llm: LlmConfig::default(),
+            system_prompt_path: None,
+            system_prompt_append_path: None,
+            cache_enabled: true,
+            cache_capacity: DEFAULT_CACHE_CAPACITY,
+            cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
+        }
+    }
 }
 
 impl EvalConfig {
@@ -160,6 +273,21 @@ impl EvalConfig {
 
     pub fn system_prompt_append_path(mut self, path: PathBuf) -> Self {
         self.system_prompt_append_path = Some(path);
+        self
+    }
+
+    pub fn cache_enabled(mut self, enabled: bool) -> Self {
+        self.cache_enabled = enabled;
+        self
+    }
+
+    pub fn cache_capacity(mut self, capacity: usize) -> Self {
+        self.cache_capacity = capacity.max(1);
+        self
+    }
+
+    pub fn cache_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = ttl;
         self
     }
 }
@@ -284,6 +412,7 @@ pub struct Evaluator {
     llm_config: LlmConfig,
     http_client: Client,
     system_prompt: String,
+    cache: Option<RwLock<EvalCache>>,
 }
 
 impl Evaluator {
@@ -353,11 +482,26 @@ impl Evaluator {
             .build()
             .context("failed to create HTTP client")?;
 
+        let cache = if config.cache_enabled {
+            tracing::info!(
+                "LLM decision cache enabled: capacity={} ttl={}s",
+                config.cache_capacity,
+                config.cache_ttl.as_secs()
+            );
+            Some(RwLock::new(EvalCache::new(
+                config.cache_capacity,
+                config.cache_ttl,
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             policy_engine,
             llm_config: config.llm,
             http_client,
             system_prompt,
+            cache,
         })
     }
 
@@ -453,7 +597,42 @@ impl Evaluator {
         }
 
         if self.llm_config.enabled {
-            return self.evaluate_llm(command).await;
+            // Cache lookup happens on the LLM path only. Static-policy hits
+            // are already cheap, and dynamic policy reloads on the static
+            // path would be bypassed by cached decisions.
+            if let Some(ref cache) = self.cache {
+                let hit = {
+                    let guard = cache.read().await;
+                    guard.get(command)
+                };
+                if let Some(result) = hit {
+                    tracing::debug!("cache hit for command");
+                    return result;
+                }
+            }
+
+            let result = self.evaluate_llm(command).await;
+
+            if let Some(ref cache) = self.cache {
+                match &result {
+                    EvalResult::Allow { reason, .. } => {
+                        let mut guard = cache.write().await;
+                        guard.insert(
+                            command.to_string(),
+                            CachedResult::Allow(reason.clone()),
+                        );
+                    }
+                    EvalResult::Deny { reason, .. } => {
+                        let mut guard = cache.write().await;
+                        guard.insert(command.to_string(), CachedResult::Deny(reason.clone()));
+                    }
+                    EvalResult::Error(_) => {
+                        // Don't cache transient errors.
+                    }
+                }
+            }
+
+            return result;
         }
 
         if let Some(ref engine) = self.policy_engine {
@@ -1069,6 +1248,60 @@ pub fn redact_for_llm(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hit_returns_cached_allow() {
+        let mut cache = EvalCache::new(4, Duration::from_secs(60));
+        cache.insert(
+            "ls -la".to_string(),
+            CachedResult::Allow("inspection".to_string()),
+        );
+        match cache.get("ls -la") {
+            Some(EvalResult::Allow { reason, .. }) => assert_eq!(reason, "inspection"),
+            other => panic!("expected cached Allow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cache_miss_returns_none() {
+        let cache = EvalCache::new(4, Duration::from_secs(60));
+        assert!(cache.get("ls -la").is_none());
+    }
+
+    #[test]
+    fn cache_ttl_expires_entry() {
+        let mut cache = EvalCache::new(4, Duration::from_millis(10));
+        cache.insert(
+            "ls".to_string(),
+            CachedResult::Allow("ok".to_string()),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cache.get("ls").is_none(), "entry should have expired");
+    }
+
+    #[test]
+    fn cache_evicts_oldest_when_full() {
+        let mut cache = EvalCache::new(2, Duration::from_secs(60));
+        cache.insert("a".into(), CachedResult::Allow("a".into()));
+        std::thread::sleep(Duration::from_millis(2));
+        cache.insert("b".into(), CachedResult::Allow("b".into()));
+        std::thread::sleep(Duration::from_millis(2));
+        cache.insert("c".into(), CachedResult::Allow("c".into()));
+
+        assert!(cache.get("a").is_none(), "oldest should have been evicted");
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("c").is_some());
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn cache_caches_both_allow_and_deny() {
+        let mut cache = EvalCache::new(4, Duration::from_secs(60));
+        cache.insert("ok".into(), CachedResult::Allow("ok".into()));
+        cache.insert("bad".into(), CachedResult::Deny("bad".into()));
+        assert!(matches!(cache.get("ok"), Some(EvalResult::Allow { .. })));
+        assert!(matches!(cache.get("bad"), Some(EvalResult::Deny { .. })));
+    }
 
     #[test]
     fn test_eval_result_display() {

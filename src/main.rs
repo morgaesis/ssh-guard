@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
+#[allow(clippy::large_enum_variant)]
 enum MainArgs {
     /// Execute a command through the guard server
     // `disable_help_flag` is critical: without it clap would intercept
@@ -211,6 +212,18 @@ enum ServerCommands {
         /// SSH_GUARD_PREFLIGHT.
         #[arg(long = "preflight", action = ArgAction::SetTrue)]
         preflight: bool,
+
+        /// Disable in-memory caching of LLM decisions. Env: SSH_GUARD_CACHE.
+        #[arg(long = "no-cache", action = ArgAction::SetTrue)]
+        no_cache: bool,
+
+        /// Maximum number of cached decisions. Env: SSH_GUARD_CACHE_CAPACITY.
+        #[arg(long)]
+        cache_capacity: Option<usize>,
+
+        /// Cache entry TTL in seconds. Env: SSH_GUARD_CACHE_TTL.
+        #[arg(long)]
+        cache_ttl: Option<u64>,
 
         /// Evaluate policy but do not execute approved commands.
         /// Env: SSH_GUARD_DRY_RUN.
@@ -407,6 +420,9 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_llm,
             no_redact,
             preflight,
+            no_cache,
+            cache_capacity,
+            cache_ttl,
             dry_run,
             system_prompt,
             system_prompt_append,
@@ -533,6 +549,29 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(ref prompt_path) = system_prompt {
                 tracing::info!("Loading system prompt from: {}", prompt_path.display());
                 eval_config = eval_config.system_prompt_path(prompt_path.clone());
+            }
+
+            // Cache: flag disable wins, else env SSH_GUARD_CACHE=false disables.
+            // Capacity and TTL: flag > env > default.
+            let cache_env_enabled = guard_env("CACHE")
+                .as_deref()
+                .map(parse_env_bool)
+                .unwrap_or(true);
+            let cache_enabled = !no_cache && cache_env_enabled;
+            let cache_capacity = cache_capacity
+                .or_else(|| {
+                    guard_env("CACHE_CAPACITY").and_then(|v| v.parse::<usize>().ok())
+                })
+                .unwrap_or(evaluate::DEFAULT_CACHE_CAPACITY);
+            let cache_ttl_secs = cache_ttl
+                .or_else(|| guard_env("CACHE_TTL").and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(evaluate::DEFAULT_CACHE_TTL_SECS);
+            eval_config = eval_config
+                .cache_enabled(cache_enabled)
+                .cache_capacity(cache_capacity)
+                .cache_ttl(std::time::Duration::from_secs(cache_ttl_secs));
+            if !cache_enabled {
+                tracing::info!("LLM decision cache disabled");
             }
 
             // Additive prompt: append to base prompt without replacing it.
@@ -1151,6 +1190,9 @@ mod tests {
                 no_llm,
                 no_redact,
                 preflight,
+                no_cache,
+                cache_capacity,
+                cache_ttl,
                 dry_run,
                 system_prompt,
                 system_prompt_append,
@@ -1172,6 +1214,9 @@ mod tests {
                 no_llm,
                 no_redact,
                 preflight,
+                no_cache,
+                cache_capacity,
+                cache_ttl,
                 dry_run,
                 system_prompt,
                 system_prompt_append,

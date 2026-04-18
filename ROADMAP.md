@@ -30,9 +30,10 @@
 - Compiled credential preflight denies known credential-disclosure paths and tool side-channels before execution (opt-in via `--preflight`; default off because heuristics over-match on benign `kubectl set env` / `jsonpath=...env...` workflows).
 - Session grants: `guard session grant <token> --allow <glob> --deny <glob> [--ttl N]` attaches per-session allow/deny overlays that short-circuit the evaluator for matching commands. Agents opt in by setting `GUARD_SESSION` before `guard run`.
 
+- LLM decision cache: in-memory TTL-bounded cache keyed on the exact command line. A command approved or denied once returns from cache on subsequent requests without another LLM call, within `--cache-ttl` seconds and `--cache-capacity` entries. Cache is bound to the Evaluator lifetime, so prompt changes force a fresh cache. Disable with `--no-cache` / `SSH_GUARD_CACHE=false`.
+
 ## Next
 
-- Command-decision caching for the stateless evaluator (key: mode + prompt hash + command line; TTL; invalidate on prompt file change).
 - Interactive approval chat per session: conversational context with the operator that lets guard make context-aware decisions beyond per-command stateless evaluation.
 - Live integration test for 429 / `Retry-After` mocking (the unit test suite already covers the retry rules; an HTTP-mock integration test would catch wire-format regressions).
 - Binary allowlist for the server (restrict which binaries can be executed, not just what arguments are passed).

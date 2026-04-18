@@ -86,6 +86,7 @@ pub struct ExecuteRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum AdminRequest {
     SessionGrant {
         token: String,
