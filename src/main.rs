@@ -7,6 +7,7 @@ mod mcp;
 mod redact;
 mod secrets;
 mod server;
+mod session;
 mod shim;
 mod ssh;
 mod tool_config;
@@ -71,6 +72,48 @@ enum MainArgs {
     /// Expose guard as an MCP server over stdio
     #[clap(subcommand)]
     Mcp(McpCommands),
+    /// Manage session grants (extra allow/deny for a specific session token)
+    #[clap(subcommand)]
+    Session(SessionCommands),
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// Grant a session token extra allow/deny patterns
+    Grant {
+        /// Opaque session token; the agent passes this as GUARD_SESSION or --session
+        token: String,
+        /// Glob pattern to allow in this session (repeatable)
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        /// Glob pattern to deny in this session (repeatable, beats allow)
+        #[arg(long = "deny")]
+        deny: Vec<String>,
+        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// Server socket path (defaults to configured)
+        #[arg(long)]
+        socket: Option<String>,
+        /// Auth token for the admin connection
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
+    /// Revoke a session grant
+    Revoke {
+        token: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
+    /// List active session grants
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
 }
 
 fn parse_key_value(s: &str) -> Result<(String, String), String> {
@@ -289,6 +332,7 @@ async fn main() -> Result<()> {
         }) => handle_shim(tools, list, remove, path, env_vars, secret_vars, user).await,
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
+        Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -332,7 +376,14 @@ fn should_fallback_to_run(args: &[String], kind: clap::error::ErrorKind) -> bool
 fn is_guard_cli_keyword(value: &str) -> bool {
     matches!(
         value,
-        "run" | "exec" | "server" | "secrets" | "shim" | "config" | "mcp" | "help"
+        "run" | "exec"
+            | "server"
+            | "secrets"
+            | "shim"
+            | "config"
+            | "mcp"
+            | "session"
+            | "help"
     )
 }
 
@@ -574,6 +625,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(token) = token {
                 client = client.with_auth(token);
             }
+            if let Ok(session) = std::env::var("GUARD_SESSION") {
+                if !session.is_empty() {
+                    client = client.with_session(session);
+                }
+            }
 
             tracing::info!(
                 binary = %binary,
@@ -632,6 +688,11 @@ async fn run_exec(binary: String, args: Vec<String>) -> Result<()> {
     let mut client = server::Client::new(socket_path, tcp_port);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
+    }
+    if let Ok(session) = std::env::var("GUARD_SESSION") {
+        if !session.is_empty() {
+            client = client.with_session(session);
+        }
     }
 
     tracing::info!(
@@ -706,6 +767,139 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             };
 
             mcp::serve(mcp_config).await
+        }
+    }
+}
+
+async fn handle_session(subcommand: SessionCommands) -> Result<()> {
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+
+    let (socket_override, auth_override, request) = match subcommand {
+        SessionCommands::Grant {
+            token,
+            allow,
+            deny,
+            ttl,
+            socket,
+            auth_token,
+        } => (
+            socket,
+            auth_token,
+            server::AdminRequest::SessionGrant {
+                token,
+                allow,
+                deny,
+                ttl_secs: ttl,
+                auth_token: None,
+            },
+        ),
+        SessionCommands::Revoke {
+            token,
+            socket,
+            auth_token,
+        } => (
+            socket,
+            auth_token,
+            server::AdminRequest::SessionRevoke {
+                token,
+                auth_token: None,
+            },
+        ),
+        SessionCommands::List {
+            socket,
+            auth_token,
+        } => (
+            socket,
+            auth_token,
+            server::AdminRequest::SessionList { auth_token: None },
+        ),
+    };
+
+    let socket_path = socket_override
+        .or(config.server_socket)
+        .map(PathBuf::from);
+    let tcp_port = if socket_path.is_none() {
+        config.server_tcp_port
+    } else {
+        None
+    };
+
+    if socket_path.is_none() && tcp_port.is_none() {
+        eprintln!("No server configured");
+        std::process::exit(1);
+    }
+
+    let mut client = server::Client::new(socket_path, tcp_port);
+    if let Some(token) = auth_override.or(config.auth_token) {
+        client = client.with_auth(token);
+    }
+
+    // Inject the auth token into the admin request itself so the server can
+    // validate it. The Client struct holds auth_token but the admin wire
+    // format carries it in-band.
+    let request = inject_admin_auth(request, client_auth_token(&client));
+
+    match client.send_admin(request).await? {
+        server::AdminResponse::Ok => {
+            println!("ok");
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        server::AdminResponse::SessionList { grants } => {
+            if grants.is_empty() {
+                println!("(no active session grants)");
+            } else {
+                for g in grants {
+                    println!(
+                        "token={} allow={:?} deny={:?} expires_at={}",
+                        g.token,
+                        g.allow,
+                        g.deny,
+                        g.expires_at
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "(never)".to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn client_auth_token(client: &server::Client) -> Option<String> {
+    client.auth_token_for_admin()
+}
+
+fn inject_admin_auth(
+    request: server::AdminRequest,
+    token: Option<String>,
+) -> server::AdminRequest {
+    match request {
+        server::AdminRequest::SessionGrant {
+            token: tok,
+            allow,
+            deny,
+            ttl_secs,
+            auth_token: _,
+        } => server::AdminRequest::SessionGrant {
+            token: tok,
+            allow,
+            deny,
+            ttl_secs,
+            auth_token: token,
+        },
+        server::AdminRequest::SessionRevoke {
+            token: tok,
+            auth_token: _,
+        } => server::AdminRequest::SessionRevoke {
+            token: tok,
+            auth_token: token,
+        },
+        server::AdminRequest::SessionList { auth_token: _ } => {
+            server::AdminRequest::SessionList { auth_token: token }
         }
     }
 }

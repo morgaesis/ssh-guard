@@ -259,6 +259,20 @@ Additional rules for this environment:
 
 The additive prompt is appended to whichever base prompt is active (readonly, safe, paranoid, or custom), letting operators customize behavior without maintaining a full prompt fork.
 
+## Session grants
+
+Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent threads an opaque `GUARD_SESSION` token through `guard run`; the operator grants that token glob-pattern allow/deny overlays on top of the normal policy.
+
+```bash
+# Operator: grant session "job-42" permission to write in /tmp/job-42/**
+guard session grant job-42 --allow 'mkdir /tmp/job-42*' --allow 'rm /tmp/job-42/scratch*' --ttl 3600
+
+# Agent: set GUARD_SESSION for this run
+GUARD_SESSION=job-42 guard run mkdir /tmp/job-42/out
+```
+
+Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session list` and `guard session revoke <token>` manage active grants.
+
 ## Agent integration
 
 Point your agent's command execution at `guard run` instead of direct execution.

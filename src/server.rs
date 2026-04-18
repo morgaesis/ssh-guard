@@ -14,6 +14,7 @@ use crate::redact::{
     redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
 };
 use crate::secrets::SecretManager;
+use crate::session::{SessionDecision, SessionGrant, SessionGrantSummary, SessionRegistry};
 use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,62 @@ pub struct ExecuteRequest {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub stream: bool,
+    /// Session grant token. When present and matched server-side, session
+    /// allow/deny patterns short-circuit the decision before the evaluator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AdminRequest {
+    SessionGrant {
+        token: String,
+        #[serde(default)]
+        allow: Vec<String>,
+        #[serde(default)]
+        deny: Vec<String>,
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
+    SessionRevoke {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
+    SessionList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
+}
+
+impl AdminRequest {
+    fn auth_token(&self) -> Option<&str> {
+        match self {
+            Self::SessionGrant { auth_token, .. }
+            | Self::SessionRevoke { auth_token, .. }
+            | Self::SessionList { auth_token, .. } => auth_token.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum AdminResponse {
+    Ok,
+    Error { message: String },
+    SessionList { grants: Vec<SessionGrantSummary> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum IncomingMessage {
+    Admin {
+        admin: AdminRequest,
+    },
+    Execute(ExecuteRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +183,9 @@ pub struct ServerConfig {
     /// PATH, credential-disclosure pattern deny). When false, the evaluator
     /// is the only authority on whether a command is allowed.
     pub preflight: bool,
+    /// Session grant registry. Grants here extend or narrow the policy
+    /// decision for a specific session token.
+    pub sessions: Arc<RwLock<SessionRegistry>>,
 }
 
 impl ServerConfig {
@@ -159,6 +219,7 @@ impl ServerConfig {
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
+            sessions: Arc::new(RwLock::new(SessionRegistry::new())),
         }
     }
 
@@ -420,7 +481,7 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
             continue;
         }
         tracing::debug!("handle_client_unix: received request (raw)");
-        let request: ExecuteRequest = match serde_json::from_str(&line) {
+        let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 let resp = ExecuteResponse {
@@ -439,6 +500,18 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
         };
 
         let caller = CallerIdentity::Unix { uid };
+
+        let request = match incoming {
+            IncomingMessage::Admin { admin } => {
+                let resp = handle_admin_request(config, &caller, admin).await;
+                writer
+                    .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                continue;
+            }
+            IncomingMessage::Execute(req) => req,
+        };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
             config.log_audit_policy(
@@ -527,6 +600,78 @@ fn emit_exec_audit_events(
     }
 }
 
+async fn handle_admin_request(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    request: AdminRequest,
+) -> AdminResponse {
+    if let Err(e) = config.validate_token(request.auth_token()) {
+        tracing::warn!(
+            "admin request rejected: caller={} reason={}",
+            caller,
+            e
+        );
+        return AdminResponse::Error {
+            message: "invalid auth token".to_string(),
+        };
+    }
+
+    match request {
+        AdminRequest::SessionGrant {
+            token,
+            allow,
+            deny,
+            ttl_secs,
+            ..
+        } => {
+            if token.is_empty() {
+                return AdminResponse::Error {
+                    message: "session token must not be empty".to_string(),
+                };
+            }
+            let expires_at = ttl_secs.map(|secs| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    + secs
+            });
+            let grant = SessionGrant {
+                allow,
+                deny,
+                expires_at,
+            };
+            let mut reg = config.sessions.write().await;
+            reg.purge_expired();
+            reg.grant(token.clone(), grant);
+            tracing::info!(
+                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?}",
+                caller,
+                token,
+                ttl_secs
+            );
+            AdminResponse::Ok
+        }
+        AdminRequest::SessionRevoke { token, .. } => {
+            let mut reg = config.sessions.write().await;
+            let removed = reg.revoke(&token);
+            tracing::info!(
+                "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
+                caller,
+                token,
+                removed
+            );
+            AdminResponse::Ok
+        }
+        AdminRequest::SessionList { .. } => {
+            let reg = config.sessions.read().await;
+            AdminResponse::SessionList {
+                grants: reg.list(),
+            }
+        }
+    }
+}
+
 async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -536,7 +681,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
             tracing::warn!("request too large ({} bytes), dropping", line.len());
             continue;
         }
-        let request: ExecuteRequest = match serde_json::from_str(&line) {
+        let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 let resp = ExecuteResponse {
@@ -552,6 +697,24 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 writer.write_all(b"\n").await?;
                 continue;
             }
+        };
+
+        let request = match incoming {
+            IncomingMessage::Admin { admin } => {
+                let caller = CallerIdentity::Tcp {
+                    token: admin
+                        .auth_token()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "<none>".to_string()),
+                };
+                let resp = handle_admin_request(config, &caller, admin).await;
+                writer
+                    .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                continue;
+            }
+            IncomingMessage::Execute(req) => req,
         };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
@@ -841,6 +1004,48 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return ExecuteResult::denied(reason);
     }
 
+    // Reconstruct full command line early so session short-circuit and
+    // evaluator share the same command text.
+    let command_line = if request.args.is_empty() {
+        request.binary.clone()
+    } else {
+        format!("{} {}", request.binary, request.args.join(" "))
+    };
+
+    // Session grants short-circuit both directions: deny wins before the
+    // evaluator, allow skips the evaluator entirely.
+    if let Some(ref token) = request.session_token {
+        let decision = {
+            let reg = config.sessions.read().await;
+            reg.check(token, &request.binary, &request.args)
+        };
+        if let Some((decision, reason)) = decision {
+            match decision {
+                SessionDecision::Deny => {
+                    config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+                    let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+                    return ExecuteResult::denied(reason);
+                }
+                SessionDecision::Allow => {
+                    config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
+                    if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await {
+                        return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+                    }
+                    return exec_after_approval(
+                        request,
+                        config,
+                        caller,
+                        reason,
+                        depth,
+                        stream_output,
+                        stream_writer,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
     if config.preflight && !binary_exists_on_path(&request.binary) {
         let reason = format!(
             "unknown binary: '{}' is not available on the guard server PATH",
@@ -850,13 +1055,6 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
         return ExecuteResult::denied(reason);
     }
-
-    // Reconstruct full command line for policy evaluation
-    let command_line = if request.args.is_empty() {
-        request.binary.clone()
-    } else {
-        format!("{} {}", request.binary, request.args.join(" "))
-    };
 
     if config.preflight {
         if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
@@ -892,11 +1090,33 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         }
     };
 
-    // From here on the policy has approved the command. Any failure is an
-    // exec-level failure, not a policy denial, and must be reported as such
-    // so the audit stream can distinguish "LLM said no" from "LLM said yes
-    // but the kernel refused".
+    exec_after_approval(
+        request,
+        config,
+        caller,
+        allow_reason,
+        depth,
+        stream_output,
+        stream_writer,
+    )
+    .await
+}
 
+/// Execute a command the policy layer has already approved.
+///
+/// Entered from either the LLM evaluator path or a session-grant allow
+/// match. Failures returned from here are exec-level, not policy-level,
+/// so the audit stream can tell "policy said no" apart from "policy
+/// said yes but the kernel refused".
+async fn exec_after_approval<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    allow_reason: String,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+) -> ExecuteResult {
     if config.dry_run {
         tracing::info!(
             "Dry-run: not executing {} {:?} ({})",
@@ -907,7 +1127,6 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return ExecuteResult::dry_run(allow_reason);
     }
 
-    // Resolve tool-level env/secrets from registry (includes per-user overrides)
     let user_key = caller.user_key();
     let tool_env = {
         let mut reg = config.tool_registry.write().await;
@@ -938,7 +1157,6 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // auth tokens) via env, printenv, /proc/self/environ, or $VAR expansion.
     cmd.env_clear();
 
-    // Allowlist: minimal set of env vars needed for child processes to function
     for var in &[
         "PATH",
         "HOME",
@@ -952,22 +1170,19 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         "SHELL",
         "LOGNAME",
         "XDG_RUNTIME_DIR",
-        "SSH_AUTH_SOCK", // needed for SSH agent forwarding
+        "SSH_AUTH_SOCK",
     ] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
     }
 
-    // Inject server-side tool env/secrets (authoritative, cannot be overridden by clients)
     for (key, value) in &tool_env {
         cmd.env(key, value);
     }
 
-    // Set recursion depth for nested shim evaluation
     cmd.env("GUARD_DEPTH", (depth + 1).to_string());
 
-    // Propagate shim directory in child PATH for nested evaluation (overrides inherited PATH)
     if let Some(ref shim_dir) = config.shim_dir {
         let base_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{}", shim_dir.display(), base_path));
@@ -988,8 +1203,6 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     let output = match cmd.output().await {
         Ok(o) => o,
         Err(e) => {
-            // ENOENT, EACCES, and other spawn failures land here. The LLM
-            // already approved; this is purely an exec-layer failure.
             return ExecuteResult::exec_failed(
                 allow_reason,
                 format!("failed to execute '{}': {}", request.binary, e),
@@ -1307,6 +1520,7 @@ pub struct Client {
     socket_path: Option<PathBuf>,
     tcp_port: Option<u16>,
     auth_token: Option<String>,
+    session_token: Option<String>,
 }
 
 impl Client {
@@ -1315,12 +1529,68 @@ impl Client {
             socket_path,
             tcp_port,
             auth_token: None,
+            session_token: None,
         }
     }
 
     pub fn with_auth(mut self, token: String) -> Self {
         self.auth_token = Some(token);
         self
+    }
+
+    pub fn with_session(mut self, session_token: String) -> Self {
+        self.session_token = Some(session_token);
+        self
+    }
+
+    pub fn auth_token_for_admin(&self) -> Option<String> {
+        self.auth_token.clone()
+    }
+
+    pub async fn send_admin(&self, request: AdminRequest) -> Result<AdminResponse> {
+        let envelope = IncomingMessage::Admin { admin: request };
+        let line = serde_json::to_string(&envelope)?;
+
+        if let Some(ref socket_path) = self.socket_path {
+            let stream = UnixStream::connect(socket_path)
+                .await
+                .context("failed to connect to guard server")?;
+            let (reader, writer) = stream.into_split();
+            let mut writer = tokio::io::BufWriter::new(writer);
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+
+            let mut lines = BufReader::new(reader).lines();
+            let response_line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
+            let resp: AdminResponse = serde_json::from_str(&response_line)
+                .context("invalid admin server response")?;
+            Ok(resp)
+        } else if let Some(port) = self.tcp_port {
+            let addr = format!("127.0.0.1:{}", port);
+            let stream = tokio::net::TcpStream::connect(&addr)
+                .await
+                .context("failed to connect to guard server")?;
+            let (reader, writer) = stream.into_split();
+            let mut writer = tokio::io::BufWriter::new(writer);
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+
+            let mut lines = BufReader::new(reader).lines();
+            let response_line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
+            let resp: AdminResponse = serde_json::from_str(&response_line)
+                .context("invalid admin server response")?;
+            Ok(resp)
+        } else {
+            anyhow::bail!("no socket path or TCP port configured");
+        }
     }
 
     pub fn endpoint_for_log(&self) -> String {
@@ -1339,6 +1609,7 @@ impl Client {
             args: args.to_vec(),
             auth_token: self.auth_token.clone(),
             stream: false,
+            session_token: self.session_token.clone(),
         };
 
         tracing::debug!(
@@ -1371,6 +1642,7 @@ impl Client {
             args: args.to_vec(),
             auth_token: self.auth_token.clone(),
             stream: true,
+            session_token: self.session_token.clone(),
         };
 
         tracing::debug!(
