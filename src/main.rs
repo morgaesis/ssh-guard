@@ -16,6 +16,7 @@ use guard::evaluate;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use guard::policy::PolicyMode;
+use std::io::Write;
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -549,11 +550,36 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 client = client.with_auth(token);
             }
 
-            let resp = client.execute(&binary, &args).await?;
+            tracing::info!(
+                binary = %binary,
+                endpoint = %client.endpoint_for_log(),
+                "REQUEST"
+            );
+            let mut streamed_output = false;
+            let resp = client
+                .execute_streaming(&binary, &args, |stream, data| {
+                    streamed_output = true;
+                    match stream {
+                        server::OutputStream::Stdout => {
+                            print!("{}", data);
+                            let _ = std::io::stdout().flush();
+                        }
+                        server::OutputStream::Stderr => {
+                            eprint!("{}", data);
+                            let _ = std::io::stderr().flush();
+                        }
+                    }
+                })
+                .await?;
 
             if resp.allowed {
-                if let Some(stdout) = &resp.stdout {
-                    print!("{}", stdout);
+                if !streamed_output {
+                    if let Some(stdout) = &resp.stdout {
+                        print!("{}", stdout);
+                    }
+                    if let Some(stderr) = &resp.stderr {
+                        eprint!("{}", stderr);
+                    }
                 }
                 if let Some(code) = resp.exit_code {
                     std::process::exit(code);
@@ -583,7 +609,27 @@ async fn run_exec(binary: String, args: Vec<String>) -> Result<()> {
         client = client.with_auth(token);
     }
 
-    let resp = client.execute(&binary, &args).await?;
+    tracing::info!(
+        binary = %binary,
+        endpoint = %client.endpoint_for_log(),
+        "REQUEST"
+    );
+    let mut streamed_output = false;
+    let resp = client
+        .execute_streaming(&binary, &args, |stream, data| {
+            streamed_output = true;
+            match stream {
+                server::OutputStream::Stdout => {
+                    print!("{}", data);
+                    let _ = std::io::stdout().flush();
+                }
+                server::OutputStream::Stderr => {
+                    eprint!("{}", data);
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        })
+        .await?;
 
     if resp.allowed {
         tracing::info!(
@@ -591,11 +637,13 @@ async fn run_exec(binary: String, args: Vec<String>) -> Result<()> {
             reason = %resp.reason,
             "ALLOWED"
         );
-        if let Some(stdout) = &resp.stdout {
-            print!("{}", stdout);
-        }
-        if let Some(stderr) = &resp.stderr {
-            eprint!("{}", stderr);
+        if !streamed_output {
+            if let Some(stdout) = &resp.stdout {
+                print!("{}", stdout);
+            }
+            if let Some(stderr) = &resp.stderr {
+                eprint!("{}", stderr);
+            }
         }
         if let Some(code) = resp.exit_code {
             std::process::exit(code);

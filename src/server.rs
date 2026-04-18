@@ -10,7 +10,9 @@
 //! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
-use crate::redact::{redact_exact_secrets, redact_output};
+use crate::redact::{
+    redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
+};
 use crate::secrets::SecretManager;
 use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
@@ -20,10 +22,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
@@ -73,6 +75,8 @@ pub struct ExecuteRequest {
     pub args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +89,22 @@ pub struct ExecuteResponse {
     pub stdout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ExecuteStreamMessage {
+    Stdout { data: String },
+    Stderr { data: String },
+    PolicyDecision { allowed: bool, reason: String },
+    Keepalive,
+    Result { response: ExecuteResponse },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
 }
 
 #[derive(Clone)]
@@ -434,14 +454,26 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
             continue;
         }
 
-        let result = execute_command(request.clone(), config, &caller).await;
-        emit_audit_events(config, &caller, &request.binary, &request.args, &result);
+        let result = if request.stream {
+            execute_command_streaming(request.clone(), config, &caller, &mut writer).await
+        } else {
+            execute_command(request.clone(), config, &caller).await
+        };
+        emit_exec_audit_events(config, &caller, &request.binary, &request.args, &result);
 
         let resp = result.into_response();
-        writer
-            .write_all(serde_json::to_string(&resp)?.as_bytes())
+        if request.stream {
+            write_stream_message(
+                &mut writer,
+                &ExecuteStreamMessage::Result { response: resp },
+            )
             .await?;
-        writer.write_all(b"\n").await?;
+        } else {
+            writer
+                .write_all(serde_json::to_string(&resp)?.as_bytes())
+                .await?;
+            writer.write_all(b"\n").await?;
+        }
     }
 
     Ok(())
@@ -470,6 +502,18 @@ fn emit_audit_events(
     // If the policy allowed but exec failed, emit a second event so the
     // audit stream can distinguish "LLM denied" from "LLM approved but
     // exec failed". Ignored by legacy grep patterns.
+    if let ExecOutcome::Failed { reason } = &result.exec {
+        config.log_audit_exec_failed(caller, binary, args, reason);
+    }
+}
+
+fn emit_exec_audit_events(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    binary: &str,
+    args: &[String],
+    result: &ExecuteResult,
+) {
     if let ExecOutcome::Failed { reason } = &result.exec {
         config.log_audit_exec_failed(caller, binary, args, reason);
     }
@@ -531,14 +575,26 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 .clone()
                 .unwrap_or_else(|| "<none>".to_string()),
         };
-        let result = execute_command(request.clone(), config, &caller).await;
-        emit_audit_events(config, &caller, &request.binary, &request.args, &result);
+        let result = if request.stream {
+            execute_command_streaming(request.clone(), config, &caller, &mut writer).await
+        } else {
+            execute_command(request.clone(), config, &caller).await
+        };
+        emit_exec_audit_events(config, &caller, &request.binary, &request.args, &result);
 
         let resp = result.into_response();
-        writer
-            .write_all(serde_json::to_string(&resp)?.as_bytes())
+        if request.stream {
+            write_stream_message(
+                &mut writer,
+                &ExecuteStreamMessage::Result { response: resp },
+            )
             .await?;
-        writer.write_all(b"\n").await?;
+        } else {
+            writer
+                .write_all(serde_json::to_string(&resp)?.as_bytes())
+                .await?;
+            writer.write_all(b"\n").await?;
+        }
     }
 
     Ok(())
@@ -697,10 +753,61 @@ impl ExecuteResult {
     }
 }
 
+async fn write_stream_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &ExecuteStreamMessage,
+) -> Result<()> {
+    writer
+        .write_all(serde_json::to_string(message)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn write_policy_decision<W: AsyncWrite + Unpin>(
+    stream_output: bool,
+    writer: &mut W,
+    allowed: bool,
+    reason: &str,
+) -> Result<()> {
+    if stream_output {
+        write_stream_message(
+            writer,
+            &ExecuteStreamMessage::PolicyDecision {
+                allowed,
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn execute_command(
     request: ExecuteRequest,
     config: &ServerConfig,
     caller: &CallerIdentity,
+) -> ExecuteResult {
+    let mut sink = tokio::io::sink();
+    execute_command_inner(request, config, caller, false, &mut sink).await
+}
+
+async fn execute_command_streaming<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    writer: &mut W,
+) -> ExecuteResult {
+    execute_command_inner(request, config, caller, true, writer).await
+}
+
+async fn execute_command_inner<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    stream_output: bool,
+    stream_writer: &mut W,
 ) -> ExecuteResult {
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
@@ -708,10 +815,10 @@ async fn execute_command(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     if depth >= MAX_GUARD_DEPTH {
-        return ExecuteResult::denied(format!(
-            "guard recursion depth exceeded (max {})",
-            MAX_GUARD_DEPTH
-        ));
+        let reason = format!("guard recursion depth exceeded (max {})", MAX_GUARD_DEPTH);
+        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        return ExecuteResult::denied(reason);
     }
 
     // Validate binary name: reject paths, traversal, and shell metacharacters
@@ -720,7 +827,20 @@ async fn execute_command(
         || request.binary.contains('\0')
         || request.binary.is_empty()
     {
-        return ExecuteResult::denied(format!("invalid binary name: '{}'", request.binary));
+        let reason = format!("invalid binary name: '{}'", request.binary);
+        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        return ExecuteResult::denied(reason);
+    }
+
+    if !binary_exists_on_path(&request.binary) {
+        let reason = format!(
+            "unknown binary: '{}' is not available on the guard server PATH",
+            request.binary
+        );
+        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        return ExecuteResult::denied(reason);
     }
 
     // Reconstruct full command line for policy evaluation
@@ -730,18 +850,34 @@ async fn execute_command(
         format!("{} {}", request.binary, request.args.join(" "))
     };
 
+    if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
+        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        return ExecuteResult::denied(reason);
+    }
+
     let eval_result = config.evaluator.evaluate(&command_line).await;
 
     let allow_reason = match eval_result {
         crate::evaluate::EvalResult::Deny { reason, .. } => {
+            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
             return ExecuteResult::denied(reason);
         }
         crate::evaluate::EvalResult::Error(e) => {
             tracing::error!("evaluation error: {}", e);
-            return ExecuteResult::denied(format!("evaluation error: {}", e));
+            let reason = format!("evaluation error: {}", e);
+            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            return ExecuteResult::denied(reason);
         }
         crate::evaluate::EvalResult::Allow { reason, .. } => {
             tracing::debug!("command allowed: {}", reason);
+            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
+            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            {
+                return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+            }
             reason
         }
     };
@@ -827,6 +963,18 @@ async fn execute_command(
         cmd.env("PATH", format!("{}:{}", shim_dir.display(), base_path));
     }
 
+    if stream_output {
+        return execute_spawn_streaming(
+            cmd,
+            &request.binary,
+            allow_reason,
+            config,
+            &tool_env,
+            stream_writer,
+        )
+        .await;
+    }
+
     let output = match cmd.output().await {
         Ok(o) => o,
         Err(e) => {
@@ -839,31 +987,12 @@ async fn execute_command(
         }
     };
 
-    // Build list of secret values for exact-match redaction
-    let secret_refs: Vec<&str> = config
-        .redact_secrets
-        .iter()
-        .map(|s| s.as_str())
-        .chain(tool_env.values().map(|s| s.as_str()))
-        .collect();
-
-    let redact_text = |s: String| -> String {
-        // First: exact-match redaction (catches bare secret values in output)
-        let s = redact_exact_secrets(&s, &secret_refs);
-        // Then: regex-based pattern redaction (catches KEY=value, PEM blocks, etc.)
-        s.lines().map(redact_output).collect::<Vec<_>>().join("\n")
-    };
-
     let stdout = if output.stdout.is_empty() {
         None
     } else {
         let raw = &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)];
         let s = String::from_utf8_lossy(raw).to_string();
-        if config.redact {
-            Some(redact_text(s))
-        } else {
-            Some(s)
-        }
+        Some(redact_command_text(config, &tool_env, s))
     };
 
     let stderr = if output.stderr.is_empty() {
@@ -871,14 +1000,297 @@ async fn execute_command(
     } else {
         let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
         let s = String::from_utf8_lossy(raw).to_string();
-        if config.redact {
-            Some(redact_text(s))
-        } else {
-            Some(s)
-        }
+        Some(redact_command_text(config, &tool_env, s))
     };
 
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
+}
+
+fn binary_exists_on_path(binary: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(binary);
+        let Ok(metadata) = std::fs::metadata(candidate) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    })
+}
+
+fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option<String> {
+    let command = if args.is_empty() {
+        binary.to_string()
+    } else {
+        format!("{} {}", binary, args.join(" "))
+    };
+    let lower = command.to_ascii_lowercase();
+    let tokens = command_tokens(&lower);
+
+    if lower.contains("/proc/") && lower.contains("/environ") {
+        return Some(
+            "credential preflight denied: /proc/*/environ can expose process secrets".to_string(),
+        );
+    }
+
+    if tokens.iter().any(|token| token == "ps") && tokens.iter().any(|token| token == "eww") {
+        return Some(
+            "credential preflight denied: ps eww can expose process environments".to_string(),
+        );
+    }
+
+    if tokens
+        .iter()
+        .any(|token| token == "env" || token == "printenv")
+    {
+        return Some(
+            "credential preflight denied: environment dumps can expose credentials".to_string(),
+        );
+    }
+
+    if lower.contains("/etc/default/guard")
+        || lower.contains("/var/lib/guard/.ssh/")
+        || lower.contains("/var/lib/guard/.kube/config")
+        || lower.contains("/.ssh/id_")
+        || lower.contains("~/.ssh/id_")
+        || lower.contains("/.kube/config")
+        || lower.contains("~/.kube/config")
+        || lower.contains("/.aws/credentials")
+        || lower.contains("~/.aws/credentials")
+        || lower.contains("/.env")
+        || tokens.iter().any(|token| token == ".env")
+    {
+        return Some(
+            "credential preflight denied: command references credential material".to_string(),
+        );
+    }
+
+    if has_token(&tokens, "kubectl")
+        && has_token(&tokens, "config")
+        && has_token(&tokens, "view")
+        && has_token(&tokens, "--raw")
+    {
+        return Some("credential preflight denied: kubectl config view --raw can expose kubeconfig credentials".to_string());
+    }
+
+    if has_token(&tokens, "kubectl")
+        && (has_token(&tokens, "secret")
+            || has_token(&tokens, "secrets")
+            || lower.contains("/secrets/")
+            || lower.contains("/secrets?"))
+    {
+        return Some(
+            "credential preflight denied: kubectl secret access can expose cluster credentials"
+                .to_string(),
+        );
+    }
+
+    if has_token(&tokens, "kubectl") && has_token(&tokens, "create") && has_token(&tokens, "token")
+    {
+        return Some(
+            "credential preflight denied: kubectl create token emits credential material"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn has_token(tokens: &[String], needle: &str) -> bool {
+    tokens.iter().any(|token| token == needle)
+}
+
+fn command_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|c: char| {
+            !(c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | '~' | '*' | '?' | ':'))
+        })
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[derive(Debug)]
+struct StreamChunk {
+    stream: OutputStream,
+    data: String,
+}
+
+async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
+    mut cmd: Command,
+    binary: &str,
+    allow_reason: String,
+    config: &ServerConfig,
+    tool_env: &HashMap<String, String>,
+    writer: &mut W,
+) -> ExecuteResult {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!("failed to execute '{}': {}", binary, e),
+            );
+        }
+    };
+
+    let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
+    let mut stream_tasks = Vec::new();
+
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        stream_tasks.push(tokio::spawn(async move {
+            forward_stream_lines(stdout, OutputStream::Stdout, tx).await;
+        }));
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        stream_tasks.push(tokio::spawn(async move {
+            forward_stream_lines(stderr, OutputStream::Stderr, tx).await;
+        }));
+    }
+
+    drop(tx);
+
+    let mut stdout_redaction = RedactionState::default();
+    let mut stderr_redaction = RedactionState::default();
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            maybe_chunk = rx.recv() => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                    let redaction_state = match chunk.stream {
+                        OutputStream::Stdout => &mut stdout_redaction,
+                        OutputStream::Stderr => &mut stderr_redaction,
+                    };
+                    let data = redact_command_text_with_state(config, tool_env, chunk.data, redaction_state);
+                    let message = match chunk.stream {
+                        OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
+                        OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
+                    };
+
+                    if let Err(e) = write_stream_message(writer, &message).await {
+                        let _ = child.kill().await;
+                        return ExecuteResult::exec_failed(allow_reason, format!("client stream error: {}", e));
+                    }
+                    }
+                    None => break,
+                }
+            }
+            _ = keepalive.tick() => {
+                if let Err(e) = write_stream_message(writer, &ExecuteStreamMessage::Keepalive).await {
+                    let _ = child.kill().await;
+                    return ExecuteResult::exec_failed(allow_reason, format!("client stream error: {}", e));
+                }
+            }
+        }
+    }
+
+    for task in stream_tasks {
+        let _ = task.await;
+    }
+
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!("failed to wait for '{}': {}", binary, e),
+            );
+        }
+    };
+
+    ExecuteResult::completed(allow_reason, status.code(), None, None)
+}
+
+async fn forward_stream_lines<R>(reader: R, stream: OutputStream, tx: mpsc::Sender<StreamChunk>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+
+    loop {
+        let mut data = String::new();
+        match reader.read_line(&mut data).await {
+            Ok(0) => break,
+            Ok(_) => {
+                if tx.send(StreamChunk { stream, data }).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(StreamChunk {
+                        stream: OutputStream::Stderr,
+                        data: format!("guard stream read error: {}\n", e),
+                    })
+                    .await;
+                break;
+            }
+        }
+    }
+}
+
+fn redact_command_text(
+    config: &ServerConfig,
+    tool_env: &HashMap<String, String>,
+    text: String,
+) -> String {
+    redact_command_text_inner(config, tool_env, text, None)
+}
+
+fn redact_command_text_with_state(
+    config: &ServerConfig,
+    tool_env: &HashMap<String, String>,
+    text: String,
+    state: &mut RedactionState,
+) -> String {
+    redact_command_text_inner(config, tool_env, text, Some(state))
+}
+
+fn redact_command_text_inner(
+    config: &ServerConfig,
+    tool_env: &HashMap<String, String>,
+    text: String,
+    state: Option<&mut RedactionState>,
+) -> String {
+    if !config.redact {
+        return text;
+    }
+
+    let secret_refs: Vec<&str> = config
+        .redact_secrets
+        .iter()
+        .map(|s| s.as_str())
+        .chain(tool_env.values().map(|s| s.as_str()))
+        .collect();
+
+    // First: exact-match redaction catches bare secret values in output.
+    let text = redact_exact_secrets(&text, &secret_refs);
+    // Then: regex and context-based redaction catches KEY=value, YAML env
+    // pairs, PEM blocks, etc.
+    if let Some(state) = state {
+        let had_trailing_newline = text.ends_with('\n');
+        let mut redacted = text
+            .lines()
+            .map(|line| redact_output_with_state(line, state))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if had_trailing_newline {
+            redacted.push('\n');
+        }
+        redacted
+    } else {
+        redact_output_text(&text)
+    }
 }
 
 pub struct Client {
@@ -901,12 +1313,30 @@ impl Client {
         self
     }
 
+    pub fn endpoint_for_log(&self) -> String {
+        if let Some(ref socket_path) = self.socket_path {
+            format!("unix:{}", socket_path.display())
+        } else if let Some(port) = self.tcp_port {
+            format!("tcp:127.0.0.1:{}", port)
+        } else {
+            "unconfigured".to_string()
+        }
+    }
+
     pub async fn execute(&self, binary: &str, args: &[String]) -> Result<ExecuteResponse> {
         let request = ExecuteRequest {
             binary: binary.to_string(),
             args: args.to_vec(),
             auth_token: self.auth_token.clone(),
+            stream: false,
         };
+
+        tracing::debug!(
+            binary = %binary,
+            arg_count = args.len(),
+            endpoint = %self.endpoint_for_log(),
+            "client dispatching execute request"
+        );
 
         if let Some(ref socket_path) = self.socket_path {
             self.send_unix(socket_path, &request).await
@@ -917,23 +1347,71 @@ impl Client {
         }
     }
 
+    pub async fn execute_streaming<F>(
+        &self,
+        binary: &str,
+        args: &[String],
+        mut on_output: F,
+    ) -> Result<ExecuteResponse>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        let request = ExecuteRequest {
+            binary: binary.to_string(),
+            args: args.to_vec(),
+            auth_token: self.auth_token.clone(),
+            stream: true,
+        };
+
+        tracing::debug!(
+            binary = %binary,
+            arg_count = args.len(),
+            endpoint = %self.endpoint_for_log(),
+            "client dispatching streaming execute request"
+        );
+
+        if let Some(ref socket_path) = self.socket_path {
+            self.send_unix_streaming(socket_path, &request, &mut on_output)
+                .await
+        } else if let Some(port) = self.tcp_port {
+            self.send_tcp_streaming(port, &request, &mut on_output)
+                .await
+        } else {
+            anyhow::bail!("no socket path or TCP port configured");
+        }
+    }
+
     async fn send_unix(
         &self,
         socket_path: &PathBuf,
         request: &ExecuteRequest,
     ) -> Result<ExecuteResponse> {
+        tracing::debug!(
+            socket = %socket_path.display(),
+            "connecting to guard server"
+        );
         let stream = UnixStream::connect(socket_path)
             .await
             .context("failed to connect to guard server")?;
+        tracing::debug!(
+            socket = %socket_path.display(),
+            "connected to guard server"
+        );
 
         let (reader, writer) = stream.into_split();
 
         let mut writer = tokio::io::BufWriter::new(writer);
+        tracing::debug!(
+            binary = %request.binary,
+            arg_count = request.args.len(),
+            "sending execute request"
+        );
         writer
             .write_all(serde_json::to_string(request)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
+        tracing::debug!("execute request sent; waiting for server response");
 
         let mut reader = BufReader::new(reader).lines();
         let Some(line) = reader.next_line().await? else {
@@ -942,24 +1420,78 @@ impl Client {
 
         let response: ExecuteResponse =
             serde_json::from_str(&line).context("invalid server response")?;
+        tracing::debug!(
+            allowed = response.allowed,
+            exit_code = ?response.exit_code,
+            has_stdout = response.stdout.is_some(),
+            has_stderr = response.stderr.is_some(),
+            "received execute response"
+        );
 
         Ok(response)
+    }
+
+    async fn send_unix_streaming<F>(
+        &self,
+        socket_path: &PathBuf,
+        request: &ExecuteRequest,
+        on_output: &mut F,
+    ) -> Result<ExecuteResponse>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        tracing::debug!(
+            socket = %socket_path.display(),
+            "connecting to guard server"
+        );
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .context("failed to connect to guard server")?;
+        tracing::debug!(
+            socket = %socket_path.display(),
+            "connected to guard server"
+        );
+
+        let (reader, writer) = stream.into_split();
+        let mut writer = tokio::io::BufWriter::new(writer);
+        tracing::debug!(
+            binary = %request.binary,
+            arg_count = request.args.len(),
+            "sending streaming execute request"
+        );
+        writer
+            .write_all(serde_json::to_string(request)?.as_bytes())
+            .await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        tracing::debug!("streaming execute request sent; waiting for server response");
+
+        let mut reader = BufReader::new(reader).lines();
+        read_streaming_response(&mut reader, on_output).await
     }
 
     async fn send_tcp(&self, port: u16, request: &ExecuteRequest) -> Result<ExecuteResponse> {
         let addr = format!("127.0.0.1:{}", port);
+        tracing::debug!(addr = %addr, "connecting to guard server");
         let stream = tokio::net::TcpStream::connect(&addr)
             .await
             .context("failed to connect to guard server")?;
+        tracing::debug!(addr = %addr, "connected to guard server");
 
         let (reader, writer) = stream.into_split();
 
         let mut writer = tokio::io::BufWriter::new(writer);
+        tracing::debug!(
+            binary = %request.binary,
+            arg_count = request.args.len(),
+            "sending execute request"
+        );
         writer
             .write_all(serde_json::to_string(request)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
+        tracing::debug!("execute request sent; waiting for server response");
 
         let mut reader = BufReader::new(reader).lines();
         let Some(line) = reader.next_line().await? else {
@@ -968,9 +1500,113 @@ impl Client {
 
         let response: ExecuteResponse =
             serde_json::from_str(&line).context("invalid server response")?;
+        tracing::debug!(
+            allowed = response.allowed,
+            exit_code = ?response.exit_code,
+            has_stdout = response.stdout.is_some(),
+            has_stderr = response.stderr.is_some(),
+            "received execute response"
+        );
 
         Ok(response)
     }
+
+    async fn send_tcp_streaming<F>(
+        &self,
+        port: u16,
+        request: &ExecuteRequest,
+        on_output: &mut F,
+    ) -> Result<ExecuteResponse>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        let addr = format!("127.0.0.1:{}", port);
+        tracing::debug!(addr = %addr, "connecting to guard server");
+        let stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .context("failed to connect to guard server")?;
+        tracing::debug!(addr = %addr, "connected to guard server");
+
+        let (reader, writer) = stream.into_split();
+        let mut writer = tokio::io::BufWriter::new(writer);
+        tracing::debug!(
+            binary = %request.binary,
+            arg_count = request.args.len(),
+            "sending streaming execute request"
+        );
+        writer
+            .write_all(serde_json::to_string(request)?.as_bytes())
+            .await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        tracing::debug!("streaming execute request sent; waiting for server response");
+
+        let mut reader = BufReader::new(reader).lines();
+        read_streaming_response(&mut reader, on_output).await
+    }
+}
+
+async fn read_streaming_response<R, F>(
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    on_output: &mut F,
+) -> Result<ExecuteResponse>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(OutputStream, &str),
+{
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    while let Some(line) = reader.next_line().await? {
+        match serde_json::from_str::<ExecuteStreamMessage>(&line) {
+            Ok(ExecuteStreamMessage::Stdout { data }) => {
+                on_output(OutputStream::Stdout, &data);
+                stdout.push_str(&data);
+            }
+            Ok(ExecuteStreamMessage::Stderr { data }) => {
+                on_output(OutputStream::Stderr, &data);
+                stderr.push_str(&data);
+            }
+            Ok(ExecuteStreamMessage::PolicyDecision { allowed, reason }) => {
+                if allowed {
+                    tracing::info!(reason = %reason, "POLICY_ALLOWED");
+                } else {
+                    tracing::trace!(reason = %reason, "POLICY_DENIED");
+                }
+            }
+            Ok(ExecuteStreamMessage::Keepalive) => {}
+            Ok(ExecuteStreamMessage::Result { mut response }) => {
+                if response.stdout.is_none() && !stdout.is_empty() {
+                    response.stdout = Some(stdout);
+                }
+                if response.stderr.is_none() && !stderr.is_empty() {
+                    response.stderr = Some(stderr);
+                }
+                tracing::debug!(
+                    allowed = response.allowed,
+                    exit_code = ?response.exit_code,
+                    has_stdout = response.stdout.is_some(),
+                    has_stderr = response.stderr.is_some(),
+                    "received streaming execute response"
+                );
+                return Ok(response);
+            }
+            Err(_) => {
+                let response: ExecuteResponse =
+                    serde_json::from_str(&line).context("invalid server response")?;
+                tracing::debug!(
+                    allowed = response.allowed,
+                    exit_code = ?response.exit_code,
+                    has_stdout = response.stdout.is_some(),
+                    has_stderr = response.stderr.is_some(),
+                    "received non-streaming execute response"
+                );
+                return Ok(response);
+            }
+        }
+    }
+
+    bail!("server closed connection without response")
 }
 
 #[cfg(test)]
@@ -1032,6 +1668,41 @@ mod tests {
             }
             other => panic!("expected Completed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn binary_exists_on_path_rejects_natural_language_token() {
+        assert!(!binary_exists_on_path(
+            "Give-this-should-not-exist-as-a-real-command"
+        ));
+    }
+
+    #[test]
+    fn credential_preflight_denies_kubectl_raw_config_through_shell() {
+        let args = vec![
+            "-c".to_string(),
+            "kubectl config view --raw >/dev/null && echo ok".to_string(),
+        ];
+        let reason = deterministic_credential_deny_reason("sh", &args)
+            .expect("kubectl raw config should be denied");
+        assert!(reason.contains("kubeconfig"));
+    }
+
+    #[test]
+    fn credential_preflight_denies_private_key_path() {
+        let args = vec![
+            "-c".to_string(),
+            "cat /var/lib/guard/.ssh/guard-admin >/dev/null".to_string(),
+        ];
+        let reason = deterministic_credential_deny_reason("sh", &args)
+            .expect("guard private key path should be denied");
+        assert!(reason.contains("credential material"));
+    }
+
+    #[test]
+    fn credential_preflight_allows_basic_kubectl_inspection() {
+        let args = vec!["get".to_string(), "namespaces".to_string()];
+        assert!(deterministic_credential_deny_reason("kubectl", &args).is_none());
     }
 
     #[test]
