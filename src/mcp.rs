@@ -453,20 +453,30 @@ fn render_tool_text(result: &Value) -> String {
         return format!("DENIED: {reason}");
     }
 
-    if !stdout.is_empty() && stderr.is_empty() && exit_code.unwrap_or(0) == 0 {
+    // Approved path: the policy reason is operational noise for the
+    // model (it just adds tokens without informing the next action).
+    // Show only exec output; surface the exit code when non-zero so
+    // the model notices failures and stderr when present.
+    if stderr.is_empty() && exit_code.unwrap_or(0) == 0 {
         return stdout.to_string();
     }
 
     let mut sections = Vec::new();
-    sections.push(format!("ALLOWED: {reason}"));
     if let Some(code) = exit_code {
-        sections.push(format!("exit_code: {code}"));
+        if code != 0 {
+            sections.push(format!("exit_code: {code}"));
+        }
     }
     if !stdout.is_empty() {
-        sections.push(format!("stdout:\n{stdout}"));
+        sections.push(stdout.to_string());
     }
     if !stderr.is_empty() {
         sections.push(format!("stderr:\n{stderr}"));
+    }
+    if sections.is_empty() {
+        // Approved, exit 0, no stdout, no stderr — produce something
+        // non-empty so the MCP transport doesn't return a blank value.
+        return "(no output)".to_string();
     }
     sections.join("\n")
 }
