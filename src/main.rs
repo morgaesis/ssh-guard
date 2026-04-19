@@ -436,7 +436,8 @@ fn should_fallback_to_run(args: &[String], kind: clap::error::ErrorKind) -> bool
 fn is_guard_cli_keyword(value: &str) -> bool {
     matches!(
         value,
-        "run" | "exec"
+        "run"
+            | "exec"
             | "server"
             | "secrets"
             | "shim"
@@ -607,9 +608,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .unwrap_or(true);
             let cache_enabled = !no_cache && cache_env_enabled;
             let cache_capacity = cache_capacity
-                .or_else(|| {
-                    guard_env("CACHE_CAPACITY").and_then(|v| v.parse::<usize>().ok())
-                })
+                .or_else(|| guard_env("CACHE_CAPACITY").and_then(|v| v.parse::<usize>().ok()))
                 .unwrap_or(evaluate::DEFAULT_CACHE_CAPACITY);
             let cache_ttl_secs = cache_ttl
                 .or_else(|| guard_env("CACHE_TTL").and_then(|v| v.parse::<u64>().ok()))
@@ -665,7 +664,9 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .map(parse_env_bool)
                     .unwrap_or(false);
             if preflight {
-                tracing::info!("Preflight checks enabled (executable validation, credential pattern deny)");
+                tracing::info!(
+                    "Preflight checks enabled (executable validation, credential pattern deny)"
+                );
             }
 
             tracing::info!(
@@ -961,9 +962,7 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
         Ok(server::AdminResponse::Error { .. }) => {
             // Expected when caller is not the daemon UID. Hide the rest.
             println!();
-            println!(
-                "(run `sudo -u <service-user> guard status` to view full server config)"
-            );
+            println!("(run `sudo -u <service-user> guard status` to view full server config)");
             Ok(())
         }
         Ok(other) => {
@@ -1056,13 +1055,13 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             || prompt_file.is_some();
 
         if has_grant {
-            let prompt_append = match prompt_file {
-                Some(path) => Some(
-                    std::fs::read_to_string(path)
-                        .with_context(|| format!("failed to read --prompt-file {}", path.display()))?,
-                ),
-                None => prompt.clone(),
-            };
+            let prompt_append =
+                match prompt_file {
+                    Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                        format!("failed to read --prompt-file {}", path.display())
+                    })?),
+                    None => prompt.clone(),
+                };
 
             let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
             let client = server::Client::new(socket_path, tcp_port);
@@ -1113,13 +1112,13 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             prompt_file,
             socket,
         } => {
-            let prompt_append = match prompt_file {
-                Some(path) => Some(
-                    std::fs::read_to_string(&path)
-                        .with_context(|| format!("failed to read --prompt-file {}", path.display()))?,
-                ),
-                None => prompt,
-            };
+            let prompt_append =
+                match prompt_file {
+                    Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
+                        format!("failed to read --prompt-file {}", path.display())
+                    })?),
+                    None => prompt,
+                };
             (
                 socket,
                 server::AdminRequest::SessionGrant {
@@ -1131,10 +1130,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 },
             )
         }
-        SessionCommands::Revoke {
-            token,
-            socket,
-        } => (socket, server::AdminRequest::SessionRevoke { token }),
+        SessionCommands::Revoke { token, socket } => {
+            (socket, server::AdminRequest::SessionRevoke { token })
+        }
         SessionCommands::List {
             history,
             since,

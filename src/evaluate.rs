@@ -635,9 +635,8 @@ impl Evaluator {
         }
 
         if self.llm_config.enabled {
-            let session_prompt_active = prompt_append
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
+            let session_prompt_active =
+                prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
 
             // Cache lookup happens on the LLM path only, and only when no
             // session-specific prompt is in play. Session prompts change
@@ -666,17 +665,11 @@ impl Evaluator {
                     match &result {
                         EvalResult::Allow { reason, .. } => {
                             let mut guard = cache.write().await;
-                            guard.insert(
-                                command.to_string(),
-                                CachedResult::Allow(reason.clone()),
-                            );
+                            guard.insert(command.to_string(), CachedResult::Allow(reason.clone()));
                         }
                         EvalResult::Deny { reason, .. } => {
                             let mut guard = cache.write().await;
-                            guard.insert(
-                                command.to_string(),
-                                CachedResult::Deny(reason.clone()),
-                            );
+                            guard.insert(command.to_string(), CachedResult::Deny(reason.clone()));
                         }
                         EvalResult::Error(_) => {
                             // Don't cache transient errors.
@@ -1343,10 +1336,7 @@ mod tests {
     #[test]
     fn cache_ttl_expires_entry() {
         let mut cache = EvalCache::new(4, Duration::from_millis(10));
-        cache.insert(
-            "ls".to_string(),
-            CachedResult::Allow("ok".to_string()),
-        );
+        cache.insert("ls".to_string(), CachedResult::Allow("ok".to_string()));
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get("ls").is_none(), "entry should have expired");
     }
@@ -1380,17 +1370,14 @@ mod tests {
         // LLM disabled and no static rules: every call falls through to
         // the default-deny branch without ever touching the LLM cache
         // path. We exercise the API and assert the cache remains empty.
-        let evaluator = Evaluator::new(EvalConfig::default().llm_enabled(false))
-            .expect("build evaluator");
+        let evaluator =
+            Evaluator::new(EvalConfig::default().llm_enabled(false)).expect("build evaluator");
 
         let _ = evaluator
             .evaluate_with_context("ls -la", Some("session is restoring backups"))
             .await;
 
-        let cache = evaluator
-            .cache
-            .as_ref()
-            .expect("cache enabled by default");
+        let cache = evaluator.cache.as_ref().expect("cache enabled by default");
         assert!(
             cache.read().await.is_empty(),
             "session-prompted call must not seed the cache"

@@ -493,9 +493,16 @@ mod tests {
     #[test]
     fn list_history_since_filters_by_ended_at() {
         let mut reg = SessionRegistry::new();
-        reg.grant("a".to_string(), SessionGrant {
-            allow: vec![], deny: vec![], expires_at: None, granted_at: 0, prompt_append: None,
-        });
+        reg.grant(
+            "a".to_string(),
+            SessionGrant {
+                allow: vec![],
+                deny: vec![],
+                expires_at: None,
+                granted_at: 0,
+                prompt_append: None,
+            },
+        );
         reg.revoke("a");
         let after = current_unix_secs() + 1;
         let before = current_unix_secs().saturating_sub(60);

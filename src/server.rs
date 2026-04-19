@@ -139,7 +139,9 @@ impl AdminRequest {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum AdminResponse {
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     SessionList {
         grants: Vec<SessionGrantSummary>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -185,9 +187,7 @@ pub struct ServerStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum IncomingMessage {
-    Admin {
-        admin: AdminRequest,
-    },
+    Admin { admin: AdminRequest },
     Execute(ExecuteRequest),
 }
 
@@ -696,11 +696,7 @@ async fn handle_admin_request(
 ) -> AdminResponse {
     if request.requires_daemon_uid() {
         if let Err(e) = config.validate_admin(caller) {
-            tracing::warn!(
-                "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"",
-                caller,
-                e
-            );
+            tracing::warn!("[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, e);
             return AdminResponse::Error {
                 message: e.to_string(),
             };
@@ -810,10 +806,7 @@ async fn handle_admin_request(
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     started_at_unix: config.started_at_unix,
                     uptime_secs: now.saturating_sub(config.started_at_unix),
-                    socket_path: config
-                        .socket_path
-                        .as_ref()
-                        .map(|p| p.display().to_string()),
+                    socket_path: config.socket_path.as_ref().map(|p| p.display().to_string()),
                     tcp_port: config.tcp_port,
                     mode,
                     llm_enabled: config.evaluator.llm_enabled(),
@@ -1199,13 +1192,19 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             match decision {
                 SessionDecision::Deny => {
                     config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-                    let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+                    let _ =
+                        write_policy_decision(stream_output, stream_writer, false, &reason).await;
                     return ExecuteResult::denied(reason);
                 }
                 SessionDecision::Allow => {
                     config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
-                    if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await {
-                        return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+                    if let Err(e) =
+                        write_policy_decision(stream_output, stream_writer, true, &reason).await
+                    {
+                        return ExecuteResult::exec_failed(
+                            reason,
+                            format!("client stream error: {}", e),
+                        );
                     }
                     return exec_after_approval(
                         request,
@@ -1752,7 +1751,6 @@ impl Client {
         self
     }
 
-
     pub async fn send_admin(&self, request: AdminRequest) -> Result<AdminResponse> {
         let envelope = IncomingMessage::Admin { admin: request };
         let line = serde_json::to_string(&envelope)?;
@@ -1772,8 +1770,8 @@ impl Client {
                 .next_line()
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            let resp: AdminResponse = serde_json::from_str(&response_line)
-                .context("invalid admin server response")?;
+            let resp: AdminResponse =
+                serde_json::from_str(&response_line).context("invalid admin server response")?;
             Ok(resp)
         } else if let Some(port) = self.tcp_port {
             let addr = format!("127.0.0.1:{}", port);
@@ -1791,8 +1789,8 @@ impl Client {
                 .next_line()
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            let resp: AdminResponse = serde_json::from_str(&response_line)
-                .context("invalid admin server response")?;
+            let resp: AdminResponse =
+                serde_json::from_str(&response_line).context("invalid admin server response")?;
             Ok(resp)
         } else {
             anyhow::bail!("no socket path or TCP port configured");
