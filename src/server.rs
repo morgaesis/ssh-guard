@@ -110,6 +110,10 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_token: Option<String>,
     },
+    Status {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
 }
 
 impl AdminRequest {
@@ -117,7 +121,8 @@ impl AdminRequest {
         match self {
             Self::SessionGrant { auth_token, .. }
             | Self::SessionRevoke { auth_token, .. }
-            | Self::SessionList { auth_token, .. } => auth_token.as_deref(),
+            | Self::SessionList { auth_token, .. }
+            | Self::Status { auth_token, .. } => auth_token.as_deref(),
         }
     }
 }
@@ -128,6 +133,26 @@ pub enum AdminResponse {
     Ok,
     Error { message: String },
     SessionList { grants: Vec<SessionGrantSummary> },
+    Status { status: ServerStatus },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub version: String,
+    pub started_at_unix: u64,
+    pub uptime_secs: u64,
+    pub socket_path: Option<String>,
+    pub tcp_port: Option<u16>,
+    pub mode: String,
+    pub llm_enabled: bool,
+    pub llm_model_chain: Vec<String>,
+    pub static_policy: bool,
+    pub preflight: bool,
+    pub redact: bool,
+    pub dry_run: bool,
+    pub cache_enabled: bool,
+    pub cache_size: usize,
+    pub session_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +214,9 @@ pub struct ServerConfig {
     /// Session grant registry. Grants here extend or narrow the policy
     /// decision for a specific session token.
     pub sessions: Arc<RwLock<SessionRegistry>>,
+    /// Wall-clock unix seconds when the daemon started. Surfaced via the
+    /// Status admin RPC so callers can compute uptime.
+    pub started_at_unix: u64,
 }
 
 impl ServerConfig {
@@ -223,6 +251,10 @@ impl ServerConfig {
             redact_secrets,
             preflight,
             sessions: Arc::new(RwLock::new(SessionRegistry::new())),
+            started_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 
@@ -672,6 +704,42 @@ async fn handle_admin_request(
             let reg = config.sessions.read().await;
             AdminResponse::SessionList {
                 grants: reg.list(),
+            }
+        }
+        AdminRequest::Status { .. } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let session_count = config.sessions.read().await.list().len();
+            let cache_size = config.evaluator.cache_size().await;
+            let mode = config
+                .evaluator
+                .mode()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "readonly".to_string());
+
+            AdminResponse::Status {
+                status: ServerStatus {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    started_at_unix: config.started_at_unix,
+                    uptime_secs: now.saturating_sub(config.started_at_unix),
+                    socket_path: config
+                        .socket_path
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                    tcp_port: config.tcp_port,
+                    mode,
+                    llm_enabled: config.evaluator.llm_enabled(),
+                    llm_model_chain: config.evaluator.llm_model_chain(),
+                    static_policy: config.evaluator.has_static_policy(),
+                    preflight: config.preflight,
+                    redact: config.redact,
+                    dry_run: config.dry_run,
+                    cache_enabled: config.evaluator.cache_enabled(),
+                    cache_size,
+                    session_count,
+                },
             }
         }
     }

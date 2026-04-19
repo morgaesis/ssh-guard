@@ -76,6 +76,13 @@ enum MainArgs {
     /// Manage session grants (extra allow/deny for a specific session token)
     #[clap(subcommand)]
     Session(SessionCommands),
+    /// Show daemon status (config snapshot, uptime, cache + session counts)
+    Status {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -285,6 +292,13 @@ enum ServerCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Show server status (alias for top-level `guard status`)
+    Status {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -375,6 +389,10 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
+        Ok(MainArgs::Status {
+            socket,
+            auth_token,
+        }) => handle_status(socket, auth_token).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -425,6 +443,7 @@ fn is_guard_cli_keyword(value: &str) -> bool {
             | "config"
             | "mcp"
             | "session"
+            | "status"
             | "help"
     )
 }
@@ -739,19 +758,17 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 std::process::exit(1);
             }
         }
+        ServerCommands::Status {
+            socket,
+            auth_token,
+        } => handle_status(socket, auth_token).await,
     }
 }
 
 async fn run_exec(binary: String, args: Vec<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
-    let socket_path = config.server_socket.map(PathBuf::from);
-    let tcp_port = config.server_tcp_port;
-
-    if socket_path.is_none() && tcp_port.is_none() {
-        eprintln!("No server configured");
-        std::process::exit(1);
-    }
+    let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
 
     let mut client = server::Client::new(socket_path, tcp_port);
     if let Some(token) = config.auth_token {
@@ -839,6 +856,97 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
     }
 }
 
+/// Well-known default socket path. Used when nothing more specific is
+/// configured (no --socket flag, no GUARD_SOCKET env, no client.yaml).
+/// Matches the systemd RuntimeDirectory layout in deployment/systemd/.
+const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
+
+/// Resolve the client endpoint from explicit override > env var > client
+/// config > well-known default. Returns (socket, tcp_port). At most one
+/// of the two will be Some.
+fn resolve_client_endpoint(
+    socket_override: Option<String>,
+    config: &client_config::ClientConfig,
+) -> (Option<PathBuf>, Option<u16>) {
+    if let Some(s) = socket_override {
+        return (Some(PathBuf::from(s)), None);
+    }
+    if let Ok(s) = std::env::var("GUARD_SOCKET") {
+        if !s.is_empty() {
+            return (Some(PathBuf::from(s)), None);
+        }
+    }
+    if let Some(ref s) = config.server_socket {
+        return (Some(PathBuf::from(s)), None);
+    }
+    if let Some(port) = config.server_tcp_port {
+        return (None, Some(port));
+    }
+    // Fall back to the well-known default. If it doesn't exist the
+    // connect will fail with a clear "failed to connect" error, which
+    // is more useful than the previous "No server configured" since
+    // most local installs use the default anyway.
+    (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
+}
+
+async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Result<()> {
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+
+    let mut client = server::Client::new(socket_path.clone(), tcp_port);
+    if let Some(t) = auth_token.or(config.auth_token) {
+        client = client.with_auth(t);
+    }
+
+    let request = server::AdminRequest::Status {
+        auth_token: client.auth_token_for_admin(),
+    };
+
+    match client.send_admin(request).await {
+        Ok(server::AdminResponse::Status { status }) => {
+            println!("guard {} ({})", status.version, client.endpoint_for_log());
+            println!(
+                "  uptime         {}s (started_at_unix={})",
+                status.uptime_secs, status.started_at_unix
+            );
+            if let Some(ref s) = status.socket_path {
+                println!("  socket         {}", s);
+            }
+            if let Some(p) = status.tcp_port {
+                println!("  tcp_port       {}", p);
+            }
+            println!("  mode           {}", status.mode);
+            println!("  llm_enabled    {}", status.llm_enabled);
+            if status.llm_enabled {
+                println!("  llm_models     {:?}", status.llm_model_chain);
+            }
+            println!("  static_policy  {}", status.static_policy);
+            println!("  preflight      {}", status.preflight);
+            println!("  redact         {}", status.redact);
+            println!("  dry_run        {}", status.dry_run);
+            println!("  cache          enabled={} size={}", status.cache_enabled, status.cache_size);
+            println!("  sessions       {}", status.session_count);
+            Ok(())
+        }
+        Ok(server::AdminResponse::Error { message }) => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("unexpected admin response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("could not contact guard server: {}", e);
+            eprintln!(
+                "  endpoint: {}",
+                client.endpoint_for_log()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Mint a 128-bit hex session token. Uniqueness collision is the only
 /// failure mode and is statistically irrelevant for in-memory grants
 /// that clear on daemon restart.
@@ -881,19 +989,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 None => prompt.clone(),
             };
 
-            let socket_path = socket
-                .clone()
-                .or(config.server_socket.clone())
-                .map(PathBuf::from);
-            let tcp_port = if socket_path.is_none() {
-                config.server_tcp_port
-            } else {
-                None
-            };
-            if socket_path.is_none() && tcp_port.is_none() {
-                eprintln!("No server configured");
-                std::process::exit(1);
-            }
+            let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
             let mut client = server::Client::new(socket_path, tcp_port);
             if let Some(t) = auth_token.clone().or(config.auth_token.clone()) {
                 client = client.with_auth(t);
@@ -987,19 +1083,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         ),
     };
 
-    let socket_path = socket_override
-        .or(config.server_socket)
-        .map(PathBuf::from);
-    let tcp_port = if socket_path.is_none() {
-        config.server_tcp_port
-    } else {
-        None
-    };
-
-    if socket_path.is_none() && tcp_port.is_none() {
-        eprintln!("No server configured");
-        std::process::exit(1);
-    }
+    let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
 
     let mut client = server::Client::new(socket_path, tcp_port);
     if let Some(token) = auth_override.or(config.auth_token) {
@@ -1047,6 +1131,11 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 }
             }
         }
+        server::AdminResponse::Status { .. } => {
+            // session subcommands never request status; defensive arm
+            eprintln!("unexpected status response from session admin call");
+            std::process::exit(1);
+        }
     }
 
     Ok(())
@@ -1085,6 +1174,9 @@ fn inject_admin_auth(
         },
         server::AdminRequest::SessionList { auth_token: _ } => {
             server::AdminRequest::SessionList { auth_token: token }
+        }
+        server::AdminRequest::Status { auth_token: _ } => {
+            server::AdminRequest::Status { auth_token: token }
         }
     }
 }

@@ -413,6 +413,7 @@ pub struct Evaluator {
     http_client: Client,
     system_prompt: String,
     cache: Option<RwLock<EvalCache>>,
+    mode: Option<PolicyMode>,
 }
 
 impl Evaluator {
@@ -502,7 +503,31 @@ impl Evaluator {
             http_client,
             system_prompt,
             cache,
+            mode: config.mode,
         })
+    }
+
+    pub fn mode(&self) -> Option<PolicyMode> {
+        self.mode
+    }
+
+    pub fn llm_enabled(&self) -> bool {
+        self.llm_config.enabled
+    }
+
+    pub fn llm_model_chain(&self) -> Vec<String> {
+        self.llm_config.model_chain()
+    }
+
+    pub fn cache_enabled(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    pub async fn cache_size(&self) -> usize {
+        match &self.cache {
+            Some(c) => c.read().await.len(),
+            None => 0,
+        }
     }
 
     pub fn has_static_policy(&self) -> bool {
