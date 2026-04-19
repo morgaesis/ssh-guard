@@ -153,6 +153,8 @@ pub struct ServerStatus {
     pub cache_enabled: bool,
     pub cache_size: usize,
     pub session_count: usize,
+    pub daemon_uid: u32,
+    pub admin_token_set: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +219,18 @@ pub struct ServerConfig {
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub started_at_unix: u64,
+    /// Effective UID of the daemon process. Used by admin authorization:
+    /// the daemon's own UID can always run admin RPCs (it already controls
+    /// the daemon process via signals and /proc).
+    pub daemon_uid: u32,
+    /// Shared-secret token required for admin RPCs (session grant /
+    /// revoke / list, status) when the caller is NOT the daemon's own UID.
+    /// None = no token configured = admin restricted to daemon UID. Set
+    /// this when operators need to admin from a non-daemon UID — and it
+    /// is REQUIRED when an exec-allowed UID is also the operator UID,
+    /// otherwise the agent process can mint sessions whose --prompt
+    /// overrides the LLM policy.
+    pub admin_token: Option<String>,
 }
 
 impl ServerConfig {
@@ -235,6 +249,7 @@ impl ServerConfig {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        admin_token: Option<String>,
     ) -> Self {
         Self {
             socket_path,
@@ -250,6 +265,8 @@ impl ServerConfig {
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
+            admin_token,
+            daemon_uid: current_uid(),
             sessions: Arc::new(RwLock::new(SessionRegistry::new())),
             started_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -260,10 +277,54 @@ impl ServerConfig {
 
     fn validate_uid(&self, uid: u32) -> Result<()> {
         if let Some(ref allowed) = self.allowed_uids {
-            if !allowed.contains(&uid) {
+            // The daemon's own UID is always permitted to connect: it
+            // already controls the daemon process (signals, /proc), so
+            // this is not a security boundary. Without this exemption
+            // the daemon could not run admin RPCs against itself, which
+            // breaks self-management.
+            if !allowed.contains(&uid) && uid != self.daemon_uid {
                 tracing::warn!("connection rejected: uid {} not in allowed list", uid);
                 anyhow::bail!("connection not allowed for this user");
             }
+        }
+        Ok(())
+    }
+
+    /// Authorize an admin RPC. Admin RPCs gate session and status
+    /// management — operations that influence what the LLM evaluator
+    /// sees (notably `--prompt` on session grants). They MUST NOT share
+    /// authorization with exec, because the exec UID may be an agent
+    /// process that, if granted admin, can override its own policy.
+    ///
+    /// Two ways to be admin:
+    /// 1. Caller is the daemon's own UID. Such a process already
+    ///    controls the daemon (signals, /proc) so the socket boundary
+    ///    is not a security boundary against it.
+    /// 2. Caller presents `admin_token` matching the configured value.
+    ///    This is the only way to admin from a non-daemon UID; without
+    ///    a configured admin_token, non-daemon callers are refused.
+    fn validate_admin(&self, caller: &CallerIdentity, presented_token: Option<&str>) -> Result<()> {
+        if let CallerIdentity::Unix { uid } = caller {
+            if *uid == self.daemon_uid {
+                return Ok(());
+            }
+        }
+
+        let Some(ref expected) = self.admin_token else {
+            anyhow::bail!(
+                "admin RPC refused: no admin token configured and caller is not the daemon UID"
+            );
+        };
+
+        let provided = presented_token.unwrap_or("").as_bytes();
+        let expected = expected.as_bytes();
+        let len_match = provided.len() == expected.len();
+        let byte_match = provided
+            .iter()
+            .zip(expected.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if !len_match || byte_match != 0 {
+            anyhow::bail!("admin RPC refused: invalid admin token");
         }
         Ok(())
     }
@@ -353,6 +414,7 @@ impl Server {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        admin_token: Option<String>,
     ) -> Self {
         let config = ServerConfig::new(
             socket_path,
@@ -368,6 +430,7 @@ impl Server {
             tool_registry,
             redact_secrets,
             preflight,
+            admin_token,
         );
         Self { config }
     }
@@ -640,14 +703,14 @@ async fn handle_admin_request(
     caller: &CallerIdentity,
     request: AdminRequest,
 ) -> AdminResponse {
-    if let Err(e) = config.validate_token(request.auth_token()) {
+    if let Err(e) = config.validate_admin(caller, request.auth_token()) {
         tracing::warn!(
-            "admin request rejected: caller={} reason={}",
+            "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"",
             caller,
             e
         );
         return AdminResponse::Error {
-            message: "invalid auth token".to_string(),
+            message: e.to_string(),
         };
     }
 
@@ -739,6 +802,8 @@ async fn handle_admin_request(
                     cache_enabled: config.evaluator.cache_enabled(),
                     cache_size,
                     session_count,
+                    daemon_uid: config.daemon_uid,
+                    admin_token_set: config.admin_token.is_some(),
                 },
             }
         }
@@ -1313,6 +1378,26 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     };
 
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
+}
+
+/// Read the daemon's effective UID without pulling in libc as a direct
+/// dep. /proc/self/status is the kernel-blessed source on Linux. Falls
+/// back to 0 only if procfs is missing — in that case admin would be
+/// gated entirely on admin_token, which is the conservative default.
+fn current_uid() -> u32 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            if let Some(uid_str) = rest.split_whitespace().next() {
+                if let Ok(uid) = uid_str.parse::<u32>() {
+                    return uid;
+                }
+            }
+        }
+    }
+    0
 }
 
 fn binary_exists_on_path(binary: &str) -> bool {
@@ -2156,6 +2241,7 @@ mod tests {
             ToolRegistry::empty(),
             Vec::new(),
             false,
+            None,
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)

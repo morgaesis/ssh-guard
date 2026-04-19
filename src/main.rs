@@ -80,7 +80,7 @@ enum MainArgs {
     Status {
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long)]
+        #[arg(long = "admin-token")]
         auth_token: Option<String>,
     },
 }
@@ -104,7 +104,7 @@ enum SessionCommands {
         prompt_file: Option<PathBuf>,
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long)]
+        #[arg(long = "admin-token")]
         auth_token: Option<String>,
     },
     /// Grant a session token extra allow/deny patterns
@@ -132,8 +132,10 @@ enum SessionCommands {
         /// Server socket path (defaults to configured)
         #[arg(long)]
         socket: Option<String>,
-        /// Auth token for the admin connection
-        #[arg(long)]
+        /// Admin token (overrides GUARD_ADMIN_TOKEN env). Required when
+        /// the daemon has an admin token configured and the caller is
+        /// not the daemon UID.
+        #[arg(long = "admin-token")]
         auth_token: Option<String>,
     },
     /// Revoke a session grant
@@ -141,14 +143,14 @@ enum SessionCommands {
         token: String,
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long)]
+        #[arg(long = "admin-token")]
         auth_token: Option<String>,
     },
     /// List active session grants
     List {
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long)]
+        #[arg(long = "admin-token")]
         auth_token: Option<String>,
     },
 }
@@ -249,6 +251,15 @@ enum ServerCommands {
         #[arg(long = "preflight", action = ArgAction::SetTrue)]
         preflight: bool,
 
+        /// Shared-secret token required for admin RPCs (session
+        /// grant/revoke/list, status) when the caller is NOT the daemon's
+        /// own UID. REQUIRED in any deployment where an exec-allowed UID
+        /// is also the operator UID, otherwise an agent process can mint
+        /// sessions whose --prompt overrides the LLM policy. Env:
+        /// SSH_GUARD_ADMIN_TOKEN.
+        #[arg(long)]
+        admin_token: Option<String>,
+
         /// Disable in-memory caching of LLM decisions. Env: SSH_GUARD_CACHE.
         #[arg(long = "no-cache", action = ArgAction::SetTrue)]
         no_cache: bool,
@@ -296,7 +307,7 @@ enum ServerCommands {
     Status {
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long)]
+        #[arg(long = "admin-token")]
         auth_token: Option<String>,
     },
 }
@@ -468,6 +479,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_llm,
             no_redact,
             preflight,
+            admin_token,
             no_cache,
             cache_capacity,
             cache_ttl,
@@ -668,6 +680,15 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::info!("Preflight checks enabled (executable validation, credential pattern deny)");
             }
 
+            let admin_token = admin_token
+                .filter(|s| !s.is_empty())
+                .or_else(|| guard_env("ADMIN_TOKEN").filter(|s| !s.is_empty()));
+            if admin_token.is_some() {
+                tracing::info!("Admin token configured: non-daemon UIDs may admin if they present it");
+            } else {
+                tracing::info!("No admin token configured: admin RPCs restricted to daemon UID");
+            }
+
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);
                 tool_config::ToolRegistry::empty()
@@ -697,6 +718,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tool_registry,
                 redact_secrets,
                 preflight,
+                admin_token,
             );
             srv.run().await
         }
@@ -893,13 +915,12 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
 
-    let mut client = server::Client::new(socket_path.clone(), tcp_port);
-    if let Some(t) = auth_token.or(config.auth_token) {
-        client = client.with_auth(t);
-    }
+    let admin_token = resolve_admin_token(auth_token);
+
+    let client = server::Client::new(socket_path.clone(), tcp_port);
 
     let request = server::AdminRequest::Status {
-        auth_token: client.auth_token_for_admin(),
+        auth_token: admin_token,
     };
 
     match client.send_admin(request).await {
@@ -926,6 +947,15 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
             println!("  dry_run        {}", status.dry_run);
             println!("  cache          enabled={} size={}", status.cache_enabled, status.cache_size);
             println!("  sessions       {}", status.session_count);
+            println!("  daemon_uid     {}", status.daemon_uid);
+            println!(
+                "  admin_token    {}",
+                if status.admin_token_set {
+                    "configured (non-daemon UIDs may admin if they present it)"
+                } else {
+                    "NOT configured (admin restricted to daemon UID)"
+                }
+            );
             Ok(())
         }
         Ok(server::AdminResponse::Error { message }) => {
@@ -945,6 +975,21 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
             std::process::exit(1);
         }
     }
+}
+
+/// Admin token for client→daemon admin RPCs. Priority: explicit
+/// --admin-token flag > GUARD_ADMIN_TOKEN env. NEVER read from
+/// client.yaml — that would let any process with read access to the
+/// config file admin the daemon, defeating the agent/operator
+/// separation. Operators export the env var in their interactive
+/// shell; agents do not have it.
+fn resolve_admin_token(flag: Option<String>) -> Option<String> {
+    if let Some(t) = flag.filter(|s| !s.is_empty()) {
+        return Some(t);
+    }
+    std::env::var("GUARD_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Mint a 128-bit hex session token. Uniqueness collision is the only
@@ -990,17 +1035,15 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             };
 
             let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
-            let mut client = server::Client::new(socket_path, tcp_port);
-            if let Some(t) = auth_token.clone().or(config.auth_token.clone()) {
-                client = client.with_auth(t);
-            }
+            let admin_token = resolve_admin_token(auth_token.clone());
+            let client = server::Client::new(socket_path, tcp_port);
             let request = server::AdminRequest::SessionGrant {
                 token: token.clone(),
                 allow: allow.clone(),
                 deny: deny.clone(),
                 ttl_secs: *ttl,
                 prompt_append,
-                auth_token: client.auth_token_for_admin(),
+                auth_token: admin_token,
             };
             match client.send_admin(request).await? {
                 server::AdminResponse::Ok => {}
@@ -1085,15 +1128,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
 
     let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
 
-    let mut client = server::Client::new(socket_path, tcp_port);
-    if let Some(token) = auth_override.or(config.auth_token) {
-        client = client.with_auth(token);
-    }
-
-    // Inject the auth token into the admin request itself so the server can
-    // validate it. The Client struct holds auth_token but the admin wire
-    // format carries it in-band.
-    let request = inject_admin_auth(request, client_auth_token(&client));
+    let admin_token = resolve_admin_token(auth_override);
+    let client = server::Client::new(socket_path, tcp_port);
+    let request = inject_admin_auth(request, admin_token);
 
     match client.send_admin(request).await? {
         server::AdminResponse::Ok => {
@@ -1428,6 +1465,7 @@ mod tests {
                 no_llm,
                 no_redact,
                 preflight,
+                admin_token,
                 no_cache,
                 cache_capacity,
                 cache_ttl,
@@ -1452,6 +1490,7 @@ mod tests {
                 no_llm,
                 no_redact,
                 preflight,
+                admin_token,
                 no_cache,
                 cache_capacity,
                 cache_ttl,

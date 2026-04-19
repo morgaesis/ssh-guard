@@ -289,6 +289,17 @@ guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt
 
 Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session list` and `guard session revoke <token>` manage active grants.
 
+### Admin authorization
+
+Session admin RPCs (`session new` / `grant` / `revoke` / `list`, plus `status`) are deliberately separated from exec authorization. Without this separation, any UID that can run commands could also mint a session whose `--prompt` tells the model to approve everything — a trivial bypass.
+
+Two ways to authorize an admin RPC:
+
+1. The caller is the daemon's own UID (e.g. `sudo -u guard guard session list`). That process can already control the daemon by other means, so the socket boundary is not security-relevant against it.
+2. The caller presents a matching `GUARD_ADMIN_TOKEN` (or `--admin-token` flag), and the daemon was started with `SSH_GUARD_ADMIN_TOKEN` set to the same value.
+
+If no admin token is configured, only the daemon UID can admin — non-daemon callers get `admin RPC refused: no admin token configured and caller is not the daemon UID`. **In any deployment where the operator and an agent share a UID, an admin token is required.** Set `SSH_GUARD_ADMIN_TOKEN` in `/etc/default/guard`, then export `GUARD_ADMIN_TOKEN` with the same value in your operator shell only — never in the agent's environment.
+
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
 ## Agent integration

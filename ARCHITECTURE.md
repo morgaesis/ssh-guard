@@ -41,6 +41,16 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 7. **Static policy** (optional, opt-in): Glob-pattern allow and deny lists for fast decisions on deterministically safe or unsafe commands. Allow matches skip the LLM; deny matches reject without an LLM call. Everything else falls through to the LLM evaluator. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics. See `examples/` for reference policies.
 
+## Admin authorization
+
+Admin RPCs (session grant/revoke/list, status) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. Authorization model:
+
+- The daemon's own UID is always permitted. It can already control the daemon process by other means.
+- Any other caller must present a matching `--admin-token` (env: `GUARD_ADMIN_TOKEN`) against a value the daemon was started with (`SSH_GUARD_ADMIN_TOKEN`).
+- If no admin token is configured, non-daemon callers are refused. This is the secure default — admin is only available to whoever can become the daemon UID.
+
+In deployments where the operator and an agent share a UID (typical for desktop developer setups where Claude Code, codex, etc. run as the user), `SSH_GUARD_ADMIN_TOKEN` is required. The operator exports `GUARD_ADMIN_TOKEN` in their interactive shell only; the agent's environment does not have it, so the agent cannot mint or modify sessions.
+
 ## Execution authority
 
 The server executes approved commands as the daemon process identity. It
