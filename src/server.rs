@@ -97,6 +97,8 @@ pub enum AdminRequest {
         #[serde(default)]
         ttl_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_append: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_token: Option<String>,
     },
     SessionRevoke {
@@ -623,6 +625,7 @@ async fn handle_admin_request(
             allow,
             deny,
             ttl_secs,
+            prompt_append,
             ..
         } => {
             if token.is_empty() {
@@ -641,6 +644,7 @@ async fn handle_admin_request(
                 allow,
                 deny,
                 expires_at,
+                prompt_append,
             };
             let mut reg = config.sessions.write().await;
             reg.purge_expired();
@@ -1065,7 +1069,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         }
     }
 
-    let eval_result = config.evaluator.evaluate(&command_line).await;
+    // Pull session-scoped additive prompt, if any. The evaluator appends
+    // it to the system prompt for this single call so the LLM has the
+    // session context that the static glob patterns cannot express.
+    let session_prompt = if let Some(ref token) = request.session_token {
+        let reg = config.sessions.read().await;
+        reg.prompt_append_for(token)
+    } else {
+        None
+    };
+
+    let eval_result = config
+        .evaluator
+        .evaluate_with_context(&command_line, session_prompt.as_deref())
+        .await;
 
     let allow_reason = match eval_result {
         crate::evaluate::EvalResult::Deny { reason, .. } => {

@@ -93,6 +93,15 @@ enum SessionCommands {
         /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
         #[arg(long)]
         ttl: Option<u64>,
+        /// Free-form context appended to the LLM system prompt for evaluator
+        /// calls made under this session token. Use to give the model context
+        /// the static glob patterns cannot express.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read prompt from a file (alternative to --prompt). Mutually
+        /// exclusive with --prompt; --prompt-file wins if both are given.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         /// Server socket path (defaults to configured)
         #[arg(long)]
         socket: Option<String>,
@@ -819,19 +828,31 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             allow,
             deny,
             ttl,
+            prompt,
+            prompt_file,
             socket,
             auth_token,
-        } => (
-            socket,
-            auth_token,
-            server::AdminRequest::SessionGrant {
-                token,
-                allow,
-                deny,
-                ttl_secs: ttl,
-                auth_token: None,
-            },
-        ),
+        } => {
+            let prompt_append = match prompt_file {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("failed to read --prompt-file {}", path.display()))?,
+                ),
+                None => prompt,
+            };
+            (
+                socket,
+                auth_token,
+                server::AdminRequest::SessionGrant {
+                    token,
+                    allow,
+                    deny,
+                    ttl_secs: ttl,
+                    prompt_append,
+                    auth_token: None,
+                },
+            )
+        }
         SessionCommands::Revoke {
             token,
             socket,
@@ -892,13 +913,24 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             } else {
                 for g in grants {
                     println!(
-                        "token={} allow={:?} deny={:?} expires_at={}",
+                        "token={} allow={:?} deny={:?} expires_at={} prompt={}",
                         g.token,
                         g.allow,
                         g.deny,
                         g.expires_at
                             .map(|t| t.to_string())
-                            .unwrap_or_else(|| "(never)".to_string())
+                            .unwrap_or_else(|| "(never)".to_string()),
+                        g.prompt_append
+                            .as_deref()
+                            .map(|s| {
+                                let preview: String = s.chars().take(60).collect();
+                                if s.len() > preview.len() {
+                                    format!("\"{}…\"", preview)
+                                } else {
+                                    format!("\"{}\"", preview)
+                                }
+                            })
+                            .unwrap_or_else(|| "(none)".to_string())
                     );
                 }
             }
@@ -922,12 +954,14 @@ fn inject_admin_auth(
             allow,
             deny,
             ttl_secs,
+            prompt_append,
             auth_token: _,
         } => server::AdminRequest::SessionGrant {
             token: tok,
             allow,
             deny,
             ttl_secs,
+            prompt_append,
             auth_token: token,
         },
         server::AdminRequest::SessionRevoke {

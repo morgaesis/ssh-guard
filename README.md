@@ -273,6 +273,16 @@ GUARD_SESSION=job-42 guard run mkdir /tmp/job-42/out
 
 Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session list` and `guard session revoke <token>` manage active grants.
 
+For commands that the static glob patterns cannot capture, attach a session-scoped prompt fragment so the LLM evaluator gets the context for that session's calls:
+
+```bash
+guard session grant restore-42 \
+  --prompt 'This session is restoring a Postgres backup into staging. \
+Treat psql, pg_restore, and createdb against the staging cluster as expected.'
+```
+
+The prompt is appended to the base system prompt under a `Session context:` heading for evaluator calls made under that token. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context. Pass `--prompt-file <path>` to read longer guidance from disk.
+
 ## Agent integration
 
 Point your agent's command execution at `guard run` instead of direct execution.

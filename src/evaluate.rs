@@ -580,6 +580,19 @@ impl Evaluator {
     }
 
     pub async fn evaluate(&self, command: &str) -> EvalResult {
+        self.evaluate_with_context(command, None).await
+    }
+
+    /// Evaluate `command`. If `prompt_append` is provided, append it to the
+    /// system prompt for this single LLM call so the evaluator has the
+    /// session-specific context. The decision cache is bypassed when a
+    /// session prompt is in play, because cached decisions were made under
+    /// the base prompt and may not hold under the extended context.
+    pub async fn evaluate_with_context(
+        &self,
+        command: &str,
+        prompt_append: Option<&str>,
+    ) -> EvalResult {
         // Only apply static policy if the engine has explicit rules.
         // Empty engines (from modes without a policy file) should not block anything
         // since they'd just default-deny everything before the LLM gets a chance.
@@ -597,37 +610,52 @@ impl Evaluator {
         }
 
         if self.llm_config.enabled {
-            // Cache lookup happens on the LLM path only. Static-policy hits
-            // are already cheap, and dynamic policy reloads on the static
-            // path would be bypassed by cached decisions.
-            if let Some(ref cache) = self.cache {
-                let hit = {
-                    let guard = cache.read().await;
-                    guard.get(command)
-                };
-                if let Some(result) = hit {
-                    tracing::debug!("cache hit for command");
-                    return result;
+            let session_prompt_active = prompt_append
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+
+            // Cache lookup happens on the LLM path only, and only when no
+            // session-specific prompt is in play. Session prompts change
+            // the decision surface, so they bypass the cache to avoid
+            // returning a verdict made under the base prompt.
+            if !session_prompt_active {
+                if let Some(ref cache) = self.cache {
+                    let hit = {
+                        let guard = cache.read().await;
+                        guard.get(command)
+                    };
+                    if let Some(result) = hit {
+                        tracing::debug!("cache hit for command");
+                        return result;
+                    }
                 }
             }
 
-            let result = self.evaluate_llm(command).await;
+            let result = self.evaluate_llm(command, prompt_append).await;
 
-            if let Some(ref cache) = self.cache {
-                match &result {
-                    EvalResult::Allow { reason, .. } => {
-                        let mut guard = cache.write().await;
-                        guard.insert(
-                            command.to_string(),
-                            CachedResult::Allow(reason.clone()),
-                        );
-                    }
-                    EvalResult::Deny { reason, .. } => {
-                        let mut guard = cache.write().await;
-                        guard.insert(command.to_string(), CachedResult::Deny(reason.clone()));
-                    }
-                    EvalResult::Error(_) => {
-                        // Don't cache transient errors.
+            // Only insert into cache when the verdict was made under the
+            // base prompt. Decisions reached with a session-specific prompt
+            // are not portable to other sessions.
+            if !session_prompt_active {
+                if let Some(ref cache) = self.cache {
+                    match &result {
+                        EvalResult::Allow { reason, .. } => {
+                            let mut guard = cache.write().await;
+                            guard.insert(
+                                command.to_string(),
+                                CachedResult::Allow(reason.clone()),
+                            );
+                        }
+                        EvalResult::Deny { reason, .. } => {
+                            let mut guard = cache.write().await;
+                            guard.insert(
+                                command.to_string(),
+                                CachedResult::Deny(reason.clone()),
+                            );
+                        }
+                        EvalResult::Error(_) => {
+                            // Don't cache transient errors.
+                        }
                     }
                 }
             }
@@ -654,8 +682,8 @@ impl Evaluator {
     /// Top-level LLM evaluation: walks the model-fallback chain and, per model,
     /// runs the retry loop. The LLM NEVER sees the unredacted command; only the
     /// caller's audit log does.
-    #[tracing::instrument(skip(self, command), fields(command_len = command.len()))]
-    async fn evaluate_llm(&self, command: &str) -> EvalResult {
+    #[tracing::instrument(skip(self, command, prompt_append), fields(command_len = command.len()))]
+    async fn evaluate_llm(&self, command: &str, prompt_append: Option<&str>) -> EvalResult {
         let api_key = match &self.llm_config.api_key {
             Some(k) => k.clone(),
             None => {
@@ -674,10 +702,20 @@ impl Evaluator {
         let api_url = self.llm_config.api_url();
         let chain = self.llm_config.model_chain();
 
+        // Build the per-call system prompt. Session-supplied context is
+        // appended after the base prompt so the static guardrails still
+        // anchor the evaluator.
+        let system_prompt = match prompt_append {
+            Some(extra) if !extra.trim().is_empty() => {
+                format!("{}\n\nSession context:\n{}", self.system_prompt, extra)
+            }
+            _ => self.system_prompt.clone(),
+        };
+
         let mut last_error: Option<String> = None;
         for model in &chain {
             match self
-                .evaluate_model(&api_key, &api_url, model, &redacted_command)
+                .evaluate_model(&api_key, &api_url, model, &redacted_command, &system_prompt)
                 .await
             {
                 Ok(decision) => {
@@ -711,13 +749,14 @@ impl Evaluator {
 
     /// Runs one model through the full retry budget. Returns Ok(decision) on the
     /// first successful attempt, or Err once the budget is exhausted.
-    #[tracing::instrument(skip(self, api_key, command), fields(model = %model))]
+    #[tracing::instrument(skip(self, api_key, command, system_prompt), fields(model = %model))]
     async fn evaluate_model(
         &self,
         api_key: &str,
         api_url: &str,
         model: &str,
         command: &str,
+        system_prompt: &str,
     ) -> Result<LlmResponse, AttemptError> {
         let max_retries = self.llm_config.effective_retries();
         // total attempts = 1 initial + max_retries
@@ -758,7 +797,14 @@ impl Evaluator {
             );
 
             let result = self
-                .one_attempt(api_key, api_url, model, command, use_function_calling)
+                .one_attempt(
+                    api_key,
+                    api_url,
+                    model,
+                    command,
+                    system_prompt,
+                    use_function_calling,
+                )
                 .await;
 
             match result {
@@ -801,12 +847,13 @@ impl Evaluator {
         api_url: &str,
         model: &str,
         command: &str,
+        system_prompt: &str,
         use_function_calling: bool,
     ) -> Result<(LlmResponse, TokenUsage), AttemptError> {
         let body = if use_function_calling {
-            build_function_call_body(model, &self.system_prompt, command)
+            build_function_call_body(model, system_prompt, command)
         } else {
-            build_json_response_body(model, &self.system_prompt, command)
+            build_json_response_body(model, system_prompt, command)
         };
 
         tracing::debug!("LLM POST {}: model={}", api_url, model);
@@ -1303,6 +1350,28 @@ mod tests {
         assert!(matches!(cache.get("bad"), Some(EvalResult::Deny { .. })));
     }
 
+    #[tokio::test]
+    async fn evaluate_with_context_session_prompt_does_not_seed_cache() {
+        // LLM disabled and no static rules: every call falls through to
+        // the default-deny branch without ever touching the LLM cache
+        // path. We exercise the API and assert the cache remains empty.
+        let evaluator = Evaluator::new(EvalConfig::default().llm_enabled(false))
+            .expect("build evaluator");
+
+        let _ = evaluator
+            .evaluate_with_context("ls -la", Some("session is restoring backups"))
+            .await;
+
+        let cache = evaluator
+            .cache
+            .as_ref()
+            .expect("cache enabled by default");
+        assert!(
+            cache.read().await.is_empty(),
+            "session-prompted call must not seed the cache"
+        );
+    }
+
     #[test]
     fn test_eval_result_display() {
         let allow = EvalResult::Allow {
@@ -1796,7 +1865,7 @@ mod tests {
         let mock = tokio::spawn(run_mock(listener, responses));
 
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
-        let result = evaluator.evaluate_llm("id").await;
+        let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_allow(), "got: {}", result);
         let _ = mock.await;
     }
@@ -1812,7 +1881,7 @@ mod tests {
         let mock = tokio::spawn(run_mock(listener, responses));
 
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
-        let result = evaluator.evaluate_llm("rm -rf /").await;
+        let result = evaluator.evaluate_llm("rm -rf /", None).await;
         assert!(result.is_deny(), "got: {}", result);
         let _ = mock.await;
     }
@@ -1841,7 +1910,7 @@ mod tests {
         let mock = tokio::spawn(run_mock(listener, responses));
 
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
-        let result = evaluator.evaluate_llm("id").await;
+        let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_error());
         assert!(
             result.reason().contains("rate_limited"),
@@ -1866,7 +1935,7 @@ mod tests {
 
         let evaluator =
             mock_server_evaluator(port, 2, vec!["primary/m1".into(), "secondary/m2".into()]).await;
-        let result = evaluator.evaluate_llm("id").await;
+        let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_allow(), "got: {}", result);
         let _ = mock.await;
     }
@@ -1883,7 +1952,7 @@ mod tests {
         let mock = tokio::spawn(run_mock(listener, responses));
 
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
-        let result = evaluator.evaluate_llm("id").await;
+        let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_allow(), "got: {}", result);
         let _ = mock.await;
     }

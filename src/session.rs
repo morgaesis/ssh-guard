@@ -22,6 +22,13 @@ pub struct SessionGrant {
     pub deny: Vec<String>,
     /// Unix seconds after which this grant is treated as absent.
     pub expires_at: Option<u64>,
+    /// Free-form text appended to the LLM system prompt for evaluator
+    /// calls made under this session token. Use to give the model
+    /// context the static glob patterns cannot express, e.g. "this
+    /// session is restoring a Postgres backup; treat pg_restore and
+    /// related psql copy commands as expected".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_append: Option<String>,
 }
 
 impl SessionGrant {
@@ -42,6 +49,8 @@ pub struct SessionGrantSummary {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_append: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -72,8 +81,19 @@ impl SessionRegistry {
                 allow: g.allow.clone(),
                 deny: g.deny.clone(),
                 expires_at: g.expires_at,
+                prompt_append: g.prompt_append.clone(),
             })
             .collect()
+    }
+
+    /// Return the additive prompt for this session, if the grant exists,
+    /// has not expired, and has a prompt attached.
+    pub fn prompt_append_for(&self, token: &str) -> Option<String> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(current_unix_secs()) {
+            return None;
+        }
+        grant.prompt_append.clone()
     }
 
     /// Remove expired entries. Called opportunistically to keep the
@@ -180,6 +200,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 expires_at: None,
+                prompt_append: None,
             },
         );
         reg
@@ -224,6 +245,7 @@ mod tests {
                 allow: vec!["mkdir*".to_string()],
                 deny: vec![],
                 expires_at: Some(1), // 1970-01-01 +1s
+                prompt_append: None,
             },
         );
         assert!(reg.check("tok", "mkdir", &["/tmp".into()]).is_none());
@@ -238,6 +260,40 @@ mod tests {
     }
 
     #[test]
+    fn prompt_append_returned_for_live_grant() {
+        let mut reg = SessionRegistry::new();
+        reg.grant(
+            "tok".to_string(),
+            SessionGrant {
+                allow: vec![],
+                deny: vec![],
+                expires_at: None,
+                prompt_append: Some("session is restoring a backup".to_string()),
+            },
+        );
+        assert_eq!(
+            reg.prompt_append_for("tok").as_deref(),
+            Some("session is restoring a backup")
+        );
+        assert!(reg.prompt_append_for("missing").is_none());
+    }
+
+    #[test]
+    fn prompt_append_suppressed_for_expired_grant() {
+        let mut reg = SessionRegistry::new();
+        reg.grant(
+            "tok".to_string(),
+            SessionGrant {
+                allow: vec![],
+                deny: vec![],
+                expires_at: Some(1),
+                prompt_append: Some("ignored".to_string()),
+            },
+        );
+        assert!(reg.prompt_append_for("tok").is_none());
+    }
+
+    #[test]
     fn list_returns_non_expired() {
         let mut reg = SessionRegistry::new();
         reg.grant(
@@ -246,6 +302,7 @@ mod tests {
                 allow: vec!["*".into()],
                 deny: vec![],
                 expires_at: None,
+                prompt_append: None,
             },
         );
         reg.grant(
@@ -254,6 +311,7 @@ mod tests {
                 allow: vec!["*".into()],
                 deny: vec![],
                 expires_at: Some(1),
+                prompt_append: None,
             },
         );
         let listed = reg.list();
