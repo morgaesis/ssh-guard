@@ -1,0 +1,60 @@
+name: Dependabot auto-merge
+
+# Auto-approve and auto-merge Dependabot PRs that pass CI, restricted to
+# the bump types we are willing to take without human review:
+#
+#   - security updates (any semver level)
+#   - patch and minor cargo updates
+#   - all GitHub Actions updates (we already SHA-pin them, so the bump
+#     is functionally a vetted-tag → vetted-tag move)
+#
+# Major version bumps are intentionally NOT auto-merged. They get a
+# label and a comment so the PR sits in review.
+#
+# Required repo settings (configure once in the GitHub UI):
+#   Settings → General → Pull Requests → "Allow auto-merge" enabled
+#   Settings → Branches → branch protection on main with the CI checks
+#   marked as required (otherwise --auto would merge without waiting).
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Resolve update metadata
+        id: meta
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
+        with:
+          alert-lookup: true
+
+      - name: Approve and enable auto-merge for safe bumps
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
+          steps.meta.outputs.alert-state == 'open' ||
+          steps.meta.outputs.package-ecosystem == 'github_actions'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
+
+      - name: Flag major bump for manual review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr edit "$PR_URL" --add-label "needs-manual-review"
+          gh pr comment "$PR_URL" --body \
+            "Major version bump detected; auto-merge skipped. Review the changelog and merge manually if appropriate."
