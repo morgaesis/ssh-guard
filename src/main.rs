@@ -80,6 +80,26 @@ enum MainArgs {
 
 #[derive(Subcommand)]
 enum SessionCommands {
+    /// Mint a fresh session token (UUID-shaped). With any of --prompt /
+    /// --allow / --deny / --ttl, also installs the grant in one round
+    /// trip. Prints `export GUARD_SESSION=<token>` on stdout so you can
+    /// `eval $(guard session new ...)` to set it for the current shell.
+    New {
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        #[arg(long = "deny")]
+        deny: Vec<String>,
+        #[arg(long)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
     /// Grant a session token extra allow/deny patterns
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
@@ -819,10 +839,102 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
     }
 }
 
+/// Mint a 128-bit hex session token. Uniqueness collision is the only
+/// failure mode and is statistically irrelevant for in-memory grants
+/// that clear on daemon restart.
+fn generate_session_token() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
+    // `session new` is special: it mints a token before deciding what to
+    // send. If no grant flags are present we just print and exit; otherwise
+    // we send a SessionGrant for the freshly-minted token.
+    if let SessionCommands::New {
+        allow,
+        deny,
+        ttl,
+        prompt,
+        prompt_file,
+        socket,
+        auth_token,
+    } = &subcommand
+    {
+        let token = generate_session_token();
+        let has_grant = !allow.is_empty()
+            || !deny.is_empty()
+            || ttl.is_some()
+            || prompt.is_some()
+            || prompt_file.is_some();
+
+        if has_grant {
+            let prompt_append = match prompt_file {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read --prompt-file {}", path.display()))?,
+                ),
+                None => prompt.clone(),
+            };
+
+            let socket_path = socket
+                .clone()
+                .or(config.server_socket.clone())
+                .map(PathBuf::from);
+            let tcp_port = if socket_path.is_none() {
+                config.server_tcp_port
+            } else {
+                None
+            };
+            if socket_path.is_none() && tcp_port.is_none() {
+                eprintln!("No server configured");
+                std::process::exit(1);
+            }
+            let mut client = server::Client::new(socket_path, tcp_port);
+            if let Some(t) = auth_token.clone().or(config.auth_token.clone()) {
+                client = client.with_auth(t);
+            }
+            let request = server::AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: allow.clone(),
+                deny: deny.clone(),
+                ttl_secs: *ttl,
+                prompt_append,
+                auth_token: client.auth_token_for_admin(),
+            };
+            match client.send_admin(request).await? {
+                server::AdminResponse::Ok => {}
+                server::AdminResponse::Error { message } => {
+                    eprintln!("error: {}", message);
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("unexpected admin response: {:?}", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Eval-friendly export line on stdout; status on stderr so it does
+        // not pollute the captured value.
+        println!("export GUARD_SESSION={}", token);
+        if has_grant {
+            eprintln!("granted session {}", token);
+        } else {
+            eprintln!(
+                "minted session {} (no grant installed; run `guard session grant {} ...` to attach rules)",
+                token, token
+            );
+        }
+        return Ok(());
+    }
+
     let (socket_override, auth_override, request) = match subcommand {
+        SessionCommands::New { .. } => unreachable!("handled above"),
         SessionCommands::Grant {
             token,
             allow,

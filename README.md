@@ -261,27 +261,35 @@ The additive prompt is appended to whichever base prompt is active (readonly, sa
 
 ## Session grants
 
-Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent threads an opaque `GUARD_SESSION` token through `guard run`; the operator grants that token glob-pattern allow/deny overlays on top of the normal policy.
+Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators attach allow/deny patterns and prompt context to that token.
+
+The simplest flow is `guard session new`, which mints a token and (optionally) grants it in one round trip, printing an eval-friendly export line:
 
 ```bash
-# Operator: grant session "job-42" permission to write in /tmp/job-42/**
-guard session grant job-42 --allow 'mkdir /tmp/job-42*' --allow 'rm /tmp/job-42/scratch*' --ttl 3600
+# Operator: mint a session, grant it, capture the token in the current shell
+eval "$(guard session new \
+  --allow 'mkdir /tmp/job-42*' \
+  --allow 'rm /tmp/job-42/scratch*' \
+  --prompt 'This session is preparing /tmp/job-42 as scratch space.' \
+  --ttl 3600)"
 
-# Agent: set GUARD_SESSION for this run
-GUARD_SESSION=job-42 guard run mkdir /tmp/job-42/out
+# Now any agent launched from this shell inherits GUARD_SESSION
+claude
+# or
+GUARD_SESSION="$GUARD_SESSION" my-agent
+```
+
+Inside the agent's process tree, every `guard run` call automatically picks up `GUARD_SESSION` from the inherited environment, so the model itself does not need to know or pass the token explicitly — it is bound to the shell that launched the agent.
+
+To grant rules to an existing token (e.g. one the agent already has):
+
+```bash
+guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT]
 ```
 
 Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session list` and `guard session revoke <token>` manage active grants.
 
-For commands that the static glob patterns cannot capture, attach a session-scoped prompt fragment so the LLM evaluator gets the context for that session's calls:
-
-```bash
-guard session grant restore-42 \
-  --prompt 'This session is restoring a Postgres backup into staging. \
-Treat psql, pg_restore, and createdb against the staging cluster as expected.'
-```
-
-The prompt is appended to the base system prompt under a `Session context:` heading for evaluator calls made under that token. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context. Pass `--prompt-file <path>` to read longer guidance from disk.
+The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
 ## Agent integration
 
