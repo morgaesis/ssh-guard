@@ -148,6 +148,18 @@ enum SessionCommands {
     },
     /// List active session grants
     List {
+        /// Include past (revoked/expired) grants. Daemon retains
+        /// history for a bounded window (default 24h).
+        #[arg(long = "history", action = ArgAction::SetTrue)]
+        history: bool,
+        /// Filter history to entries that ended within the last duration.
+        /// Accepts plain seconds (e.g. `3600`) or simple suffixes:
+        /// `30m`, `2h`, `1d`. Implies --history when set.
+        #[arg(long)]
+        since: Option<String>,
+        /// Print untruncated session prompts.
+        #[arg(long = "full", action = ArgAction::SetTrue)]
+        full: bool,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long = "admin-token")]
@@ -992,6 +1004,52 @@ fn resolve_admin_token(flag: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Format a session prompt for `guard session list` output. Without
+/// `full`, prompts longer than 60 chars are ellipsized so the listing
+/// stays terminal-readable; `--full` prints the entire prompt.
+fn format_prompt(prompt: Option<&str>, full: bool) -> String {
+    match prompt {
+        None => "(none)".to_string(),
+        Some(s) if full => format!("\"{}\"", s),
+        Some(s) => {
+            let preview: String = s.chars().take(60).collect();
+            if s.chars().count() > 60 {
+                format!("\"{}…\"", preview)
+            } else {
+                format!("\"{}\"", preview)
+            }
+        }
+    }
+}
+
+/// Parse a `--since` value into an absolute unix-seconds threshold.
+/// Accepts plain integer seconds or simple suffixes: `s`, `m`, `h`, `d`.
+fn parse_since_to_unix(value: &str) -> Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--since must not be empty");
+    }
+    let (num_part, multiplier) = if let Some(stripped) = trimmed.strip_suffix('s') {
+        (stripped, 1u64)
+    } else if let Some(stripped) = trimmed.strip_suffix('m') {
+        (stripped, 60u64)
+    } else if let Some(stripped) = trimmed.strip_suffix('h') {
+        (stripped, 3600u64)
+    } else if let Some(stripped) = trimmed.strip_suffix('d') {
+        (stripped, 86400u64)
+    } else {
+        (trimmed, 1u64)
+    };
+    let n: u64 = num_part
+        .parse()
+        .with_context(|| format!("invalid --since value: '{}'", value))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(now.saturating_sub(n.saturating_mul(multiplier)))
+}
+
 /// Mint a 128-bit hex session token. Uniqueness collision is the only
 /// failure mode and is statistically irrelevant for in-memory grants
 /// that clear on daemon restart.
@@ -1072,6 +1130,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         return Ok(());
     }
 
+    let mut print_full_prompt = false;
+
     let (socket_override, auth_override, request) = match subcommand {
         SessionCommands::New { .. } => unreachable!("handled above"),
         SessionCommands::Grant {
@@ -1117,13 +1177,30 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             },
         ),
         SessionCommands::List {
+            history,
+            since,
+            full,
             socket,
             auth_token,
-        } => (
-            socket,
-            auth_token,
-            server::AdminRequest::SessionList { auth_token: None },
-        ),
+        } => {
+            let since_unix = match since.as_deref() {
+                Some(s) => Some(parse_since_to_unix(s)?),
+                None => None,
+            };
+            // --since implies --history; pure --history with no
+            // since shows the entire retention window.
+            let include_history = history || since_unix.is_some();
+            print_full_prompt = full;
+            (
+                socket,
+                auth_token,
+                server::AdminRequest::SessionList {
+                    include_history,
+                    since_unix,
+                    auth_token: None,
+                },
+            )
+        }
     };
 
     let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
@@ -1140,30 +1217,37 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             eprintln!("error: {}", message);
             std::process::exit(1);
         }
-        server::AdminResponse::SessionList { grants } => {
-            if grants.is_empty() {
-                println!("(no active session grants)");
+        server::AdminResponse::SessionList { grants, history } => {
+            if grants.is_empty() && history.is_empty() {
+                println!("(no session grants)");
             } else {
-                for g in grants {
+                for g in &grants {
                     println!(
-                        "token={} allow={:?} deny={:?} expires_at={} prompt={}",
+                        "[active]  token={} allow={:?} deny={:?} granted_at={} expires_at={} prompt={}",
                         g.token,
                         g.allow,
                         g.deny,
+                        g.granted_at,
                         g.expires_at
                             .map(|t| t.to_string())
                             .unwrap_or_else(|| "(never)".to_string()),
-                        g.prompt_append
-                            .as_deref()
-                            .map(|s| {
-                                let preview: String = s.chars().take(60).collect();
-                                if s.len() > preview.len() {
-                                    format!("\"{}…\"", preview)
-                                } else {
-                                    format!("\"{}\"", preview)
-                                }
-                            })
-                            .unwrap_or_else(|| "(none)".to_string())
+                        format_prompt(g.prompt_append.as_deref(), print_full_prompt),
+                    );
+                }
+                for h in &history {
+                    let label = match h.status {
+                        server::HistoricalStatus::Revoked => "[revoked]",
+                        server::HistoricalStatus::Expired => "[expired]",
+                    };
+                    println!(
+                        "{} token={} allow={:?} deny={:?} granted_at={} ended_at={} prompt={}",
+                        label,
+                        h.token,
+                        h.allow,
+                        h.deny,
+                        h.granted_at,
+                        h.ended_at,
+                        format_prompt(h.prompt_append.as_deref(), print_full_prompt),
                     );
                 }
             }
@@ -1209,9 +1293,15 @@ fn inject_admin_auth(
             token: tok,
             auth_token: token,
         },
-        server::AdminRequest::SessionList { auth_token: _ } => {
-            server::AdminRequest::SessionList { auth_token: token }
-        }
+        server::AdminRequest::SessionList {
+            include_history,
+            since_unix,
+            auth_token: _,
+        } => server::AdminRequest::SessionList {
+            include_history,
+            since_unix,
+            auth_token: token,
+        },
         server::AdminRequest::Status { auth_token: _ } => {
             server::AdminRequest::Status { auth_token: token }
         }

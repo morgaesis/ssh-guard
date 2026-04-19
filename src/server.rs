@@ -14,7 +14,13 @@ use crate::redact::{
     redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
 };
 use crate::secrets::SecretManager;
-use crate::session::{SessionDecision, SessionGrant, SessionGrantSummary, SessionRegistry};
+use crate::session::{
+    HistoricalGrant, SessionDecision, SessionGrant, SessionGrantSummary, SessionRegistry,
+};
+
+// Re-export so main.rs can pattern-match on history status without a
+// direct dependency on the `session` module path.
+pub use crate::session::HistoricalStatus;
 use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -107,6 +113,13 @@ pub enum AdminRequest {
         auth_token: Option<String>,
     },
     SessionList {
+        /// Include past (revoked/expired) grants alongside the active set.
+        #[serde(default)]
+        include_history: bool,
+        /// When set, only history entries that ended at-or-after this
+        /// unix-seconds value are returned. None = no time filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_unix: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_token: Option<String>,
     },
@@ -132,8 +145,14 @@ impl AdminRequest {
 pub enum AdminResponse {
     Ok,
     Error { message: String },
-    SessionList { grants: Vec<SessionGrantSummary> },
-    Status { status: ServerStatus },
+    SessionList {
+        grants: Vec<SessionGrantSummary>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        history: Vec<HistoricalGrant>,
+    },
+    Status {
+        status: ServerStatus,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -740,6 +759,7 @@ async fn handle_admin_request(
                 deny,
                 expires_at,
                 prompt_append,
+                granted_at: 0, // SessionRegistry::grant fills the current time
             };
             let mut reg = config.sessions.write().await;
             reg.purge_expired();
@@ -763,11 +783,25 @@ async fn handle_admin_request(
             );
             AdminResponse::Ok
         }
-        AdminRequest::SessionList { .. } => {
-            let reg = config.sessions.read().await;
-            AdminResponse::SessionList {
-                grants: reg.list(),
+        AdminRequest::SessionList {
+            include_history,
+            since_unix,
+            ..
+        } => {
+            // Opportunistic purge so list shows fresh state and history
+            // bookkeeping stays bounded.
+            {
+                let mut reg = config.sessions.write().await;
+                reg.purge_expired();
             }
+            let reg = config.sessions.read().await;
+            let grants = reg.list();
+            let history = if include_history {
+                reg.list_history(since_unix)
+            } else {
+                Vec::new()
+            };
+            AdminResponse::SessionList { grants, history }
         }
         AdminRequest::Status { .. } => {
             let now = std::time::SystemTime::now()
@@ -1152,11 +1186,26 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
 
     // Session grants short-circuit both directions: deny wins before the
     // evaluator, allow skips the evaluator entirely.
+    //
+    // If the caller passes a session_token that the daemon does not know
+    // about (revoked, expired, or never existed), the request is rejected
+    // — silently falling through to base policy would let an agent run
+    // with surprise rules when its operator-issued grant is gone.
     if let Some(ref token) = request.session_token {
-        let decision = {
+        let (decision, exists) = {
             let reg = config.sessions.read().await;
-            reg.check(token, &request.binary, &request.args)
+            let decision = reg.check(token, &request.binary, &request.args);
+            (decision, reg.has(token))
         };
+        if !exists {
+            let reason = format!(
+                "unknown session token: '{}' is revoked, expired, or never existed",
+                token
+            );
+            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            return ExecuteResult::denied(reason);
+        }
         if let Some((decision, reason)) = decision {
             match decision {
                 SessionDecision::Deny => {

@@ -16,6 +16,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Default daemon-side history retention. Anything older than this is
+/// dropped on the next opportunistic purge. 24h matches the "I want
+/// to debug what an agent did yesterday" use case without growing the
+/// in-memory log unboundedly.
+pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGrant {
     pub allow: Vec<String>,
@@ -29,12 +35,37 @@ pub struct SessionGrant {
     /// related psql copy commands as expected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    /// Unix seconds when the grant was installed. Used by `session
+    /// list` to show grant age.
+    #[serde(default)]
+    pub granted_at: u64,
 }
 
 impl SessionGrant {
     pub fn is_expired(&self, now: u64) -> bool {
         matches!(self.expires_at, Some(exp) if now >= exp)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalStatus {
+    Revoked,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoricalGrant {
+    pub token: String,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub granted_at: u64,
+    pub expires_at: Option<u64>,
+    /// Unix seconds when the grant left the active set.
+    pub ended_at: u64,
+    pub status: HistoricalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_append: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,13 +80,27 @@ pub struct SessionGrantSummary {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub granted_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionRegistry {
     grants: HashMap<String, SessionGrant>,
+    history: Vec<HistoricalGrant>,
+    history_retention_secs: u64,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            grants: HashMap::new(),
+            history: Vec::new(),
+            history_retention_secs: DEFAULT_HISTORY_RETENTION_SECS,
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -63,12 +108,47 @@ impl SessionRegistry {
         Self::default()
     }
 
-    pub fn grant(&mut self, token: String, grant: SessionGrant) {
+    pub fn with_history_retention(mut self, secs: u64) -> Self {
+        self.history_retention_secs = secs;
+        self
+    }
+
+    pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
+        if grant.granted_at == 0 {
+            grant.granted_at = current_unix_secs();
+        }
+        // If we are overwriting an active grant, archive the previous
+        // version so the audit trail still shows what was in effect.
+        if let Some(prev) = self.grants.remove(&token) {
+            self.history.push(historical(
+                &token,
+                prev,
+                current_unix_secs(),
+                HistoricalStatus::Revoked,
+            ));
+        }
         self.grants.insert(token, grant);
     }
 
     pub fn revoke(&mut self, token: &str) -> bool {
-        self.grants.remove(token).is_some()
+        let Some(grant) = self.grants.remove(token) else {
+            return false;
+        };
+        self.history.push(historical(
+            token,
+            grant,
+            current_unix_secs(),
+            HistoricalStatus::Revoked,
+        ));
+        true
+    }
+
+    /// True if this token currently maps to a non-expired grant.
+    pub fn has(&self, token: &str) -> bool {
+        let Some(grant) = self.grants.get(token) else {
+            return false;
+        };
+        !grant.is_expired(current_unix_secs())
     }
 
     pub fn list(&self) -> Vec<SessionGrantSummary> {
@@ -81,8 +161,22 @@ impl SessionRegistry {
                 allow: g.allow.clone(),
                 deny: g.deny.clone(),
                 expires_at: g.expires_at,
+                granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
             })
+            .collect()
+    }
+
+    /// Return historical grants no older than `since_unix`. When
+    /// `since_unix` is None, return everything still in retention.
+    pub fn list_history(&self, since_unix: Option<u64>) -> Vec<HistoricalGrant> {
+        self.history
+            .iter()
+            .filter(|h| match since_unix {
+                Some(t) => h.ended_at >= t,
+                None => true,
+            })
+            .cloned()
             .collect()
     }
 
@@ -96,11 +190,26 @@ impl SessionRegistry {
         grant.prompt_append.clone()
     }
 
-    /// Remove expired entries. Called opportunistically to keep the
-    /// registry from growing indefinitely when tokens churn.
+    /// Remove expired entries (move them to history) and trim history
+    /// older than the retention window. Called opportunistically.
     pub fn purge_expired(&mut self) {
         let now = current_unix_secs();
-        self.grants.retain(|_, g| !g.is_expired(now));
+        let retention_cutoff = now.saturating_sub(self.history_retention_secs);
+
+        let expired_tokens: Vec<String> = self
+            .grants
+            .iter()
+            .filter(|(_, g)| g.is_expired(now))
+            .map(|(t, _)| t.clone())
+            .collect();
+        for token in expired_tokens {
+            if let Some(grant) = self.grants.remove(&token) {
+                self.history
+                    .push(historical(&token, grant, now, HistoricalStatus::Expired));
+            }
+        }
+
+        self.history.retain(|h| h.ended_at >= retention_cutoff);
     }
 
     /// Check whether the session's grants short-circuit the decision.
@@ -181,6 +290,24 @@ impl SessionRegistry {
     }
 }
 
+fn historical(
+    token: &str,
+    grant: SessionGrant,
+    ended_at: u64,
+    status: HistoricalStatus,
+) -> HistoricalGrant {
+    HistoricalGrant {
+        token: token.to_string(),
+        allow: grant.allow,
+        deny: grant.deny,
+        granted_at: grant.granted_at,
+        expires_at: grant.expires_at,
+        ended_at,
+        status,
+        prompt_append: grant.prompt_append,
+    }
+}
+
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -200,6 +327,7 @@ mod tests {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 expires_at: None,
+                granted_at: 0,
                 prompt_append: None,
             },
         );
@@ -244,7 +372,8 @@ mod tests {
             SessionGrant {
                 allow: vec!["mkdir*".to_string()],
                 deny: vec![],
-                expires_at: Some(1), // 1970-01-01 +1s
+                expires_at: Some(1),
+                granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
             },
         );
@@ -268,6 +397,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![],
                 expires_at: None,
+                granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
             },
         );
@@ -287,6 +417,7 @@ mod tests {
                 allow: vec![],
                 deny: vec![],
                 expires_at: Some(1),
+                granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
             },
         );
@@ -302,6 +433,7 @@ mod tests {
                 allow: vec!["*".into()],
                 deny: vec![],
                 expires_at: None,
+                granted_at: 0,
                 prompt_append: None,
             },
         );
@@ -311,11 +443,63 @@ mod tests {
                 allow: vec!["*".into()],
                 deny: vec![],
                 expires_at: Some(1),
+                granted_at: 0,
                 prompt_append: None,
             },
         );
         let listed = reg.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].token, "live");
+    }
+
+    #[test]
+    fn has_returns_true_only_for_live_grants() {
+        let reg = reg_with("live", &[], &[]);
+        assert!(reg.has("live"));
+        assert!(!reg.has("ghost"));
+    }
+
+    #[test]
+    fn revoke_moves_grant_into_history() {
+        let mut reg = reg_with("tok", &["mkdir*"], &[]);
+        assert!(reg.revoke("tok"));
+        assert!(!reg.has("tok"));
+        let history = reg.list_history(None);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].token, "tok");
+        assert_eq!(history[0].status, HistoricalStatus::Revoked);
+    }
+
+    #[test]
+    fn purge_moves_expired_to_history() {
+        let mut reg = SessionRegistry::new();
+        reg.grant(
+            "expired".to_string(),
+            SessionGrant {
+                allow: vec!["*".into()],
+                deny: vec![],
+                expires_at: Some(1),
+                granted_at: 0,
+                prompt_append: None,
+            },
+        );
+        reg.purge_expired();
+        assert!(!reg.has("expired"));
+        let history = reg.list_history(None);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, HistoricalStatus::Expired);
+    }
+
+    #[test]
+    fn list_history_since_filters_by_ended_at() {
+        let mut reg = SessionRegistry::new();
+        reg.grant("a".to_string(), SessionGrant {
+            allow: vec![], deny: vec![], expires_at: None, granted_at: 0, prompt_append: None,
+        });
+        reg.revoke("a");
+        let after = current_unix_secs() + 1;
+        let before = current_unix_secs().saturating_sub(60);
+        assert_eq!(reg.list_history(Some(after)).len(), 0);
+        assert_eq!(reg.list_history(Some(before)).len(), 1);
     }
 }
