@@ -127,6 +127,11 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_token: Option<String>,
     },
+    /// No-auth liveness probe. Returns the daemon version and uptime
+    /// so a client can always confirm "I am talking to a guard server"
+    /// without needing admin credentials. Anything beyond version and
+    /// uptime is gated by Status (which requires admin).
+    Ping,
 }
 
 impl AdminRequest {
@@ -136,7 +141,14 @@ impl AdminRequest {
             | Self::SessionRevoke { auth_token, .. }
             | Self::SessionList { auth_token, .. }
             | Self::Status { auth_token, .. } => auth_token.as_deref(),
+            Self::Ping => None,
         }
+    }
+
+    /// Ping is the only admin RPC that does not require admin auth —
+    /// it is intentionally a public liveness probe.
+    fn requires_admin_auth(&self) -> bool {
+        !matches!(self, Self::Ping)
     }
 }
 
@@ -152,6 +164,10 @@ pub enum AdminResponse {
     },
     Status {
         status: ServerStatus,
+    },
+    Ping {
+        version: String,
+        uptime_secs: u64,
     },
 }
 
@@ -722,15 +738,17 @@ async fn handle_admin_request(
     caller: &CallerIdentity,
     request: AdminRequest,
 ) -> AdminResponse {
-    if let Err(e) = config.validate_admin(caller, request.auth_token()) {
-        tracing::warn!(
-            "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"",
-            caller,
-            e
-        );
-        return AdminResponse::Error {
-            message: e.to_string(),
-        };
+    if request.requires_admin_auth() {
+        if let Err(e) = config.validate_admin(caller, request.auth_token()) {
+            tracing::warn!(
+                "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"",
+                caller,
+                e
+            );
+            return AdminResponse::Error {
+                message: e.to_string(),
+            };
+        }
     }
 
     match request {
@@ -802,6 +820,16 @@ async fn handle_admin_request(
                 Vec::new()
             };
             AdminResponse::SessionList { grants, history }
+        }
+        AdminRequest::Ping => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            AdminResponse::Ping {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                uptime_secs: now.saturating_sub(config.started_at_unix),
+            }
         }
         AdminRequest::Status { .. } => {
             let now = std::time::SystemTime::now()

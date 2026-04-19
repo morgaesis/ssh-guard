@@ -926,22 +926,59 @@ fn resolve_client_endpoint(
 async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
-
     let admin_token = resolve_admin_token(auth_token);
-
     let client = server::Client::new(socket_path.clone(), tcp_port);
 
-    let request = server::AdminRequest::Status {
-        auth_token: admin_token,
+    // Always print client info first — useful even when the daemon is
+    // unreachable.
+    println!("Client:");
+    println!("  version        {}", env!("CARGO_PKG_VERSION"));
+    println!("  endpoint       {}", client.endpoint_for_log());
+    println!(
+        "  admin_token    {}",
+        if admin_token.is_some() {
+            "set (will request full server status)"
+        } else {
+            "not set (server status will be limited)"
+        }
+    );
+    println!();
+
+    // Ping is always permitted. If this fails the daemon is unreachable.
+    let ping_response = match client.send_admin(server::AdminRequest::Ping).await {
+        Ok(server::AdminResponse::Ping {
+            version,
+            uptime_secs,
+        }) => Some((version, uptime_secs)),
+        Ok(server::AdminResponse::Error { message }) => {
+            eprintln!("Server: ping refused — {}", message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Server: unexpected ping response: {:?}", other);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Server: unreachable — {}", e);
+            std::process::exit(1);
+        }
     };
 
-    match client.send_admin(request).await {
+    println!("Server:");
+    if let Some((version, uptime)) = ping_response {
+        println!("  version        {}", version);
+        println!("  uptime         {}s", uptime);
+    }
+
+    // Always attempt the full Status RPC. The server decides whether to
+    // grant it based on caller UID + admin token. We just present what
+    // we get back: full snapshot if accepted, hint to set the token if
+    // refused.
+    let status_request = server::AdminRequest::Status {
+        auth_token: admin_token,
+    };
+    match client.send_admin(status_request).await {
         Ok(server::AdminResponse::Status { status }) => {
-            println!("guard {} ({})", status.version, client.endpoint_for_log());
-            println!(
-                "  uptime         {}s (started_at_unix={})",
-                status.uptime_secs, status.started_at_unix
-            );
             if let Some(ref s) = status.socket_path {
                 println!("  socket         {}", s);
             }
@@ -970,20 +1007,21 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
             );
             Ok(())
         }
-        Ok(server::AdminResponse::Error { message }) => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
+        Ok(server::AdminResponse::Error { .. }) => {
+            // Refusal is expected when caller is not daemon-UID and has
+            // no admin token. Don't treat it as a hard failure — basic
+            // ping info already printed above is enough to confirm the
+            // connection works.
+            println!();
+            println!("(set GUARD_ADMIN_TOKEN to view full server config)");
+            Ok(())
         }
         Ok(other) => {
-            eprintln!("unexpected admin response: {:?}", other);
+            eprintln!("Server: unexpected status response: {:?}", other);
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("could not contact guard server: {}", e);
-            eprintln!(
-                "  endpoint: {}",
-                client.endpoint_for_log()
-            );
+            eprintln!("Server: status RPC failed: {}", e);
             std::process::exit(1);
         }
     }
@@ -1252,9 +1290,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 }
             }
         }
-        server::AdminResponse::Status { .. } => {
-            // session subcommands never request status; defensive arm
-            eprintln!("unexpected status response from session admin call");
+        server::AdminResponse::Status { .. } | server::AdminResponse::Ping { .. } => {
+            // session subcommands never request status or ping; defensive arms
+            eprintln!("unexpected response from session admin call");
             std::process::exit(1);
         }
     }
@@ -1305,6 +1343,7 @@ fn inject_admin_auth(
         server::AdminRequest::Status { auth_token: _ } => {
             server::AdminRequest::Status { auth_token: token }
         }
+        server::AdminRequest::Ping => server::AdminRequest::Ping,
     }
 }
 
