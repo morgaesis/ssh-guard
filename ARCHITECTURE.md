@@ -43,13 +43,12 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 ## Admin authorization
 
-Admin RPCs (session grant/revoke/list, status) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. Authorization model:
+Admin RPCs (session grant/revoke/list and the full `status` snapshot) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. The model is intentionally simple:
 
-- The daemon's own UID is always permitted. It can already control the daemon process by other means.
-- Any other caller must present a matching `--admin-token` (env: `GUARD_ADMIN_TOKEN`) against a value the daemon was started with (`SSH_GUARD_ADMIN_TOKEN`).
-- If no admin token is configured, non-daemon callers are refused. This is the secure default — admin is only available to whoever can become the daemon UID.
+- **Admin = the daemon's own UID.** That process can already control the daemon by signals, /proc, or restarting the service. The socket boundary adds nothing against it. To administer, become the service user (`sudo -u <service-user> guard ...`).
+- **There is no client-side admin token.** A token-based path would have to live somewhere — env var, config file — and any agent process running as the same user could read it. The admin/agent split is enforced by UID separation only.
 
-In deployments where the operator and an agent share a UID (typical for desktop developer setups where Claude Code, codex, etc. run as the user), `SSH_GUARD_ADMIN_TOKEN` is required. The operator exports `GUARD_ADMIN_TOKEN` in their interactive shell only; the agent's environment does not have it, so the agent cannot mint or modify sessions.
+The non-privileged `Ping` admin RPC is always permitted to UIDs that can already exec, and returns version, uptime, mode, and dry-run state. That is enough for a `guard status` liveness check without fingerprinting the deployment (no LLM model identity, no redaction posture, no session counts).
 
 ## Execution authority
 

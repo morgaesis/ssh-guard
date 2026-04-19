@@ -104,13 +104,9 @@ pub enum AdminRequest {
         ttl_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_append: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth_token: Option<String>,
     },
     SessionRevoke {
         token: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth_token: Option<String>,
     },
     SessionList {
         /// Include past (revoked/expired) grants alongside the active set.
@@ -120,34 +116,21 @@ pub enum AdminRequest {
         /// unix-seconds value are returned. None = no time filter.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth_token: Option<String>,
     },
-    Status {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth_token: Option<String>,
-    },
-    /// No-auth liveness probe. Returns the daemon version and uptime
-    /// so a client can always confirm "I am talking to a guard server"
-    /// without needing admin credentials. Anything beyond version and
-    /// uptime is gated by Status (which requires admin).
+    /// Privileged status snapshot. Caller must be the daemon UID.
+    Status,
+    /// No-auth liveness probe. Returns version, uptime, and a small
+    /// set of non-elevating posture fields so any allowed client can
+    /// confirm reachability and the evaluation context they are
+    /// operating under, without revealing model identity, redaction
+    /// state, session counts, or other fingerprintable internals.
     Ping,
 }
 
 impl AdminRequest {
-    fn auth_token(&self) -> Option<&str> {
-        match self {
-            Self::SessionGrant { auth_token, .. }
-            | Self::SessionRevoke { auth_token, .. }
-            | Self::SessionList { auth_token, .. }
-            | Self::Status { auth_token, .. } => auth_token.as_deref(),
-            Self::Ping => None,
-        }
-    }
-
-    /// Ping is the only admin RPC that does not require admin auth —
-    /// it is intentionally a public liveness probe.
-    fn requires_admin_auth(&self) -> bool {
+    /// Ping is the only admin RPC that does not require daemon-UID
+    /// caller; it is intentionally a public liveness probe.
+    fn requires_daemon_uid(&self) -> bool {
         !matches!(self, Self::Ping)
     }
 }
@@ -168,6 +151,14 @@ pub enum AdminResponse {
     Ping {
         version: String,
         uptime_secs: u64,
+        /// Evaluation mode the daemon is configured for. Knowing this
+        /// helps a caller understand why borderline commands get
+        /// allowed or denied; it is already inferable from probing.
+        mode: String,
+        /// True when the daemon evaluates but does not execute approved
+        /// commands. Useful for callers to know whether their command
+        /// will actually run.
+        dry_run: bool,
     },
 }
 
@@ -189,7 +180,6 @@ pub struct ServerStatus {
     pub cache_size: usize,
     pub session_count: usize,
     pub daemon_uid: u32,
-    pub admin_token_set: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,18 +244,11 @@ pub struct ServerConfig {
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub started_at_unix: u64,
-    /// Effective UID of the daemon process. Used by admin authorization:
-    /// the daemon's own UID can always run admin RPCs (it already controls
-    /// the daemon process via signals and /proc).
+    /// Effective UID of the daemon process. Admin RPCs require the
+    /// caller to be this UID — there is no token-based elevation. To
+    /// administer the daemon, become the service user (e.g.
+    /// `sudo -u guard guard session list`).
     pub daemon_uid: u32,
-    /// Shared-secret token required for admin RPCs (session grant /
-    /// revoke / list, status) when the caller is NOT the daemon's own UID.
-    /// None = no token configured = admin restricted to daemon UID. Set
-    /// this when operators need to admin from a non-daemon UID — and it
-    /// is REQUIRED when an exec-allowed UID is also the operator UID,
-    /// otherwise the agent process can mint sessions whose --prompt
-    /// overrides the LLM policy.
-    pub admin_token: Option<String>,
 }
 
 impl ServerConfig {
@@ -284,7 +267,6 @@ impl ServerConfig {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
-        admin_token: Option<String>,
     ) -> Self {
         Self {
             socket_path,
@@ -300,7 +282,6 @@ impl ServerConfig {
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
-            admin_token,
             daemon_uid: current_uid(),
             sessions: Arc::new(RwLock::new(SessionRegistry::new())),
             started_at_unix: std::time::SystemTime::now()
@@ -325,43 +306,20 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// Authorize an admin RPC. Admin RPCs gate session and status
-    /// management — operations that influence what the LLM evaluator
-    /// sees (notably `--prompt` on session grants). They MUST NOT share
-    /// authorization with exec, because the exec UID may be an agent
-    /// process that, if granted admin, can override its own policy.
-    ///
-    /// Two ways to be admin:
-    /// 1. Caller is the daemon's own UID. Such a process already
-    ///    controls the daemon (signals, /proc) so the socket boundary
-    ///    is not a security boundary against it.
-    /// 2. Caller presents `admin_token` matching the configured value.
-    ///    This is the only way to admin from a non-daemon UID; without
-    ///    a configured admin_token, non-daemon callers are refused.
-    fn validate_admin(&self, caller: &CallerIdentity, presented_token: Option<&str>) -> Result<()> {
+    /// Authorize an admin RPC. Admin = caller is the daemon's own UID.
+    /// There is no token-based elevation; to administer the daemon,
+    /// become the service user (e.g. `sudo -u guard guard session list`).
+    /// Without this rule, an exec-allowed agent process could mint
+    /// sessions whose `--prompt` overrides the LLM policy from itself.
+    fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
         if let CallerIdentity::Unix { uid } = caller {
             if *uid == self.daemon_uid {
                 return Ok(());
             }
         }
-
-        let Some(ref expected) = self.admin_token else {
-            anyhow::bail!(
-                "admin RPC refused: no admin token configured and caller is not the daemon UID"
-            );
-        };
-
-        let provided = presented_token.unwrap_or("").as_bytes();
-        let expected = expected.as_bytes();
-        let len_match = provided.len() == expected.len();
-        let byte_match = provided
-            .iter()
-            .zip(expected.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        if !len_match || byte_match != 0 {
-            anyhow::bail!("admin RPC refused: invalid admin token");
-        }
-        Ok(())
+        anyhow::bail!(
+            "admin RPC refused: caller is not the daemon UID (admin via `sudo -u <service-user> guard ...`)"
+        );
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
@@ -449,7 +407,6 @@ impl Server {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
-        admin_token: Option<String>,
     ) -> Self {
         let config = ServerConfig::new(
             socket_path,
@@ -465,7 +422,6 @@ impl Server {
             tool_registry,
             redact_secrets,
             preflight,
-            admin_token,
         );
         Self { config }
     }
@@ -738,8 +694,8 @@ async fn handle_admin_request(
     caller: &CallerIdentity,
     request: AdminRequest,
 ) -> AdminResponse {
-    if request.requires_admin_auth() {
-        if let Err(e) = config.validate_admin(caller, request.auth_token()) {
+    if request.requires_daemon_uid() {
+        if let Err(e) = config.validate_admin(caller) {
             tracing::warn!(
                 "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"",
                 caller,
@@ -758,7 +714,6 @@ async fn handle_admin_request(
             deny,
             ttl_secs,
             prompt_append,
-            ..
         } => {
             if token.is_empty() {
                 return AdminResponse::Error {
@@ -790,7 +745,7 @@ async fn handle_admin_request(
             );
             AdminResponse::Ok
         }
-        AdminRequest::SessionRevoke { token, .. } => {
+        AdminRequest::SessionRevoke { token } => {
             let mut reg = config.sessions.write().await;
             let removed = reg.revoke(&token);
             tracing::info!(
@@ -804,7 +759,6 @@ async fn handle_admin_request(
         AdminRequest::SessionList {
             include_history,
             since_unix,
-            ..
         } => {
             // Opportunistic purge so list shows fresh state and history
             // bookkeeping stays bounded.
@@ -826,12 +780,19 @@ async fn handle_admin_request(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            let mode = config
+                .evaluator
+                .mode()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "readonly".to_string());
             AdminResponse::Ping {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime_secs: now.saturating_sub(config.started_at_unix),
+                mode,
+                dry_run: config.dry_run,
             }
         }
-        AdminRequest::Status { .. } => {
+        AdminRequest::Status => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -865,7 +826,6 @@ async fn handle_admin_request(
                     cache_size,
                     session_count,
                     daemon_uid: config.daemon_uid,
-                    admin_token_set: config.admin_token.is_some(),
                 },
             }
         }
@@ -901,11 +861,12 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
 
         let request = match incoming {
             IncomingMessage::Admin { admin } => {
+                // Admin over TCP can never satisfy the daemon-UID rule
+                // (no peer-credentials over loopback that we can trust),
+                // so we surface a generic Tcp identity and let
+                // validate_admin reject everything except Ping.
                 let caller = CallerIdentity::Tcp {
-                    token: admin
-                        .auth_token()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "<none>".to_string()),
+                    token: "<tcp>".to_string(),
                 };
                 let resp = handle_admin_request(config, &caller, admin).await;
                 writer
@@ -1459,8 +1420,8 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
 
 /// Read the daemon's effective UID without pulling in libc as a direct
 /// dep. /proc/self/status is the kernel-blessed source on Linux. Falls
-/// back to 0 only if procfs is missing — in that case admin would be
-/// gated entirely on admin_token, which is the conservative default.
+/// back to 0 only if procfs is missing — in that case admin only works
+/// when the daemon happens to be uid 0, which is the conservative default.
 fn current_uid() -> u32 {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return 0;
@@ -1791,9 +1752,6 @@ impl Client {
         self
     }
 
-    pub fn auth_token_for_admin(&self) -> Option<String> {
-        self.auth_token.clone()
-    }
 
     pub async fn send_admin(&self, request: AdminRequest) -> Result<AdminResponse> {
         let envelope = IncomingMessage::Admin { admin: request };
@@ -2318,7 +2276,6 @@ mod tests {
             ToolRegistry::empty(),
             Vec::new(),
             false,
-            None,
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)

@@ -76,12 +76,14 @@ enum MainArgs {
     /// Manage session grants (extra allow/deny for a specific session token)
     #[clap(subcommand)]
     Session(SessionCommands),
-    /// Show daemon status (config snapshot, uptime, cache + session counts)
+    /// Show daemon status. Always prints client + server version,
+    /// uptime, evaluation mode, and dry-run state. The full config
+    /// snapshot (LLM models, redaction state, session counts, etc.)
+    /// is only available when the caller is the daemon UID, e.g.
+    /// `sudo -u guard guard status`.
     Status {
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long = "admin-token")]
-        auth_token: Option<String>,
     },
 }
 
@@ -104,8 +106,6 @@ enum SessionCommands {
         prompt_file: Option<PathBuf>,
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long = "admin-token")]
-        auth_token: Option<String>,
     },
     /// Grant a session token extra allow/deny patterns
     Grant {
@@ -132,19 +132,12 @@ enum SessionCommands {
         /// Server socket path (defaults to configured)
         #[arg(long)]
         socket: Option<String>,
-        /// Admin token (overrides GUARD_ADMIN_TOKEN env). Required when
-        /// the daemon has an admin token configured and the caller is
-        /// not the daemon UID.
-        #[arg(long = "admin-token")]
-        auth_token: Option<String>,
     },
     /// Revoke a session grant
     Revoke {
         token: String,
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long = "admin-token")]
-        auth_token: Option<String>,
     },
     /// List active session grants
     List {
@@ -162,8 +155,6 @@ enum SessionCommands {
         full: bool,
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long = "admin-token")]
-        auth_token: Option<String>,
     },
 }
 
@@ -263,15 +254,6 @@ enum ServerCommands {
         #[arg(long = "preflight", action = ArgAction::SetTrue)]
         preflight: bool,
 
-        /// Shared-secret token required for admin RPCs (session
-        /// grant/revoke/list, status) when the caller is NOT the daemon's
-        /// own UID. REQUIRED in any deployment where an exec-allowed UID
-        /// is also the operator UID, otherwise an agent process can mint
-        /// sessions whose --prompt overrides the LLM policy. Env:
-        /// SSH_GUARD_ADMIN_TOKEN.
-        #[arg(long)]
-        admin_token: Option<String>,
-
         /// Disable in-memory caching of LLM decisions. Env: SSH_GUARD_CACHE.
         #[arg(long = "no-cache", action = ArgAction::SetTrue)]
         no_cache: bool,
@@ -319,8 +301,6 @@ enum ServerCommands {
     Status {
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long = "admin-token")]
-        auth_token: Option<String>,
     },
 }
 
@@ -412,10 +392,7 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
-        Ok(MainArgs::Status {
-            socket,
-            auth_token,
-        }) => handle_status(socket, auth_token).await,
+        Ok(MainArgs::Status { socket }) => handle_status(socket).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -491,7 +468,6 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_llm,
             no_redact,
             preflight,
-            admin_token,
             no_cache,
             cache_capacity,
             cache_ttl,
@@ -692,14 +668,9 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::info!("Preflight checks enabled (executable validation, credential pattern deny)");
             }
 
-            let admin_token = admin_token
-                .filter(|s| !s.is_empty())
-                .or_else(|| guard_env("ADMIN_TOKEN").filter(|s| !s.is_empty()));
-            if admin_token.is_some() {
-                tracing::info!("Admin token configured: non-daemon UIDs may admin if they present it");
-            } else {
-                tracing::info!("No admin token configured: admin RPCs restricted to daemon UID");
-            }
+            tracing::info!(
+                "Admin RPCs restricted to daemon UID (administer via `sudo -u <service-user>`)"
+            );
 
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);
@@ -730,7 +701,6 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tool_registry,
                 redact_secrets,
                 preflight,
-                admin_token,
             );
             srv.run().await
         }
@@ -792,10 +762,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        ServerCommands::Status {
-            socket,
-            auth_token,
-        } => handle_status(socket, auth_token).await,
+        ServerCommands::Status { socket } => handle_status(socket).await,
     }
 }
 
@@ -923,33 +890,26 @@ fn resolve_client_endpoint(
     (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
 }
 
-async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Result<()> {
+async fn handle_status(socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
-    let admin_token = resolve_admin_token(auth_token);
     let client = server::Client::new(socket_path.clone(), tcp_port);
 
-    // Always print client info first — useful even when the daemon is
-    // unreachable.
+    // Client info first — useful even when the daemon is unreachable.
     println!("Client:");
     println!("  version        {}", env!("CARGO_PKG_VERSION"));
     println!("  endpoint       {}", client.endpoint_for_log());
-    println!(
-        "  admin_token    {}",
-        if admin_token.is_some() {
-            "set (will request full server status)"
-        } else {
-            "not set (server status will be limited)"
-        }
-    );
     println!();
 
-    // Ping is always permitted. If this fails the daemon is unreachable.
-    let ping_response = match client.send_admin(server::AdminRequest::Ping).await {
+    // Ping is the public liveness probe. Always permitted to any
+    // exec-allowed UID; reveals only version/uptime/mode/dry_run.
+    let ping = match client.send_admin(server::AdminRequest::Ping).await {
         Ok(server::AdminResponse::Ping {
             version,
             uptime_secs,
-        }) => Some((version, uptime_secs)),
+            mode,
+            dry_run,
+        }) => (version, uptime_secs, mode, dry_run),
         Ok(server::AdminResponse::Error { message }) => {
             eprintln!("Server: ping refused — {}", message);
             std::process::exit(1);
@@ -964,20 +924,18 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
         }
     };
 
+    let (version, uptime, mode, dry_run) = ping;
     println!("Server:");
-    if let Some((version, uptime)) = ping_response {
-        println!("  version        {}", version);
-        println!("  uptime         {}s", uptime);
-    }
+    println!("  version        {}", version);
+    println!("  uptime         {}s", uptime);
+    println!("  mode           {}", mode);
+    println!("  dry_run        {}", dry_run);
 
-    // Always attempt the full Status RPC. The server decides whether to
-    // grant it based on caller UID + admin token. We just present what
-    // we get back: full snapshot if accepted, hint to set the token if
-    // refused.
-    let status_request = server::AdminRequest::Status {
-        auth_token: admin_token,
-    };
-    match client.send_admin(status_request).await {
+    // Try the full Status RPC. Succeeds when the caller is the daemon
+    // UID; refused otherwise. There is no client-side admin token — to
+    // see the full snapshot, run as the service user
+    // (e.g. `sudo -u guard guard status`).
+    match client.send_admin(server::AdminRequest::Status).await {
         Ok(server::AdminResponse::Status { status }) => {
             if let Some(ref s) = status.socket_path {
                 println!("  socket         {}", s);
@@ -985,7 +943,6 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
             if let Some(p) = status.tcp_port {
                 println!("  tcp_port       {}", p);
             }
-            println!("  mode           {}", status.mode);
             println!("  llm_enabled    {}", status.llm_enabled);
             if status.llm_enabled {
                 println!("  llm_models     {:?}", status.llm_model_chain);
@@ -993,27 +950,20 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
             println!("  static_policy  {}", status.static_policy);
             println!("  preflight      {}", status.preflight);
             println!("  redact         {}", status.redact);
-            println!("  dry_run        {}", status.dry_run);
-            println!("  cache          enabled={} size={}", status.cache_enabled, status.cache_size);
+            println!(
+                "  cache          enabled={} size={}",
+                status.cache_enabled, status.cache_size
+            );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
-            println!(
-                "  admin_token    {}",
-                if status.admin_token_set {
-                    "configured (non-daemon UIDs may admin if they present it)"
-                } else {
-                    "NOT configured (admin restricted to daemon UID)"
-                }
-            );
             Ok(())
         }
         Ok(server::AdminResponse::Error { .. }) => {
-            // Refusal is expected when caller is not daemon-UID and has
-            // no admin token. Don't treat it as a hard failure — basic
-            // ping info already printed above is enough to confirm the
-            // connection works.
+            // Expected when caller is not the daemon UID. Hide the rest.
             println!();
-            println!("(set GUARD_ADMIN_TOKEN to view full server config)");
+            println!(
+                "(run `sudo -u <service-user> guard status` to view full server config)"
+            );
             Ok(())
         }
         Ok(other) => {
@@ -1025,21 +975,6 @@ async fn handle_status(socket: Option<String>, auth_token: Option<String>) -> Re
             std::process::exit(1);
         }
     }
-}
-
-/// Admin token for client→daemon admin RPCs. Priority: explicit
-/// --admin-token flag > GUARD_ADMIN_TOKEN env. NEVER read from
-/// client.yaml — that would let any process with read access to the
-/// config file admin the daemon, defeating the agent/operator
-/// separation. Operators export the env var in their interactive
-/// shell; agents do not have it.
-fn resolve_admin_token(flag: Option<String>) -> Option<String> {
-    if let Some(t) = flag.filter(|s| !s.is_empty()) {
-        return Some(t);
-    }
-    std::env::var("GUARD_ADMIN_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
 }
 
 /// Format a session prompt for `guard session list` output. Without
@@ -1111,7 +1046,6 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         prompt,
         prompt_file,
         socket,
-        auth_token,
     } = &subcommand
     {
         let token = generate_session_token();
@@ -1131,7 +1065,6 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             };
 
             let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
-            let admin_token = resolve_admin_token(auth_token.clone());
             let client = server::Client::new(socket_path, tcp_port);
             let request = server::AdminRequest::SessionGrant {
                 token: token.clone(),
@@ -1139,7 +1072,6 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 deny: deny.clone(),
                 ttl_secs: *ttl,
                 prompt_append,
-                auth_token: admin_token,
             };
             match client.send_admin(request).await? {
                 server::AdminResponse::Ok => {}
@@ -1170,7 +1102,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
 
     let mut print_full_prompt = false;
 
-    let (socket_override, auth_override, request) = match subcommand {
+    let (socket_override, request) = match subcommand {
         SessionCommands::New { .. } => unreachable!("handled above"),
         SessionCommands::Grant {
             token,
@@ -1180,7 +1112,6 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             prompt,
             prompt_file,
             socket,
-            auth_token,
         } => {
             let prompt_append = match prompt_file {
                 Some(path) => Some(
@@ -1191,35 +1122,24 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             };
             (
                 socket,
-                auth_token,
                 server::AdminRequest::SessionGrant {
                     token,
                     allow,
                     deny,
                     ttl_secs: ttl,
                     prompt_append,
-                    auth_token: None,
                 },
             )
         }
         SessionCommands::Revoke {
             token,
             socket,
-            auth_token,
-        } => (
-            socket,
-            auth_token,
-            server::AdminRequest::SessionRevoke {
-                token,
-                auth_token: None,
-            },
-        ),
+        } => (socket, server::AdminRequest::SessionRevoke { token }),
         SessionCommands::List {
             history,
             since,
             full,
             socket,
-            auth_token,
         } => {
             let since_unix = match since.as_deref() {
                 Some(s) => Some(parse_since_to_unix(s)?),
@@ -1231,21 +1151,16 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             print_full_prompt = full;
             (
                 socket,
-                auth_token,
                 server::AdminRequest::SessionList {
                     include_history,
                     since_unix,
-                    auth_token: None,
                 },
             )
         }
     };
 
     let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
-
-    let admin_token = resolve_admin_token(auth_override);
     let client = server::Client::new(socket_path, tcp_port);
-    let request = inject_admin_auth(request, admin_token);
 
     match client.send_admin(request).await? {
         server::AdminResponse::Ok => {
@@ -1298,53 +1213,6 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn client_auth_token(client: &server::Client) -> Option<String> {
-    client.auth_token_for_admin()
-}
-
-fn inject_admin_auth(
-    request: server::AdminRequest,
-    token: Option<String>,
-) -> server::AdminRequest {
-    match request {
-        server::AdminRequest::SessionGrant {
-            token: tok,
-            allow,
-            deny,
-            ttl_secs,
-            prompt_append,
-            auth_token: _,
-        } => server::AdminRequest::SessionGrant {
-            token: tok,
-            allow,
-            deny,
-            ttl_secs,
-            prompt_append,
-            auth_token: token,
-        },
-        server::AdminRequest::SessionRevoke {
-            token: tok,
-            auth_token: _,
-        } => server::AdminRequest::SessionRevoke {
-            token: tok,
-            auth_token: token,
-        },
-        server::AdminRequest::SessionList {
-            include_history,
-            since_unix,
-            auth_token: _,
-        } => server::AdminRequest::SessionList {
-            include_history,
-            since_unix,
-            auth_token: token,
-        },
-        server::AdminRequest::Status { auth_token: _ } => {
-            server::AdminRequest::Status { auth_token: token }
-        }
-        server::AdminRequest::Ping => server::AdminRequest::Ping,
-    }
 }
 
 async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
@@ -1594,7 +1462,6 @@ mod tests {
                 no_llm,
                 no_redact,
                 preflight,
-                admin_token,
                 no_cache,
                 cache_capacity,
                 cache_ttl,
@@ -1619,7 +1486,6 @@ mod tests {
                 no_llm,
                 no_redact,
                 preflight,
-                admin_token,
                 no_cache,
                 cache_capacity,
                 cache_ttl,

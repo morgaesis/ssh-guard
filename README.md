@@ -291,14 +291,17 @@ Matching deny patterns win over allow patterns, and everything that does not mat
 
 ### Admin authorization
 
-Session admin RPCs (`session new` / `grant` / `revoke` / `list`, plus `status`) are deliberately separated from exec authorization. Without this separation, any UID that can run commands could also mint a session whose `--prompt` tells the model to approve everything — a trivial bypass.
+Session admin RPCs (`session new` / `grant` / `revoke` / `list`, plus the privileged subset of `status`) are restricted to **the daemon's own UID**. There is no client-side admin token, by design — without that separation, any exec-allowed UID could mint a session whose `--prompt` tells the model to approve everything, a trivial bypass.
 
-Two ways to authorize an admin RPC:
+To administer the daemon, become the service user:
 
-1. The caller is the daemon's own UID (e.g. `sudo -u guard guard session list`). That process can already control the daemon by other means, so the socket boundary is not security-relevant against it.
-2. The caller presents a matching `GUARD_ADMIN_TOKEN` (or `--admin-token` flag), and the daemon was started with `SSH_GUARD_ADMIN_TOKEN` set to the same value.
+```bash
+sudo -u guard guard session list
+sudo -u guard guard session new --prompt '...' --allow '...' --ttl 3600
+sudo -u guard guard status   # full server snapshot
+```
 
-If no admin token is configured, only the daemon UID can admin — non-daemon callers get `admin RPC refused: no admin token configured and caller is not the daemon UID`. **In any deployment where the operator and an agent share a UID, an admin token is required.** Set `SSH_GUARD_ADMIN_TOKEN` in `/etc/default/guard`, then export `GUARD_ADMIN_TOKEN` with the same value in your operator shell only — never in the agent's environment.
+The non-privileged `guard status` (run as your normal user or any other exec-allowed UID) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
