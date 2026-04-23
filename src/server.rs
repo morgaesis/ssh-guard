@@ -82,6 +82,13 @@ pub struct ExecuteRequest {
     pub args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// Per-run plain environment variables requested by the client.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    /// Per-run secret mappings requested by the client: env var -> secret key.
+    /// Secret values are resolved by the daemon immediately before execution.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub secrets: HashMap<String, String>,
     #[serde(default)]
     pub stream: bool,
     /// Session grant token. When present and matched server-side, session
@@ -117,6 +124,14 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix: Option<u64>,
     },
+    SecretSet {
+        key: String,
+        value: String,
+    },
+    SecretDelete {
+        key: String,
+    },
+    SecretList,
     /// Privileged status snapshot. Caller must be the daemon UID.
     Status,
     /// No-auth liveness probe. Returns version, uptime, and a small
@@ -146,6 +161,9 @@ pub enum AdminResponse {
         grants: Vec<SessionGrantSummary>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         history: Vec<HistoricalGrant>,
+    },
+    SecretList {
+        keys: Vec<String>,
     },
     Status {
         status: ServerStatus,
@@ -245,9 +263,7 @@ pub struct ServerConfig {
     /// Status admin RPC so callers can compute uptime.
     pub started_at_unix: u64,
     /// Effective UID of the daemon process. Admin RPCs require the
-    /// caller to be this UID — there is no token-based elevation. To
-    /// administer the daemon, become the service user (e.g.
-    /// `sudo -u guard guard session list`).
+    /// caller to be this UID; there is no token-based elevation.
     pub daemon_uid: u32,
 }
 
@@ -307,8 +323,7 @@ impl ServerConfig {
     }
 
     /// Authorize an admin RPC. Admin = caller is the daemon's own UID.
-    /// There is no token-based elevation; to administer the daemon,
-    /// become the service user (e.g. `sudo -u guard guard session list`).
+    /// There is no token-based elevation.
     /// Without this rule, an exec-allowed agent process could mint
     /// sessions whose `--prompt` overrides the LLM policy from itself.
     fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
@@ -317,9 +332,7 @@ impl ServerConfig {
                 return Ok(());
             }
         }
-        anyhow::bail!(
-            "admin RPC refused: caller is not the daemon UID (admin via `sudo -u <service-user> guard ...`)"
-        );
+        anyhow::bail!("admin RPC refused: caller is not the daemon UID");
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
@@ -771,6 +784,37 @@ async fn handle_admin_request(
             };
             AdminResponse::SessionList { grants, history }
         }
+        AdminRequest::SecretSet { key, value } => {
+            if key.trim().is_empty() {
+                return AdminResponse::Error {
+                    message: "secret key must not be empty".to_string(),
+                };
+            }
+            match config.secrets.set(&key, &value).await {
+                Ok(()) => {
+                    tracing::info!("[AUDIT] SECRET_SET caller={} key={}", caller, key);
+                    AdminResponse::Ok
+                }
+                Err(e) => AdminResponse::Error {
+                    message: format!("failed to store secret '{}': {}", key, e),
+                },
+            }
+        }
+        AdminRequest::SecretDelete { key } => match config.secrets.delete(&key).await {
+            Ok(()) => {
+                tracing::info!("[AUDIT] SECRET_DELETE caller={} key={}", caller, key);
+                AdminResponse::Ok
+            }
+            Err(e) => AdminResponse::Error {
+                message: format!("failed to remove secret '{}': {}", key, e),
+            },
+        },
+        AdminRequest::SecretList => match config.secrets.list().await {
+            Ok(keys) => AdminResponse::SecretList { keys },
+            Err(e) => AdminResponse::Error {
+                message: format!("failed to list secrets: {}", e),
+            },
+        },
         AdminRequest::Ping => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1328,6 +1372,42 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
             return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
         }
     };
+    let mut tool_env = tool_env;
+
+    for key in request.env.keys().chain(request.secrets.keys()) {
+        if !is_valid_env_name(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!("invalid injected environment variable name: '{}'", key),
+            );
+        }
+    }
+
+    for (key, value) in &request.env {
+        tool_env.insert(key.clone(), value.clone());
+    }
+
+    for (env_var, secret_key) in &request.secrets {
+        let value = match config.secrets.get(secret_key).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return ExecuteResult::exec_failed(
+                    allow_reason,
+                    format!(
+                        "secret not found: '{}' (required by --secret {})",
+                        secret_key, env_var
+                    ),
+                );
+            }
+            Err(e) => {
+                return ExecuteResult::exec_failed(
+                    allow_reason,
+                    format!("failed to read secret '{}': {}", secret_key, e),
+                );
+            }
+        };
+        tool_env.insert(env_var.clone(), value);
+    }
 
     tracing::info!(
         "Executing: {} {:?} ({})",
@@ -1542,6 +1622,15 @@ fn command_tokens(command: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn is_valid_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 #[derive(Debug)]
@@ -1808,13 +1897,18 @@ impl Client {
     }
 
     pub async fn execute(&self, binary: &str, args: &[String]) -> Result<ExecuteResponse> {
-        let request = ExecuteRequest {
-            binary: binary.to_string(),
-            args: args.to_vec(),
-            auth_token: self.auth_token.clone(),
-            stream: false,
-            session_token: self.session_token.clone(),
-        };
+        self.execute_with_injections(binary, args, HashMap::new(), HashMap::new())
+            .await
+    }
+
+    pub async fn execute_with_injections(
+        &self,
+        binary: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+    ) -> Result<ExecuteResponse> {
+        let request = self.build_execute_request(binary, args, env, secrets, false);
 
         tracing::debug!(
             binary = %binary,
@@ -1841,13 +1935,28 @@ impl Client {
     where
         F: FnMut(OutputStream, &str),
     {
-        let request = ExecuteRequest {
-            binary: binary.to_string(),
-            args: args.to_vec(),
-            auth_token: self.auth_token.clone(),
-            stream: true,
-            session_token: self.session_token.clone(),
-        };
+        self.execute_streaming_with_injections(
+            binary,
+            args,
+            HashMap::new(),
+            HashMap::new(),
+            on_output,
+        )
+        .await
+    }
+
+    pub async fn execute_streaming_with_injections<F>(
+        &self,
+        binary: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+        mut on_output: F,
+    ) -> Result<ExecuteResponse>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        let request = self.build_execute_request(binary, args, env, secrets, true);
 
         tracing::debug!(
             binary = %binary,
@@ -1864,6 +1973,25 @@ impl Client {
                 .await
         } else {
             anyhow::bail!("no socket path or TCP port configured");
+        }
+    }
+
+    fn build_execute_request(
+        &self,
+        binary: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+        stream: bool,
+    ) -> ExecuteRequest {
+        ExecuteRequest {
+            binary: binary.to_string(),
+            args: args.to_vec(),
+            auth_token: self.auth_token.clone(),
+            env,
+            secrets,
+            stream,
+            session_token: self.session_token.clone(),
         }
     }
 

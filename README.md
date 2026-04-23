@@ -289,17 +289,45 @@ guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt
 
 Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session list` and `guard session revoke <token>` manage active grants.
 
-### Admin authorization
+## Per-run secret injection
 
-Session admin RPCs (`session new` / `grant` / `revoke` / `list`, plus the privileged subset of `status`) are restricted to **the daemon's own UID**. There is no client-side admin token, by design — without that separation, any exec-allowed UID could mint a session whose `--prompt` tells the model to approve everything, a trivial bypass.
+`guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
-To administer the daemon, become the service user:
+`guard secrets add/list/remove` are daemon admin operations. The client sends the request to the configured guard server; only the daemon reads or writes the configured secret backend.
+
+For a stored secret with a shell-safe name, `--secret NAME` injects `$NAME`:
 
 ```bash
-sudo -u guard guard session list
-sudo -u guard guard session new --prompt '...' --allow '...' --ttl 3600
-sudo -u guard guard status   # full server snapshot
+guard run \
+  --secret OPNSENSE_API_KEY \
+  --secret OPNSENSE_API_SECRET \
+  --secret OPNSENSE_USERNAME \
+  ssh opnsense-host 'configctl system status'
 ```
+
+For a stored secret with dashes, slashes, or lowercase names, bare `--secret` derives an uppercase env var by replacing separators with underscores:
+
+```bash
+guard run --secret opnsense-apikey-secret \
+  sh -c 'opnsense-tool --key "$OPNSENSE_APIKEY_SECRET"'
+```
+
+Map a different environment variable name to a stored secret key with `ENV_VAR=secret-name`:
+
+```bash
+guard run --secret OPNSENSE_API_KEY=atlas/opnsense-apikey ssh opnsense-host uptime
+```
+
+Plain per-run environment values are also supported for non-secret settings:
+
+```bash
+guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
+  sh -c 'ssh "$OPNSENSE_HOST" uptime'
+```
+
+## Admin authorization
+
+Session admin RPCs (`session new` / `grant` / `revoke` / `list`, plus the privileged subset of `status`) are restricted to **the daemon's own UID**. There is no client-side admin token, by design — without that separation, any exec-allowed UID could mint a session whose `--prompt` tells the model to approve everything, a trivial bypass.
 
 The non-privileged `guard status` (run as your normal user or any other exec-allowed UID) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
@@ -387,9 +415,9 @@ def guarded_command(command: str, args: list[str]) -> str:
 
 Guard provides defense in depth through three layers:
 
-1. **Environment isolation** (`env_clear`): Child processes inherit only safe environment variables (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, etc.). API keys and secrets are not accessible to executed commands.
+1. **Environment isolation** (`env_clear`): Child processes inherit only safe environment variables (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, etc.) plus any per-run or tool-configured variables the caller explicitly requested.
 
-2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets) are exact-match redacted from stdout/stderr before returning to the agent. Regex patterns catch `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, PEM blocks, and JWTs.
+2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets, per-run injected secrets) are exact-match redacted from stdout/stderr before returning to the agent. Regex patterns catch `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, PEM blocks, and JWTs.
 
 3. **LLM evaluation**: Each command is analyzed for destructive intent, privilege escalation, reverse shells, obfuscated payloads, tool side-channel abuse, and prompt injection. The LLM evaluates the full command including all chained parts.
 

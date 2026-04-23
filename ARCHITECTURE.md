@@ -18,6 +18,8 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
                                                     |
                                               env_clear + allowlist
                                                     |
+                                              Per-run/tool secret injection
+                                                    |
                                               Output redaction
                                                     |
                                               Stream/output response to agent
@@ -25,13 +27,13 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 ## Security layers
 
-1. **Environment isolation**: `cmd.env_clear()` strips all environment variables from child processes. Only safe variables are re-injected (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TZ`, `SHELL`, `LOGNAME`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`). API keys and secrets never reach executed commands.
+1. **Environment isolation**: `cmd.env_clear()` strips all environment variables from child processes. Only safe variables are re-injected (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TZ`, `SHELL`, `LOGNAME`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`), followed by explicit per-run or tool-configured env/secret injections.
 
 2. **Preflight** (optional, opt-in via `--preflight`): Two deterministic pre-LLM checks. Executable validation rejects binaries not present on the daemon `PATH`, so natural-language first tokens such as `Give` or `Please` never reach the model as prose. Credential preflight rejects known credential-disclosure patterns (private key paths, guard environment files, kubeconfig raw output, Kubernetes Secret access, token minting, process environment reads). These are coarse by design and can over-match (e.g. they block any command containing the `env` token). Enable on hosts where LLM cost or latency dominates over false positives; leave off where the LLM is the authoritative decision maker.
 
    Invariant checks still run regardless of `--preflight`: binary names containing `/`, `..`, or NUL are rejected, and recursion depth is capped.
 
-3. **Output redaction**: Known secret values (API key, auth token, tool-injected secrets) are exact-match redacted from stdout/stderr. Regex patterns catch common secret formats (`*_TOKEN=`, `*_KEY=`, PEM blocks, JWTs, `sk-*` strings).
+3. **Output redaction**: Known secret values (API key, auth token, tool-injected secrets, per-run injected secrets) are exact-match redacted from stdout/stderr. Regex patterns catch common secret formats (`*_TOKEN=`, `*_KEY=`, PEM blocks, JWTs, `sk-*` strings).
 
 4. **LLM evaluation**: Commands are sent to an LLM with a mode-specific system prompt. The LLM analyzes intent, chained operations, obfuscation, tool side-channels, and prompt injection attempts. Returns `APPROVE`/`DENY` with risk score.
 
@@ -45,7 +47,7 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 Admin RPCs (session grant/revoke/list and the full `status` snapshot) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. The model is intentionally simple:
 
-- **Admin = the daemon's own UID.** That process can already control the daemon by signals, /proc, or restarting the service. The socket boundary adds nothing against it. To administer, become the service user (`sudo -u <service-user> guard ...`).
+- **Admin = the daemon's own UID.** That process can already control the daemon by signals, /proc, or restarting the service. The socket boundary adds nothing against it.
 - **There is no client-side admin token.** A token-based path would have to live somewhere — env var, config file — and any agent process running as the same user could read it. The admin/agent split is enforced by UID separation only.
 
 The non-privileged `Ping` admin RPC is always permitted to UIDs that can already exec, and returns version, uptime, mode, and dry-run state. That is enough for a `guard status` liveness check without fingerprinting the deployment (no LLM model identity, no redaction posture, no session counts).
@@ -92,11 +94,15 @@ single JSON response after the approved command exits. `guard run` and
 are redacted server-side and sent as they arrive, followed by a final result
 message carrying the policy reason and exit code.
 
-Execution requests currently carry only `binary` and `args`. They do not carry
-the client's current working directory as structured metadata. Relative paths
-therefore resolve in the daemon process working directory when a command is
-actually executed, and the evaluator only sees the relative path text supplied
-in the command.
+Execution requests carry `binary`, `args`, optional session token, optional
+plain env injections, and optional secret env mappings. Secret values are never
+sent by execution clients; the daemon resolves them from its configured secret
+backend immediately before exec. Secret management (`guard secrets
+add/list/remove`) is also daemon-side via admin RPCs, so the client does not
+select or write a secret backend. Requests do not carry the client's current
+working directory as structured metadata. Relative paths therefore resolve in
+the daemon process working directory when a command is actually executed, and
+the evaluator only sees the relative path text supplied in the command.
 
 ## Design constraints
 
