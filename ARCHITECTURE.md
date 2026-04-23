@@ -97,12 +97,15 @@ message carrying the policy reason and exit code.
 Execution requests carry `binary`, `args`, optional session token, optional
 plain env injections, and optional secret env mappings. Secret values are never
 sent by execution clients; the daemon resolves them from its configured secret
-backend immediately before exec. Secret management (`guard secrets
-add/list/remove`) is also daemon-side via admin RPCs, so the client does not
-select or write a secret backend. Requests do not carry the client's current
-working directory as structured metadata. Relative paths therefore resolve in
-the daemon process working directory when a command is actually executed, and
-the evaluator only sees the relative path text supplied in the command.
+backend immediately before exec. Before the LLM or static policy runs, the
+daemon rejects malformed injected env names, invalid secret keys, missing
+secret references, and shell references that point at the secret key instead of
+the injected env var. Secret management (`guard secrets add/list/remove`) is
+also daemon-side via admin RPCs, so the client does not select or write a
+secret backend. Requests do not carry the client's current working directory as
+structured metadata. Relative paths therefore resolve in the daemon process
+working directory when a command is actually executed, and the evaluator only
+sees the relative path text supplied in the command.
 
 ## Design constraints
 

@@ -785,9 +785,9 @@ async fn handle_admin_request(
             AdminResponse::SessionList { grants, history }
         }
         AdminRequest::SecretSet { key, value } => {
-            if key.trim().is_empty() {
+            if !is_valid_secret_key(&key) {
                 return AdminResponse::Error {
-                    message: "secret key must not be empty".to_string(),
+                    message: format!("invalid secret key: '{}'", key),
                 };
             }
             match config.secrets.set(&key, &value).await {
@@ -800,15 +800,22 @@ async fn handle_admin_request(
                 },
             }
         }
-        AdminRequest::SecretDelete { key } => match config.secrets.delete(&key).await {
-            Ok(()) => {
-                tracing::info!("[AUDIT] SECRET_DELETE caller={} key={}", caller, key);
-                AdminResponse::Ok
+        AdminRequest::SecretDelete { key } => {
+            if !is_valid_secret_key(&key) {
+                return AdminResponse::Error {
+                    message: format!("invalid secret key: '{}'", key),
+                };
             }
-            Err(e) => AdminResponse::Error {
-                message: format!("failed to remove secret '{}': {}", key, e),
-            },
-        },
+            match config.secrets.delete(&key).await {
+                Ok(()) => {
+                    tracing::info!("[AUDIT] SECRET_DELETE caller={} key={}", caller, key);
+                    AdminResponse::Ok
+                }
+                Err(e) => AdminResponse::Error {
+                    message: format!("failed to remove secret '{}': {}", key, e),
+                },
+            }
+        }
         AdminRequest::SecretList => match config.secrets.list().await {
             Ok(keys) => AdminResponse::SecretList { keys },
             Err(e) => AdminResponse::Error {
@@ -1209,6 +1216,12 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     } else {
         format!("{} {}", request.binary, request.args.join(" "))
     };
+
+    if let Err(reason) = validate_request_injections(&request, config, &command_line).await {
+        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        return ExecuteResult::denied(reason);
+    }
 
     // Session grants short-circuit both directions: deny wins before the
     // evaluator, allow skips the evaluator entirely.
@@ -1633,6 +1646,85 @@ fn is_valid_env_name(value: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+fn is_valid_secret_key(value: &str) -> bool {
+    if value.is_empty()
+        || value.contains('\0')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+    {
+        return false;
+    }
+
+    value.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    })
+}
+
+fn invalid_shell_secret_reference(
+    command_line: &str,
+    env_var: &str,
+    secret_key: &str,
+) -> Option<String> {
+    if is_valid_env_name(secret_key) {
+        return None;
+    }
+
+    let bare_ref = format!("${secret_key}");
+    let braced_ref = format!("${{{secret_key}}}");
+    if command_line.contains(&bare_ref) || command_line.contains(&braced_ref) {
+        return Some(format!(
+            "invalid secret environment reference '{}': secret '{}' is injected as ${}. Use `--secret {}={}` to choose a different env var.",
+            bare_ref, secret_key, env_var, env_var, secret_key
+        ));
+    }
+
+    None
+}
+
+async fn validate_request_injections(
+    request: &ExecuteRequest,
+    config: &ServerConfig,
+    command_line: &str,
+) -> std::result::Result<(), String> {
+    for key in request.env.keys().chain(request.secrets.keys()) {
+        if !is_valid_env_name(key) {
+            return Err(format!(
+                "invalid injected environment variable name: '{}'",
+                key
+            ));
+        }
+    }
+
+    for (env_var, secret_key) in &request.secrets {
+        if !is_valid_secret_key(secret_key) {
+            return Err(format!("invalid secret key: '{}'", secret_key));
+        }
+        if let Some(reason) = invalid_shell_secret_reference(command_line, env_var, secret_key) {
+            return Err(reason);
+        }
+        match config.secrets.get(secret_key).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(format!(
+                    "secret not found: '{}' (required by --secret {})",
+                    secret_key, env_var
+                ));
+            }
+            Err(e) => {
+                return Err(format!("failed to read secret '{}': {}", secret_key, e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct StreamChunk {
     stream: OutputStream,
@@ -1841,6 +1933,16 @@ impl Client {
     }
 
     pub async fn send_admin(&self, request: AdminRequest) -> Result<AdminResponse> {
+        let request_name = match &request {
+            AdminRequest::SessionGrant { .. } => "session_grant",
+            AdminRequest::SessionRevoke { .. } => "session_revoke",
+            AdminRequest::SessionList { .. } => "session_list",
+            AdminRequest::SecretSet { .. } => "secret_set",
+            AdminRequest::SecretDelete { .. } => "secret_delete",
+            AdminRequest::SecretList => "secret_list",
+            AdminRequest::Status => "status",
+            AdminRequest::Ping => "ping",
+        };
         let envelope = IncomingMessage::Admin { admin: request };
         let line = serde_json::to_string(&envelope)?;
 
@@ -1859,8 +1961,7 @@ impl Client {
                 .next_line()
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            let resp: AdminResponse =
-                serde_json::from_str(&response_line).context("invalid admin server response")?;
+            let resp = parse_admin_response_line(&response_line, request_name)?;
             Ok(resp)
         } else if let Some(port) = self.tcp_port {
             let addr = format!("127.0.0.1:{}", port);
@@ -1878,8 +1979,7 @@ impl Client {
                 .next_line()
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            let resp: AdminResponse =
-                serde_json::from_str(&response_line).context("invalid admin server response")?;
+            let resp = parse_admin_response_line(&response_line, request_name)?;
             Ok(resp)
         } else {
             anyhow::bail!("no socket path or TCP port configured");
@@ -2160,6 +2260,28 @@ impl Client {
     }
 }
 
+fn parse_admin_response_line(response_line: &str, request_name: &str) -> Result<AdminResponse> {
+    match serde_json::from_str::<AdminResponse>(response_line) {
+        Ok(resp) => Ok(resp),
+        Err(admin_err) => {
+            if let Ok(exec_resp) = serde_json::from_str::<ExecuteResponse>(response_line) {
+                let message = if exec_resp.reason.contains("invalid request")
+                    && exec_resp.reason.contains("IncomingMessage")
+                {
+                    format!(
+                        "guard daemon rejected admin RPC '{}'. The running daemon likely predates this client or needs restart onto the current binary.",
+                        request_name
+                    )
+                } else {
+                    exec_resp.reason
+                };
+                return Ok(AdminResponse::Error { message });
+            }
+            Err(admin_err).context("invalid admin server response")
+        }
+    }
+}
+
 async fn read_streaming_response<R, F>(
     reader: &mut tokio::io::Lines<BufReader<R>>,
     on_output: &mut F,
@@ -2317,6 +2439,96 @@ mod tests {
     fn credential_preflight_allows_basic_kubectl_inspection() {
         let args = vec!["get".to_string(), "namespaces".to_string()];
         assert!(deterministic_credential_deny_reason("kubectl", &args).is_none());
+    }
+
+    #[test]
+    fn parse_admin_response_line_accepts_admin_response() {
+        let line = r#"{"result":"error","message":"admin denied"}"#;
+        match parse_admin_response_line(line, "secret_set").unwrap() {
+            AdminResponse::Error { message } => assert_eq!(message, "admin denied"),
+            other => panic!("expected admin error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_admin_response_line_maps_execute_invalid_request_to_actionable_error() {
+        let line = r#"{"allowed":false,"reason":"invalid request: data did not match any variant of untagged enum IncomingMessage"}"#;
+        match parse_admin_response_line(line, "secret_set").unwrap() {
+            AdminResponse::Error { message } => {
+                assert!(message.contains("secret_set"));
+                assert!(message.contains("needs restart"));
+            }
+            other => panic!("expected admin error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn secret_key_validation_allows_namespaced_keys() {
+        assert!(is_valid_secret_key("opnsense-apikey-secret"));
+        assert!(is_valid_secret_key("atlas/opnsense-apikey"));
+        assert!(!is_valid_secret_key("../opnsense"));
+        assert!(!is_valid_secret_key("atlas/../opnsense"));
+        assert!(!is_valid_secret_key("bad key"));
+        assert!(!is_valid_secret_key("/absolute"));
+    }
+
+    #[test]
+    fn invalid_shell_secret_reference_points_to_injected_env() {
+        let reason = invalid_shell_secret_reference(
+            "echo '$opnsense-apikey-secret'",
+            "OPNSENSE_APIKEY_SECRET",
+            "opnsense-apikey-secret",
+        )
+        .expect("dashed shell-style reference should be rejected");
+        assert!(reason.contains("$OPNSENSE_APIKEY_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn missing_requested_secret_denies_before_policy_evaluation() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "echo".to_string(),
+            args: vec!["$NONEXISTING_SEC".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::from([(
+                "NONEXISTING_SEC".to_string(),
+                "nonexisting_sec".to_string(),
+            )]),
+            stream: false,
+            session_token: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result.policy_reason().contains("secret not found"));
+    }
+
+    #[tokio::test]
+    async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
+        let (cfg, _) = make_test_config();
+        cfg.secrets
+            .set("opnsense-apikey-secret", "dummy_api_key_12345")
+            .await
+            .unwrap();
+        let request = ExecuteRequest {
+            binary: "echo".to_string(),
+            args: vec!["$opnsense-apikey-secret".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::from([(
+                "OPNSENSE_APIKEY_SECRET".to_string(),
+                "opnsense-apikey-secret".to_string(),
+            )]),
+            stream: false,
+            session_token: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result
+            .policy_reason()
+            .contains("invalid secret environment reference"));
     }
 
     #[test]

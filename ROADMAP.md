@@ -36,6 +36,7 @@
 ## Next
 
 - Interactive approval chat per session: conversational context with the operator that lets guard make context-aware decisions beyond per-command stateless evaluation.
+- Pre-LLM validation for secret injection requests: invalid env names, missing secrets, and misleading shell references to invalid env names should fail before evaluator approval.
 - Live integration test for 429 / `Retry-After` mocking (the unit test suite already covers the retry rules; an HTTP-mock integration test would catch wire-format regressions).
 - Binary allowlist for the server (restrict which binaries can be executed, not just what arguments are passed).
 - Seccomp/AppArmor profile generation for containerized deployments.
