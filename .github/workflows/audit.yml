@@ -95,7 +95,24 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
+      - name: Detect dependency graph availability
+        id: dependency_graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api repos/${{ github.repository }}/dependency-graph/sbom >/dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        if: steps.dependency_graph.outputs.enabled == 'true'
 
       - name: Dependency Review
+        if: steps.dependency_graph.outputs.enabled == 'true'
         uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48  # v4
+
+      - name: Skip dependency review
+        if: steps.dependency_graph.outputs.enabled != 'true'
+        run: echo "Dependency graph API is unavailable for this repository; skipping dependency review."
