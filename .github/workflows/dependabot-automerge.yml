@@ -17,7 +17,11 @@ name: Dependabot auto-merge
 #   marked as required (otherwise --auto would merge without waiting).
 
 on:
-  pull_request:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
 
 permissions:
   contents: read
@@ -55,6 +59,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
+          gh label create "needs-manual-review" \
+            --color "B60205" \
+            --description "Dependabot update requires manual review" \
+            --force
           gh pr edit "$PR_URL" --add-label "needs-manual-review"
           gh pr comment "$PR_URL" --body \
             "Major version bump detected; auto-merge skipped. Review the changelog and merge manually if appropriate."

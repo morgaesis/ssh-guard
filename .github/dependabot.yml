@@ -10,9 +10,17 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     groups:
-      rust-dependencies:
+      rust-safe-dependencies:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      rust-major-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
 
   - package-ecosystem: "github-actions"
     directory: "/"
