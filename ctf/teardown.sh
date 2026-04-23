@@ -17,6 +17,14 @@ done
 
 podman network rm guard-net >/dev/null 2>&1 || true
 
+# Wipe the staged OAuth credential mount. It is mode 600 and gitignored, but
+# leaving a copy of the user's claude credential file lying around after the
+# CTF run is unnecessary blast radius.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -d "$SCRIPT_DIR/.agent-claude-state" ] && \
+    (rm -rf "$SCRIPT_DIR/.agent-claude-state" 2>/dev/null || \
+     podman unshare rm -rf "$SCRIPT_DIR/.agent-claude-state" 2>/dev/null || true)
+
 # Report remaining ctf containers (should be none).
 remaining=$(podman ps -a --filter 'name=^guard-(local|remote|agent)$' --format '{{.Names}}' 2>/dev/null || true)
 if [ -n "$remaining" ]; then

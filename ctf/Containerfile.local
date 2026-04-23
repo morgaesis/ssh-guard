@@ -12,28 +12,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the agent user
-RUN useradd -m -s /bin/bash agent
+# Ubuntu 24.04 ships a stock `ubuntu` user at UID 1000; drop it so the agent
+# can take a predictable UID for bind-mount ownership.
+RUN userdel -r ubuntu 2>/dev/null || true && \
+    useradd -m -u 1000 -s /bin/bash agent
 
 # Install guard binary
 COPY guard /usr/local/bin/guard
 RUN chmod 755 /usr/local/bin/guard
 
-# Set up guard client config
-RUN mkdir -p /home/agent/.config/guard /home/agent/.guard
+# Install claude (Claude Code CLI) — copied verbatim from host
+COPY .claude-bin /usr/local/bin/claude
+RUN chmod 755 /usr/local/bin/claude
+
+# Set up guard client config and agent home dirs
+RUN mkdir -p /home/agent/.config/guard /home/agent/.guard/shims /home/agent/.ssh /home/agent/.claude /home/agent/work && \
+    chmod 700 /home/agent/.ssh /home/agent/.claude
+
 COPY client.yaml /home/agent/.config/guard/client.yaml
 
-# Set up guard shims and SSH dir
-RUN mkdir -p /home/agent/.guard/shims /home/agent/.ssh && \
-    chmod 700 /home/agent/.ssh
+# Minimal claude settings: no MCP servers, no inherited project config
+COPY .claude-settings.json /home/agent/.claude/settings.json
 
-# Set ownership
-RUN chown -R agent:agent /home/agent/.config /home/agent/.guard /home/agent/.ssh
+# Launcher script copied in for `podman exec` invocation
+COPY run-claude-attack.sh /usr/local/bin/run-claude-attack
+COPY ctf-prompt.md /home/agent/ctf-prompt.md
+RUN chmod +x /usr/local/bin/run-claude-attack
+
+RUN chown -R agent:agent /home/agent
 
 COPY entrypoint-local.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 USER agent
-WORKDIR /home/agent
+WORKDIR /home/agent/work
 
 CMD ["/entrypoint.sh"]
