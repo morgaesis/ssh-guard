@@ -88,6 +88,62 @@ impl PassBackend {
     }
 }
 
+fn parse_flat_pass_list(stdout: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let key = line
+            .strip_prefix(PASS_PREFIX)
+            .unwrap_or(line)
+            .trim_end_matches('/');
+        if !key.is_empty() {
+            keys.push(key.to_string());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn parse_tree_pass_list(stdout: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("Password Store")
+            || line.starts_with("Passwords")
+            || line == PASS_PREFIX.trim_end_matches('/')
+        {
+            continue;
+        }
+
+        let cleaned = line
+            .trim_start_matches(|c: char| {
+                c.is_whitespace() || matches!(c, '├' | '└' | '│' | '─' | '┬' | '┼' | ' ' | '\t')
+            })
+            .trim();
+        if cleaned.is_empty() || cleaned == PASS_PREFIX.trim_end_matches('/') {
+            continue;
+        }
+
+        let key = cleaned
+            .split_whitespace()
+            .next()
+            .unwrap_or(cleaned)
+            .trim_end_matches('/');
+        let key = key.strip_prefix(PASS_PREFIX).unwrap_or(key);
+        if !key.is_empty() {
+            keys.push(key.to_string());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 #[async_trait]
 impl SecretBackend for PassBackend {
     fn name(&self) -> &str {
@@ -118,6 +174,16 @@ impl SecretBackend for PassBackend {
     }
 
     async fn list(&self) -> Result<Vec<String>> {
+        let flat_output = AsyncCommand::new("pass")
+            .args(["ls", "--flat", PASS_PREFIX])
+            .output()
+            .await?;
+        if flat_output.status.success() {
+            return Ok(parse_flat_pass_list(&String::from_utf8_lossy(
+                &flat_output.stdout,
+            )));
+        }
+
         let output = AsyncCommand::new("pass")
             .args(["ls", PASS_PREFIX])
             .output()
@@ -132,36 +198,9 @@ impl SecretBackend for PassBackend {
             bail!("pass ls {} failed: {}", PASS_PREFIX, stderr.trim());
         }
 
-        // Parse pass ls output to extract key names
-        // Output format: each line is "key/" or "key (creation_date)"
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut keys = Vec::new();
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with("Passwords") || line.starts_with(PASS_PREFIX) {
-                continue;
-            }
-
-            // Strip directory suffix and any parenthetical info
-            let key = if let Some(slash) = line.strip_suffix('/') {
-                slash.trim().to_string()
-            } else {
-                line.split_whitespace()
-                    .next()
-                    .unwrap_or(line)
-                    .trim()
-                    .to_string()
-            };
-
-            if !key.is_empty() {
-                // Remove the PASS_PREFIX if it appears
-                let key = key.strip_prefix(PASS_PREFIX).unwrap_or(&key).to_string();
-                keys.push(key);
-            }
-        }
-
-        Ok(keys)
+        Ok(parse_tree_pass_list(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 
     async fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -175,7 +214,9 @@ impl SecretBackend for PassBackend {
             cmd.args(["--gpg-id", gpg_id]);
         }
 
-        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
@@ -809,6 +850,29 @@ mod tests {
         assert_eq!("local".parse::<BackendType>().unwrap(), BackendType::Local);
         assert_eq!("PASS".parse::<BackendType>().unwrap(), BackendType::Pass);
         assert!("invalid".parse::<BackendType>().is_err());
+    }
+
+    #[test]
+    fn parse_pass_flat_list_strips_guard_prefix() {
+        let keys = parse_flat_pass_list("guard/opnsense-apikey-secret\nguard/API_KEY\n");
+        assert_eq!(
+            keys,
+            vec!["API_KEY".to_string(), "opnsense-apikey-secret".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_pass_tree_list_strips_tree_glyphs() {
+        let keys = parse_tree_pass_list(
+            "Password Store\n└── guard\n    ├── OPNSENSE_API_KEY\n    └── opnsense-apikey-secret\n",
+        );
+        assert_eq!(
+            keys,
+            vec![
+                "OPNSENSE_API_KEY".to_string(),
+                "opnsense-apikey-secret".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
