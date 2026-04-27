@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 mod client_config;
+mod injection;
 mod mcp;
 mod redact;
 mod secrets;
@@ -17,6 +18,7 @@ use guard::evaluate;
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use guard::policy::PolicyMode;
+use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -40,7 +42,8 @@ enum MainArgs {
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
         /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
-        #[arg(long = "secret", value_name = "SECRET|ENV_VAR=SECRET", value_parser = parse_secret_mapping)]
+        /// Repeat the flag or pass a comma-separated list for multiple secrets.
+        #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
         /// Binary to execute
         binary: String,
@@ -52,7 +55,7 @@ enum MainArgs {
     #[clap(subcommand)]
     Server(ServerCommands),
     /// Manage secrets
-    #[clap(subcommand)]
+    #[clap(subcommand, alias = "secret")]
     Secrets(SecretCommands),
     /// Install shim scripts for command interposition
     Shim {
@@ -71,8 +74,8 @@ enum MainArgs {
         /// Inject an environment variable (KEY=VALUE, repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
-        /// Inject a secret as an env var (ENV_VAR=secret-name, repeatable)
-        #[arg(long = "secret", value_name = "ENV_VAR=SECRET", value_parser = parse_env_assignment)]
+        /// Inject a secret as an env var (ENV_VAR=secret-name). Repeat or comma-separate.
+        #[arg(long = "secret", value_name = "ENV_VAR=SECRET[,ENV_VAR=SECRET]", value_parser = parse_env_assignment, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
         /// Apply env/secret config to a specific user (UID or token name)
         #[arg(long)]
@@ -167,7 +170,8 @@ enum SessionCommands {
         /// `30m`, `2h`, `1d`. Implies --history when set.
         #[arg(long, value_name = "DURATION")]
         since: Option<String>,
-        /// Print untruncated session prompts.
+        /// Print untruncated session prompts (daemon UID only; other users
+        /// still see "(hidden)").
         #[arg(long = "full", action = ArgAction::SetTrue)]
         full: bool,
         /// Server socket path (defaults to configured)
@@ -181,63 +185,6 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
         .find('=')
         .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
-}
-
-fn is_valid_env_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
-fn derive_env_name(secret_name: &str) -> Result<String, String> {
-    let mut out = String::new();
-    let mut last_was_underscore = false;
-
-    for c in secret_name.chars() {
-        let next = if c.is_ascii_alphanumeric() {
-            Some(c.to_ascii_uppercase())
-        } else if c == '_' || c == '-' || c == '.' || c == '/' {
-            Some('_')
-        } else {
-            None
-        };
-
-        if let Some(c) = next {
-            if c == '_' {
-                if !out.is_empty() && !last_was_underscore {
-                    out.push(c);
-                }
-                last_was_underscore = true;
-            } else {
-                out.push(c);
-                last_was_underscore = false;
-            }
-        }
-    }
-
-    while out.ends_with('_') {
-        out.pop();
-    }
-
-    if out.is_empty() {
-        return Err(format!(
-            "could not derive an environment variable name from secret '{secret_name}'"
-        ));
-    }
-
-    if out
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        out.insert(0, '_');
-    }
-
-    Ok(out)
 }
 
 fn parse_env_assignment(s: &str) -> Result<(String, String), String> {
@@ -262,8 +209,12 @@ fn parse_secret_mapping(s: &str) -> Result<(String, String), String> {
     Ok((env_name, secret_name))
 }
 
-fn pairs_to_map(pairs: Vec<(String, String)>) -> HashMap<String, String> {
-    pairs.into_iter().collect()
+fn env_pairs_to_map(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>, String> {
+    collect_unique_pairs(pairs, "environment variable injection", "value")
+}
+
+fn secret_pairs_to_map(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>, String> {
+    collect_unique_pairs(pairs, "secret injection", "secret")
 }
 
 fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool {
@@ -411,7 +362,8 @@ enum ServerCommands {
         env_vars: Vec<(String, String)>,
 
         /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
-        #[arg(long = "secret", value_name = "SECRET|ENV_VAR=SECRET", value_parser = parse_secret_mapping)]
+        /// Repeat the flag or pass a comma-separated list for multiple secrets.
+        #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
 
         /// Binary to execute
@@ -488,7 +440,11 @@ enum SecretCommands {
         value: Option<String>,
     },
     /// List stored secret keys.
-    List,
+    List {
+        /// Include daemon-only ownership/origin detail for migration work.
+        #[arg(long, action = ArgAction::SetTrue)]
+        detailed: bool,
+    },
     /// Remove a stored secret.
     Remove {
         /// Secret key to remove.
@@ -537,13 +493,9 @@ async fn main() -> Result<()> {
             binary,
             args,
         }) => {
-            run_exec(
-                binary,
-                args,
-                pairs_to_map(env_vars),
-                pairs_to_map(secret_vars),
-            )
-            .await
+            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
+            run_exec(binary, args, env_vars, secret_vars).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
@@ -567,12 +519,6 @@ async fn main() -> Result<()> {
         {
             // Let clap render help/version to stdout and exit 0.
             e.exit();
-        }
-        Err(ref e) if should_fallback_to_run(&args, e.kind()) => {
-            // Fallback: treat unknown subcommands as `run <binary> <args...>`
-            let binary = args[0].clone();
-            let cmd_args = args[1..].to_vec();
-            run_exec(binary, cmd_args, HashMap::new(), HashMap::new()).await
         }
         Err(e) => {
             eprintln!("{}", e);
@@ -607,31 +553,6 @@ fn print_run_help() -> Result<()> {
     run.print_help()?;
     println!();
     Ok(())
-}
-
-fn should_fallback_to_run(args: &[String], kind: clap::error::ErrorKind) -> bool {
-    matches!(
-        kind,
-        clap::error::ErrorKind::InvalidSubcommand | clap::error::ErrorKind::UnknownArgument
-    ) && args.len() >= 2
-        && !args[0].starts_with('-')
-        && !is_guard_cli_keyword(&args[0])
-}
-
-fn is_guard_cli_keyword(value: &str) -> bool {
-    matches!(
-        value,
-        "run"
-            | "exec"
-            | "server"
-            | "secrets"
-            | "shim"
-            | "config"
-            | "mcp"
-            | "session"
-            | "status"
-            | "help"
-    )
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
@@ -833,7 +754,20 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             tracing::info!("Evaluator created successfully");
 
             tracing::info!("Initializing secret backend...");
-            let backend = secrets::detect_backend()
+            let backend_type = match guard_env("BACKEND") {
+                Some(value) => value
+                    .parse::<secrets::BackendType>()
+                    .map_err(anyhow::Error::msg)
+                    .context("invalid secret backend")?,
+                None => secrets::detect_backend(),
+            };
+            tracing::info!("Using {} secret backend", backend_type.as_str());
+            if guard_env("BACKEND").is_none() && backend_type == secrets::BackendType::Env {
+                tracing::warn!(
+                    "auto-selected env secret backend; secrets are process-local and will disappear on daemon restart"
+                );
+            }
+            let backend = backend_type
                 .build()
                 .context("Failed to create secret backend")?;
             let secrets = secrets::SecretManager::new(backend);
@@ -897,6 +831,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             binary,
             args,
         } => {
+            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
             let socket_path = socket.map(PathBuf::from);
             let mut client = server::Client::new(socket_path, tcp_port);
             if let Some(token) = token {
@@ -918,8 +854,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .execute_streaming_with_injections(
                     &binary,
                     &args,
-                    pairs_to_map(env_vars),
-                    pairs_to_map(secret_vars),
+                    env_vars,
+                    secret_vars,
                     |stream, data| {
                         streamed_output = true;
                         match stream {
@@ -1145,6 +1081,9 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!("  static_policy  {}", status.static_policy);
             println!("  preflight      {}", status.preflight);
             println!("  redact         {}", status.redact);
+            if !status.secret_backend.is_empty() {
+                println!("  secret_backend {}", status.secret_backend);
+            }
             println!(
                 "  cache          enabled={} size={}",
                 status.cache_enabled, status.cache_size
@@ -1399,7 +1338,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         }
         server::AdminResponse::Status { .. }
         | server::AdminResponse::Ping { .. }
-        | server::AdminResponse::SecretList { .. } => {
+        | server::AdminResponse::SecretExists { .. }
+        | server::AdminResponse::SecretList { .. }
+        | server::AdminResponse::SecretListDetailed { .. } => {
             // session subcommands never request these response variants.
             eprintln!("unexpected response from session admin call");
             std::process::exit(1);
@@ -1481,6 +1422,22 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
 
     match subcommand {
         SecretCommands::Add { key, value } => {
+            let existed = match client
+                .send_admin(server::AdminRequest::SecretExists { key: key.clone() })
+                .await
+            {
+                Ok(server::AdminResponse::SecretExists { exists }) => exists,
+                Ok(server::AdminResponse::Error { .. }) | Err(_) => {
+                    match client.send_admin(server::AdminRequest::SecretList).await? {
+                        server::AdminResponse::SecretList { keys } => {
+                            keys.iter().any(|k| k == &key)
+                        }
+                        server::AdminResponse::Error { message } => anyhow::bail!("{}", message),
+                        other => anyhow::bail!("unexpected admin response: {:?}", other),
+                    }
+                }
+                Ok(other) => anyhow::bail!("unexpected admin response: {:?}", other),
+            };
             let secret_value = if let Some(v) = value {
                 v
             } else if !std::io::stdin().is_terminal() {
@@ -1506,6 +1463,12 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 .await?
             {
                 server::AdminResponse::Ok => {
+                    if existed {
+                        eprintln!(
+                            "warning: secret '{}' already existed and was overwritten",
+                            key
+                        );
+                    }
                     println!("Secret '{}' stored", key);
                     Ok(())
                 }
@@ -1515,22 +1478,45 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
         }
-        SecretCommands::List => match client.send_admin(server::AdminRequest::SecretList).await? {
-            server::AdminResponse::SecretList { keys } => {
-                if keys.is_empty() {
-                    println!("No secrets stored");
-                } else {
-                    for key in keys {
-                        println!("  - {}", key);
+        SecretCommands::List { detailed } => {
+            let request = if detailed {
+                server::AdminRequest::SecretListDetailed
+            } else {
+                server::AdminRequest::SecretList
+            };
+            match client.send_admin(request).await? {
+                server::AdminResponse::SecretList { keys } => {
+                    if keys.is_empty() {
+                        println!("No secrets stored");
+                    } else {
+                        for key in keys {
+                            println!("  - {}", key);
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
+                server::AdminResponse::SecretListDetailed { items } => {
+                    if items.is_empty() {
+                        println!("No secrets stored");
+                    } else {
+                        for item in items {
+                            if item.legacy {
+                                println!("  - {}  origin=legacy", item.key);
+                            } else if let Some(uid) = item.uid {
+                                println!("  - {}  uid={}", item.key, uid);
+                            } else {
+                                println!("  - {}", item.key);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => {
+                    anyhow::bail!("{}", message);
+                }
+                other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
-            server::AdminResponse::Error { message } => {
-                anyhow::bail!("{}", message);
-            }
-            other => anyhow::bail!("unexpected admin response: {:?}", other),
-        },
+        }
         SecretCommands::Remove { key } => {
             match client
                 .send_admin(server::AdminRequest::SecretDelete { key: key.clone() })
@@ -1542,6 +1528,9 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 }
                 server::AdminResponse::Error { message } => {
                     anyhow::bail!("{}", message);
+                }
+                server::AdminResponse::SecretExists { .. } => {
+                    anyhow::bail!("unexpected admin response: secret_exists")
                 }
                 other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
@@ -1558,6 +1547,8 @@ async fn handle_shim(
     secret_vars: Vec<(String, String)>,
     user: Option<String>,
 ) -> Result<()> {
+    let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+    let secret_vars = env_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
     let shim_dir = path.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -2021,6 +2012,31 @@ mod tests {
     }
 
     #[test]
+    fn run_accepts_comma_separated_bare_secret_names() {
+        match MainArgs::try_parse_from(["guard", "run", "--secret", "foo,bar", "sh", "-c", "true"])
+        {
+            Ok(MainArgs::Run {
+                secret_vars,
+                binary,
+                args,
+                ..
+            }) => {
+                assert_eq!(binary, "sh");
+                assert_eq!(args, vec!["-c".to_string(), "true".to_string()]);
+                assert_eq!(
+                    secret_vars,
+                    vec![
+                        ("FOO".to_string(), "foo".to_string()),
+                        ("BAR".to_string(), "bar".to_string())
+                    ]
+                );
+            }
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser rejected comma-separated bare secrets: {}", e),
+        }
+    }
+
+    #[test]
     fn bare_secret_name_derives_shell_safe_env_name() {
         let parsed = parse_secret_mapping("opnsense-apikey-secret").unwrap();
         assert_eq!(
@@ -2137,26 +2153,39 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_command_with_args_falls_back_to_run() {
-        assert!(should_fallback_to_run(
-            &["ssh".to_string(), "host".to_string(), "id".to_string()],
-            clap::error::ErrorKind::InvalidSubcommand
+    fn env_pairs_to_map_rejects_conflicting_duplicate_values() {
+        let err = env_pairs_to_map(vec![
+            ("FOO".to_string(), "one".to_string()),
+            ("FOO".to_string(), "two".to_string()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("conflicting duplicate environment variable injection"));
+    }
+
+    #[test]
+    fn secret_pairs_to_map_allows_idempotent_repeats() {
+        let map = secret_pairs_to_map(vec![
+            ("AWS_TOKEN".to_string(), "aws/token".to_string()),
+            ("AWS_TOKEN".to_string(), "aws/token".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(map.get("AWS_TOKEN").map(String::as_str), Some("aws/token"));
+    }
+
+    #[test]
+    fn singular_secret_alias_parses_as_secrets_subcommand() {
+        let args = MainArgs::try_parse_from(["guard", "secret", "list"]).unwrap();
+        assert!(matches!(
+            args,
+            MainArgs::Secrets(SecretCommands::List { detailed: false })
         ));
     }
 
     #[test]
-    fn known_cli_subcommand_error_does_not_fallback_to_run() {
-        assert!(!should_fallback_to_run(
-            &["server".to_string(), "hlep".to_string()],
-            clap::error::ErrorKind::InvalidSubcommand
-        ));
-        assert!(!should_fallback_to_run(
-            &[
-                "server".to_string(),
-                "start".to_string(),
-                "--bogus".to_string()
-            ],
-            clap::error::ErrorKind::UnknownArgument
-        ));
+    fn unknown_top_level_command_does_not_execute_implicitly() {
+        let err = MainArgs::try_parse_from(["guard", "ssh", "host"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }
