@@ -16,7 +16,8 @@ use crate::redact::{
 };
 use crate::secrets::{SecretManager, LEGACY_UID_SENTINEL};
 use crate::session::{
-    HistoricalGrant, SessionDecision, SessionGrant, SessionGrantSummary, SessionRegistry,
+    HistoricalGrant, SessionDecision, SessionDecisionSource, SessionExecStatus, SessionGrant,
+    SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
 };
 
 // Re-export so main.rs can pattern-match on history status without a
@@ -26,7 +27,9 @@ use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -34,6 +37,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
+use uzers::os::unix::UserExt;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
@@ -125,6 +129,11 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix: Option<u64>,
     },
+    SessionShow {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     SecretSet {
         key: String,
         value: String,
@@ -180,6 +189,9 @@ pub enum AdminResponse {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         history: Vec<HistoricalGrant>,
     },
+    SessionShow {
+        report: SessionReport,
+    },
     SecretList {
         keys: Vec<String>,
     },
@@ -230,6 +242,7 @@ pub struct ServerStatus {
     pub cache_size: usize,
     pub session_count: usize,
     pub daemon_uid: u32,
+    pub exec_identity: String,
     #[serde(default)]
     pub secret_backend: String,
 }
@@ -291,6 +304,9 @@ pub struct ServerConfig {
     /// Session grant registry. Grants here extend or narrow the policy
     /// decision for a specific session token.
     pub sessions: Arc<RwLock<SessionRegistry>>,
+    /// When true, approved Unix-socket requests execute as the connecting
+    /// user instead of the daemon UID.
+    pub exec_as_caller: bool,
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub started_at_unix: u64,
@@ -315,6 +331,7 @@ impl ServerConfig {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        exec_as_caller: bool,
     ) -> Self {
         Self {
             socket_path,
@@ -330,6 +347,7 @@ impl ServerConfig {
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
+            exec_as_caller,
             daemon_uid: current_uid(),
             sessions: Arc::new(RwLock::new(SessionRegistry::new())),
             started_at_unix: std::time::SystemTime::now()
@@ -452,6 +470,7 @@ impl Server {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        exec_as_caller: bool,
     ) -> Self {
         let config = ServerConfig::new(
             socket_path,
@@ -467,6 +486,7 @@ impl Server {
             tool_registry,
             redact_secrets,
             preflight,
+            exec_as_caller,
         );
         Self { config }
     }
@@ -845,6 +865,19 @@ async fn handle_admin_request(
             };
             AdminResponse::SessionList { grants, history }
         }
+        AdminRequest::SessionShow { token, limit } => {
+            {
+                let mut reg = config.sessions.write().await;
+                reg.purge_expired();
+            }
+            let reg = config.sessions.read().await;
+            match reg.show(&token, limit.unwrap_or(20)) {
+                Some(report) => AdminResponse::SessionShow { report },
+                None => AdminResponse::Error {
+                    message: format!("unknown session token: '{}'", token),
+                },
+            }
+        }
         AdminRequest::SecretSet { key, value } => {
             if !is_valid_secret_key(&key) {
                 return AdminResponse::Error {
@@ -1029,6 +1062,11 @@ async fn handle_admin_request(
                     cache_size,
                     session_count,
                     daemon_uid: config.daemon_uid,
+                    exec_identity: if config.exec_as_caller {
+                        "caller".to_string()
+                    } else {
+                        "daemon".to_string()
+                    },
                     secret_backend: config.secrets.backend_name().to_string(),
                 },
             }
@@ -1297,6 +1335,15 @@ impl ExecuteResult {
             },
         }
     }
+
+    fn session_exec_status(&self) -> SessionExecStatus {
+        match self.exec {
+            ExecOutcome::Completed { .. } => SessionExecStatus::Completed,
+            ExecOutcome::Failed { .. } => SessionExecStatus::Failed,
+            ExecOutcome::DryRun => SessionExecStatus::DryRun,
+            ExecOutcome::NotAttempted => SessionExecStatus::NotAttempted,
+        }
+    }
 }
 
 async fn write_stream_message<W: AsyncWrite + Unpin>(
@@ -1355,6 +1402,8 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    let session_token = request.session_token.clone();
+
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
         .ok()
@@ -1364,6 +1413,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         let reason = format!("guard recursion depth exceeded (max {})", MAX_GUARD_DEPTH);
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: request.binary.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1386,6 +1449,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         };
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: request.binary.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1401,6 +1478,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     {
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: command_line.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1432,6 +1523,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
                     let _ =
                         write_policy_decision(stream_output, stream_writer, false, &reason).await;
+                    record_live_session_interaction(
+                        config,
+                        session_token.as_deref(),
+                        SessionInteraction {
+                            at_unix: 0,
+                            command: command_line.clone(),
+                            allowed: false,
+                            source: SessionDecisionSource::SessionDeny,
+                            reason: reason.clone(),
+                            risk: None,
+                            exec_status: SessionExecStatus::NotAttempted,
+                        },
+                    )
+                    .await;
                     return ExecuteResult::denied(reason);
                 }
                 SessionDecision::Allow => {
@@ -1444,16 +1549,31 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                             format!("client stream error: {}", e),
                         );
                     }
-                    return exec_after_approval(
+                    let result = exec_after_approval(
                         request,
                         config,
                         caller,
-                        reason,
+                        reason.clone(),
                         depth,
                         stream_output,
                         stream_writer,
                     )
                     .await;
+                    record_live_session_interaction(
+                        config,
+                        session_token.as_deref(),
+                        SessionInteraction {
+                            at_unix: 0,
+                            command: command_line.clone(),
+                            allowed: true,
+                            source: SessionDecisionSource::SessionAllow,
+                            reason,
+                            risk: None,
+                            exec_status: result.session_exec_status(),
+                        },
+                    )
+                    .await;
+                    return result;
                 }
             }
         }
@@ -1466,6 +1586,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         );
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: command_line.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1473,6 +1607,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: SessionDecisionSource::Validation,
+                    reason: reason.clone(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
             return ExecuteResult::denied(reason);
         }
     }
@@ -1492,40 +1640,166 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         .evaluate_with_context(&command_line, session_prompt.as_deref())
         .await;
 
-    let allow_reason = match eval_result {
-        crate::evaluate::EvalResult::Deny { reason, .. } => {
+    match eval_result {
+        crate::evaluate::EvalResult::Deny {
+            reason,
+            source,
+            risk,
+        } => {
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            return ExecuteResult::denied(reason);
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: session_source_from_eval(source),
+                    reason: reason.clone(),
+                    risk,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            ExecuteResult::denied(reason)
         }
         crate::evaluate::EvalResult::Error(e) => {
             tracing::error!("evaluation error: {}", e);
             let reason = format!("evaluation error: {}", e);
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            return ExecuteResult::denied(reason);
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: SessionDecisionSource::EvaluatorError,
+                    reason: reason.clone(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            ExecuteResult::denied(reason)
         }
-        crate::evaluate::EvalResult::Allow { reason, .. } => {
+        crate::evaluate::EvalResult::Allow {
+            reason,
+            source,
+            risk,
+        } => {
             tracing::debug!("command allowed: {}", reason);
             config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
             if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
             {
                 return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
             }
-            reason
+            let result = exec_after_approval(
+                request,
+                config,
+                caller,
+                reason.clone(),
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line,
+                    allowed: true,
+                    source: session_source_from_eval(source),
+                    reason,
+                    risk,
+                    exec_status: result.session_exec_status(),
+                },
+            )
+            .await;
+            result
         }
-    };
+    }
+}
 
-    exec_after_approval(
-        request,
-        config,
-        caller,
-        allow_reason,
-        depth,
-        stream_output,
-        stream_writer,
-    )
-    .await
+fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecisionSource {
+    match source {
+        crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
+        crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
+    }
+}
+
+async fn record_live_session_interaction(
+    config: &ServerConfig,
+    token: Option<&str>,
+    interaction: SessionInteraction,
+) {
+    let Some(token) = token else {
+        return;
+    };
+    let mut reg = config.sessions.write().await;
+    if reg.has(token) {
+        reg.record_interaction(token, interaction);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExecCallerContext {
+    uid: u32,
+    gid: u32,
+    username: String,
+    home_dir: PathBuf,
+}
+
+fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext> {
+    let user = uzers::get_user_by_uid(uid)
+        .ok_or_else(|| anyhow::anyhow!("caller uid {} does not exist in passwd", uid))?;
+    let username = user
+        .name()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("caller uid {} has a non-utf8 username", uid))?
+        .to_string();
+    Ok(ExecCallerContext {
+        uid,
+        gid: user.primary_group_id(),
+        username,
+        home_dir: user.home_dir().to_path_buf(),
+    })
+}
+
+fn apply_exec_identity(
+    cmd: &mut Command,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+) -> Result<Option<ExecCallerContext>> {
+    if !config.exec_as_caller {
+        return Ok(None);
+    }
+
+    let caller_uid = match caller {
+        CallerIdentity::Unix { uid } => *uid,
+        _ => bail!("exec-as-caller requires a unix socket caller"),
+    };
+    let context = resolve_exec_caller_context(caller_uid)?;
+    let username = CString::new(context.username.clone())
+        .context("caller username contains an interior NUL byte")?;
+    let gid = context.gid;
+
+    cmd.gid(gid);
+    cmd.uid(context.uid);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::initgroups(username.as_ptr(), gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    Ok(Some(context))
 }
 
 /// Execute a command the policy layer has already approved.
@@ -1657,8 +1931,27 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
+    let exec_caller = match apply_exec_identity(&mut cmd, config, caller) {
+        Ok(context) => context,
+        Err(e) => {
+            return ExecuteResult::exec_failed(allow_reason, format!("exec identity error: {}", e));
+        }
+    };
+
     for (key, value) in &tool_env {
         cmd.env(key, value);
+    }
+
+    if let Some(context) = &exec_caller {
+        cmd.env("HOME", &context.home_dir);
+        cmd.env("USER", &context.username);
+        cmd.env("LOGNAME", &context.username);
+        cmd.env_remove("SSH_AUTH_SOCK");
+        cmd.env_remove("XDG_RUNTIME_DIR");
+        let runtime_dir = PathBuf::from(format!("/run/user/{}", context.uid));
+        if runtime_dir.exists() {
+            cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
     }
 
     cmd.env("GUARD_DEPTH", (depth + 1).to_string());
@@ -2147,6 +2440,7 @@ impl Client {
             AdminRequest::SessionGrant { .. } => "session_grant",
             AdminRequest::SessionRevoke { .. } => "session_revoke",
             AdminRequest::SessionList { .. } => "session_list",
+            AdminRequest::SessionShow { .. } => "session_show",
             AdminRequest::SecretSet { .. } => "secret_set",
             AdminRequest::SecretDelete { .. } => "secret_delete",
             AdminRequest::SecretExists { .. } => "secret_exists",
@@ -2874,6 +3168,7 @@ mod tests {
             ToolRegistry::empty(),
             Vec::new(),
             false,
+            false,
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)
@@ -3129,6 +3424,87 @@ mod tests {
                 assert!(hidden.allow.is_empty());
                 assert!(hidden.deny.is_empty());
                 assert_eq!(hidden.prompt_append.as_deref(), Some("(hidden)"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_show_reports_recent_stats() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let token = format!("session-show-{}", std::process::id());
+
+        let grant = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: vec!["echo*".into()],
+                deny: vec!["rm*".into()],
+                ttl_secs: None,
+                prompt_append: Some("operator context".into()),
+            },
+        )
+        .await;
+        assert!(matches!(grant, AdminResponse::Ok));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
+        {
+            let mut reg = cfg.sessions.write().await;
+            reg.record_interaction(
+                &token,
+                SessionInteraction {
+                    at_unix: now.saturating_sub(1),
+                    command: "echo hi".into(),
+                    allowed: true,
+                    source: SessionDecisionSource::Llm,
+                    reason: "safe".into(),
+                    risk: Some(1),
+                    exec_status: SessionExecStatus::Completed,
+                },
+            );
+            reg.record_interaction(
+                &token,
+                SessionInteraction {
+                    at_unix: now,
+                    command: "rm -rf /tmp/x".into(),
+                    allowed: false,
+                    source: SessionDecisionSource::SessionDeny,
+                    reason: "session deny pattern: rm*".into(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            );
+        }
+
+        let show = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionShow {
+                token: token.clone(),
+                limit: Some(1),
+            },
+        )
+        .await;
+        match show {
+            AdminResponse::SessionShow { report } => {
+                assert_eq!(report.stats.total, 2);
+                assert_eq!(report.stats.allowed, 1);
+                assert_eq!(report.stats.denied, 1);
+                assert_eq!(report.stats.risk_histogram[1], 1);
+                assert_eq!(report.recent.len(), 1);
+                assert_eq!(report.recent[0].command, "rm -rf /tmp/x");
+                assert_eq!(
+                    report.active.and_then(|grant| grant.prompt_append),
+                    Some("operator context".into())
+                );
             }
             other => panic!("unexpected {:?}", other),
         }

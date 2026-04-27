@@ -159,6 +159,17 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
+    /// Show one session in detail, including prompt, aggregate stats, and recent interactions.
+    Show {
+        /// Session token to inspect.
+        token: String,
+        /// Number of recent interactions to print.
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
     /// List active session grants
     List {
         /// Include past (revoked/expired) grants. Daemon retains
@@ -334,6 +345,11 @@ enum ServerCommands {
         /// Env: SSH_GUARD_DRY_RUN.
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
         dry_run: bool,
+
+        /// Execute approved Unix-socket requests as the connecting UID instead of the daemon UID.
+        /// Requires a root daemon and no TCP listener.
+        #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
+        exec_as_caller: bool,
 
         /// Path to custom system prompt file for the LLM evaluator
         #[arg(long, value_name = "PATH")]
@@ -555,6 +571,22 @@ fn print_run_help() -> Result<()> {
     Ok(())
 }
 
+fn current_uid() -> u32 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            if let Some(uid_str) = rest.split_whitespace().next() {
+                if let Ok(uid) = uid_str.parse::<u32>() {
+                    return uid;
+                }
+            }
+        }
+    }
+    0
+}
+
 async fn run_server(cmd: ServerCommands) -> Result<()> {
     match cmd {
         ServerCommands::Start {
@@ -579,6 +611,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             cache_capacity,
             cache_ttl,
             dry_run,
+            exec_as_caller,
             system_prompt,
             system_prompt_append,
         } => {
@@ -614,6 +647,24 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .unwrap_or(false);
             if dry_run {
                 tracing::warn!("Dry-run mode enabled: approved commands will not be executed");
+            }
+
+            let exec_as_caller = exec_as_caller
+                || guard_env("EXEC_AS_CALLER")
+                    .as_deref()
+                    .map(parse_env_bool)
+                    .unwrap_or(false);
+            if exec_as_caller {
+                let daemon_uid = current_uid();
+                if daemon_uid != 0 {
+                    anyhow::bail!("--exec-as-caller requires the daemon to start as root");
+                }
+                if tcp_port.is_some() {
+                    anyhow::bail!(
+                        "--exec-as-caller requires a unix socket only; TCP callers do not carry a trusted local UID"
+                    );
+                }
+                tracing::info!("Approved commands will execute as the connecting unix uid");
             }
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
@@ -819,6 +870,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tool_registry,
                 redact_secrets,
                 preflight,
+                exec_as_caller,
             );
             srv.run().await
         }
@@ -1090,6 +1142,7 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
+            println!("  exec_identity  {}", status.exec_identity);
             Ok(())
         }
         Ok(server::AdminResponse::Error { .. }) => {
@@ -1266,6 +1319,17 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         SessionCommands::Revoke { token, socket } => {
             (socket, server::AdminRequest::SessionRevoke { token })
         }
+        SessionCommands::Show {
+            token,
+            limit,
+            socket,
+        } => (
+            socket,
+            server::AdminRequest::SessionShow {
+                token,
+                limit: Some(limit),
+            },
+        ),
         SessionCommands::List {
             history,
             since,
@@ -1332,6 +1396,110 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         h.granted_at,
                         h.ended_at,
                         format_prompt(h.prompt_append.as_deref(), print_full_prompt),
+                    );
+                }
+            }
+        }
+        server::AdminResponse::SessionShow { report } => {
+            if let Some(active) = report.active {
+                println!(
+                    "token={} status=active granted_at={} expires_at={} allow={:?} deny={:?}",
+                    active.token,
+                    active.granted_at,
+                    active
+                        .expires_at
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "(never)".to_string()),
+                    active.allow,
+                    active.deny,
+                );
+                println!(
+                    "prompt={}",
+                    format_prompt(active.prompt_append.as_deref(), true)
+                );
+            } else {
+                println!("status=inactive");
+            }
+
+            for entry in &report.history {
+                let label = match entry.status {
+                    server::HistoricalStatus::Revoked => "revoked",
+                    server::HistoricalStatus::Expired => "expired",
+                };
+                println!(
+                    "history status={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} prompt={}",
+                    label,
+                    entry.granted_at,
+                    entry.ended_at,
+                    entry
+                        .expires_at
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "(never)".to_string()),
+                    entry.allow,
+                    entry.deny,
+                    format_prompt(entry.prompt_append.as_deref(), true),
+                );
+            }
+
+            println!(
+                "stats total={} allowed={} denied={} completed={} exec_failed={} dry_run={} not_attempted={}",
+                report.stats.total,
+                report.stats.allowed,
+                report.stats.denied,
+                report.stats.completed,
+                report.stats.exec_failed,
+                report.stats.dry_run,
+                report.stats.not_attempted,
+            );
+            if !report.stats.source_counts.is_empty() {
+                let sources = report
+                    .stats
+                    .source_counts
+                    .iter()
+                    .map(|(source, count)| format!("{source}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("sources {}", sources);
+            }
+            let histogram = report
+                .stats
+                .risk_histogram
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(risk, count)| format!("{risk}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "risk_histogram {}",
+                if histogram.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    histogram
+                }
+            );
+            if report.recent.is_empty() {
+                println!("recent (none)");
+            } else {
+                for interaction in &report.recent {
+                    let exec = match interaction.exec_status {
+                        session::SessionExecStatus::NotAttempted => "not_attempted",
+                        session::SessionExecStatus::Completed => "completed",
+                        session::SessionExecStatus::Failed => "failed",
+                        session::SessionExecStatus::DryRun => "dry_run",
+                    };
+                    println!(
+                        "recent at={} allowed={} source={:?} risk={} exec={} cmd={:?} reason={:?}",
+                        interaction.at_unix,
+                        interaction.allowed,
+                        interaction.source,
+                        interaction
+                            .risk
+                            .map(|risk| risk.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        exec,
+                        interaction.command,
+                        interaction.reason,
                     );
                 }
             }
@@ -1691,6 +1859,7 @@ mod tests {
                 cache_capacity,
                 cache_ttl,
                 dry_run,
+                exec_as_caller,
                 system_prompt,
                 system_prompt_append,
             }) => ServerCommands::Start {
@@ -1715,6 +1884,7 @@ mod tests {
                 cache_capacity,
                 cache_ttl,
                 dry_run,
+                exec_as_caller,
                 system_prompt,
                 system_prompt_append,
             },
@@ -1759,6 +1929,16 @@ mod tests {
             panic!("expected start");
         };
         assert_eq!(llm_retries, Some(1));
+    }
+
+    #[test]
+    fn test_server_start_exec_as_caller_flag() {
+        let ServerCommands::Start { exec_as_caller, .. } =
+            parse_start(&["guard", "server", "start", "--exec-as-caller"])
+        else {
+            panic!("expected start");
+        };
+        assert!(exec_as_caller);
     }
 
     /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment
