@@ -35,6 +35,8 @@ const ENV_PREFIX: &str = "GUARD_SECRET_";
 /// Filename for the local encrypted secrets file.
 const SECRETS_FILE: &str = "secrets.yaml";
 pub const LEGACY_UID_SENTINEL: u32 = u32::MAX;
+type NamespacedSecretKey = (u32, String);
+type PassStoreEntries = (Vec<NamespacedSecretKey>, Vec<String>);
 
 fn uid_segment(uid: u32) -> String {
     format!("u{}", uid)
@@ -156,7 +158,7 @@ fn pass_store_initialized() -> bool {
 fn collect_pass_entries(
     namespace_root: &Path,
     dir: &Path,
-    namespaced: &mut Vec<(u32, String)>,
+    namespaced: &mut Vec<NamespacedSecretKey>,
     legacy: &mut Vec<String>,
 ) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -203,7 +205,7 @@ fn collect_pass_entries(
     Ok(())
 }
 
-fn list_pass_store_entries(store_dir: &Path) -> Result<(Vec<(u32, String)>, Vec<String>)> {
+fn list_pass_store_entries(store_dir: &Path) -> Result<PassStoreEntries> {
     let namespace_root = store_dir.join(PASS_PREFIX.trim_end_matches('/'));
     if !namespace_root.exists() {
         return Ok((Vec::new(), Vec::new()));
