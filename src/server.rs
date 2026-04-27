@@ -19,6 +19,7 @@ use crate::session::{
     HistoricalGrant, SessionDecision, SessionDecisionSource, SessionExecStatus, SessionGrant,
     SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
 };
+use crate::session_store::SessionStore;
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
@@ -243,6 +244,7 @@ pub struct ServerStatus {
     pub session_count: usize,
     pub daemon_uid: u32,
     pub exec_identity: String,
+    pub state_db_path: Option<String>,
     #[serde(default)]
     pub secret_backend: String,
 }
@@ -304,6 +306,7 @@ pub struct ServerConfig {
     /// Session grant registry. Grants here extend or narrow the policy
     /// decision for a specific session token.
     pub sessions: Arc<RwLock<SessionRegistry>>,
+    pub session_store: Option<SessionStore>,
     /// When true, approved Unix-socket requests execute as the connecting
     /// user instead of the daemon UID.
     pub exec_as_caller: bool,
@@ -313,6 +316,7 @@ pub struct ServerConfig {
     /// Effective UID of the daemon process. Admin RPCs require the
     /// caller to be this UID; there is no token-based elevation.
     pub daemon_uid: u32,
+    pub state_db_path: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -331,7 +335,10 @@ impl ServerConfig {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        sessions: SessionRegistry,
+        session_store: Option<SessionStore>,
         exec_as_caller: bool,
+        state_db_path: Option<PathBuf>,
     ) -> Self {
         Self {
             socket_path,
@@ -347,13 +354,15 @@ impl ServerConfig {
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
+            session_store,
             exec_as_caller,
             daemon_uid: current_uid(),
-            sessions: Arc::new(RwLock::new(SessionRegistry::new())),
+            sessions: Arc::new(RwLock::new(sessions)),
             started_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            state_db_path,
         }
     }
 
@@ -470,7 +479,10 @@ impl Server {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        sessions: SessionRegistry,
+        session_store: Option<SessionStore>,
         exec_as_caller: bool,
+        state_db_path: Option<PathBuf>,
     ) -> Self {
         let config = ServerConfig::new(
             socket_path,
@@ -486,7 +498,10 @@ impl Server {
             tool_registry,
             redact_secrets,
             preflight,
+            sessions,
+            session_store,
             exec_as_caller,
+            state_db_path,
         );
         Self { config }
     }
@@ -795,9 +810,19 @@ async fn handle_admin_request(
                 prompt_append,
                 granted_at: 0, // SessionRegistry::grant fills the current time
             };
-            let mut reg = config.sessions.write().await;
-            reg.purge_expired();
-            reg.grant(token.clone(), grant);
+            let (before, after) = {
+                let mut reg = config.sessions.write().await;
+                reg.purge_expired();
+                let before = reg.clone();
+                reg.grant(token.clone(), grant);
+                (before, reg.clone())
+            };
+            if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
+                *config.sessions.write().await = before;
+                return AdminResponse::Error {
+                    message: format!("failed to persist session grant: {}", err),
+                };
+            }
             tracing::info!(
                 "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?}",
                 caller,
@@ -807,8 +832,18 @@ async fn handle_admin_request(
             AdminResponse::Ok
         }
         AdminRequest::SessionRevoke { token } => {
-            let mut reg = config.sessions.write().await;
-            let removed = reg.revoke(&token);
+            let (removed, before, after) = {
+                let mut reg = config.sessions.write().await;
+                let before = reg.clone();
+                let removed = reg.revoke(&token);
+                (removed, before, reg.clone())
+            };
+            if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
+                *config.sessions.write().await = before;
+                return AdminResponse::Error {
+                    message: format!("failed to persist session revoke: {}", err),
+                };
+            }
             tracing::info!(
                 "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
                 caller,
@@ -826,6 +861,9 @@ async fn handle_admin_request(
             {
                 let mut reg = config.sessions.write().await;
                 reg.purge_expired();
+            }
+            if let Err(err) = persist_current_sessions(config).await {
+                tracing::warn!("failed to persist purged session state: {}", err);
             }
             let reg = config.sessions.read().await;
             let show_prompt =
@@ -869,6 +907,9 @@ async fn handle_admin_request(
             {
                 let mut reg = config.sessions.write().await;
                 reg.purge_expired();
+            }
+            if let Err(err) = persist_current_sessions(config).await {
+                tracing::warn!("failed to persist purged session state: {}", err);
             }
             let reg = config.sessions.read().await;
             match reg.show(&token, limit.unwrap_or(20)) {
@@ -1067,6 +1108,10 @@ async fn handle_admin_request(
                     } else {
                         "daemon".to_string()
                     },
+                    state_db_path: config
+                        .state_db_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
                     secret_backend: config.secrets.backend_name().to_string(),
                 },
             }
@@ -1732,6 +1777,21 @@ fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecis
     }
 }
 
+async fn persist_session_snapshot(
+    session_store: Option<SessionStore>,
+    snapshot: SessionRegistry,
+) -> Result<()> {
+    if let Some(store) = session_store {
+        store.persist_registry(&snapshot).await?;
+    }
+    Ok(())
+}
+
+async fn persist_current_sessions(config: &ServerConfig) -> Result<()> {
+    let snapshot = { config.sessions.read().await.clone() };
+    persist_session_snapshot(config.session_store.clone(), snapshot).await
+}
+
 async fn record_live_session_interaction(
     config: &ServerConfig,
     token: Option<&str>,
@@ -1740,9 +1800,19 @@ async fn record_live_session_interaction(
     let Some(token) = token else {
         return;
     };
-    let mut reg = config.sessions.write().await;
-    if reg.has(token) {
-        reg.record_interaction(token, interaction);
+    let snapshot = {
+        let mut reg = config.sessions.write().await;
+        if reg.has(token) {
+            reg.record_interaction(token, interaction);
+            Some(reg.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(snapshot) = snapshot {
+        if let Err(err) = persist_session_snapshot(config.session_store.clone(), snapshot).await {
+            tracing::warn!("failed to persist session interaction: {}", err);
+        }
     }
 }
 
@@ -3168,7 +3238,10 @@ mod tests {
             ToolRegistry::empty(),
             Vec::new(),
             false,
+            SessionRegistry::new(),
+            None,
             false,
+            None,
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)

@@ -36,3 +36,4 @@ shell-words = "1.0"
 rand = "0.10.1"
 uzers = "0.12.2"
 libc = "0.2.186"
+rusqlite = { version = "0.39.0", features = ["bundled"] }

@@ -9,6 +9,7 @@ mod redact;
 mod secrets;
 mod server;
 mod session;
+mod session_store;
 mod shim;
 mod ssh;
 mod tool_config;
@@ -346,6 +347,11 @@ enum ServerCommands {
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
         dry_run: bool,
 
+        /// SQLite state database path for persistent sessions and session history.
+        /// Env: SSH_GUARD_STATE_DB.
+        #[arg(long, value_name = "PATH")]
+        state_db: Option<PathBuf>,
+
         /// Execute approved Unix-socket requests as the connecting UID instead of the daemon UID.
         /// Requires a root daemon and no TCP listener.
         #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
@@ -587,6 +593,10 @@ fn current_uid() -> u32 {
     0
 }
 
+fn default_state_db_path() -> Option<PathBuf> {
+    dirs::state_dir().map(|dir| dir.join("guard").join("state.db"))
+}
+
 async fn run_server(cmd: ServerCommands) -> Result<()> {
     match cmd {
         ServerCommands::Start {
@@ -611,6 +621,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             cache_capacity,
             cache_ttl,
             dry_run,
+            state_db,
             exec_as_caller,
             system_prompt,
             system_prompt_append,
@@ -647,6 +658,17 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .unwrap_or(false);
             if dry_run {
                 tracing::warn!("Dry-run mode enabled: approved commands will not be executed");
+            }
+
+            let state_db_path = state_db
+                .or_else(|| {
+                    guard_env("STATE_DB")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                })
+                .or_else(default_state_db_path);
+            if let Some(ref path) = state_db_path {
+                tracing::info!("State DB: {}", path.display());
             }
 
             let exec_as_caller = exec_as_caller
@@ -855,6 +877,22 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
+            let (sessions, session_store) = if let Some(ref path) = state_db_path {
+                let store = session_store::SessionStore::open(
+                    path.clone(),
+                    session::DEFAULT_HISTORY_RETENTION_SECS,
+                )
+                .await
+                .with_context(|| format!("failed to open state db {}", path.display()))?;
+                let sessions = store
+                    .load_registry()
+                    .await
+                    .with_context(|| format!("failed to load state db {}", path.display()))?;
+                (sessions, Some(store))
+            } else {
+                (session::SessionRegistry::new(), None)
+            };
+
             tracing::info!("Creating server instance...");
             let srv = server::Server::new(
                 socket_path,
@@ -870,7 +908,10 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tool_registry,
                 redact_secrets,
                 preflight,
+                sessions,
+                session_store,
                 exec_as_caller,
+                state_db_path,
             );
             srv.run().await
         }
@@ -1143,6 +1184,9 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
             println!("  exec_identity  {}", status.exec_identity);
+            if let Some(ref path) = status.state_db_path {
+                println!("  state_db       {}", path);
+            }
             Ok(())
         }
         Ok(server::AdminResponse::Error { .. }) => {
@@ -1859,6 +1903,7 @@ mod tests {
                 cache_capacity,
                 cache_ttl,
                 dry_run,
+                state_db,
                 exec_as_caller,
                 system_prompt,
                 system_prompt_append,
@@ -1884,6 +1929,7 @@ mod tests {
                 cache_capacity,
                 cache_ttl,
                 dry_run,
+                state_db,
                 exec_as_caller,
                 system_prompt,
                 system_prompt_append,
@@ -1939,6 +1985,20 @@ mod tests {
             panic!("expected start");
         };
         assert!(exec_as_caller);
+    }
+
+    #[test]
+    fn test_server_start_state_db_flag() {
+        let ServerCommands::Start { state_db, .. } = parse_start(&[
+            "guard",
+            "server",
+            "start",
+            "--state-db",
+            "/var/lib/guard/state.db",
+        ]) else {
+            panic!("expected start");
+        };
+        assert_eq!(state_db, Some(PathBuf::from("/var/lib/guard/state.db")));
     }
 
     /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment

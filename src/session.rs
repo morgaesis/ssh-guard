@@ -1,4 +1,4 @@
-//! In-memory session grant registry.
+//! Session grant registry and reporting model.
 //!
 //! A session is an opaque token the caller includes in `ExecuteRequest`.
 //! Grants attach extra allow/deny glob patterns to that token. Session
@@ -8,8 +8,9 @@
 //! /tmp/work/*", "rm /tmp/work/scratch.txt") without relaxing the
 //! global mode.
 //!
-//! Grants are in-memory only. They clear on daemon restart, matching
-//! the "short-lived extra trust" semantics of sudo timestamps.
+//! The daemon keeps a live in-memory registry for fast decision checks,
+//! while `session_store.rs` persists grants and bounded interaction
+//! history across daemon restarts.
 
 use guard::policy::{Decision, PolicyRule};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default daemon-side history retention. Anything older than this is
 /// dropped on the next opportunistic purge. 24h matches the "I want
 /// to debug what an agent did yesterday" use case without growing the
-/// in-memory log unboundedly.
+/// persisted interaction history unboundedly.
 pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,7 +178,7 @@ struct StoredSessionInteraction {
     interaction: SessionInteraction,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionRegistry {
     grants: HashMap<String, SessionGrant>,
     history: Vec<HistoricalGrant>,
@@ -204,6 +205,38 @@ impl SessionRegistry {
     pub fn with_history_retention(mut self, secs: u64) -> Self {
         self.history_retention_secs = secs;
         self
+    }
+
+    pub fn from_parts(
+        grants: HashMap<String, SessionGrant>,
+        history: Vec<HistoricalGrant>,
+        interactions: Vec<(String, SessionInteraction)>,
+        history_retention_secs: u64,
+    ) -> Self {
+        Self {
+            grants,
+            history,
+            interactions: interactions
+                .into_iter()
+                .map(|(token, interaction)| StoredSessionInteraction { token, interaction })
+                .collect(),
+            history_retention_secs,
+        }
+    }
+
+    pub fn grants_snapshot(&self) -> HashMap<String, SessionGrant> {
+        self.grants.clone()
+    }
+
+    pub fn history_snapshot(&self) -> Vec<HistoricalGrant> {
+        self.history.clone()
+    }
+
+    pub fn interactions_snapshot(&self) -> Vec<(String, SessionInteraction)> {
+        self.interactions
+            .iter()
+            .map(|entry| (entry.token.clone(), entry.interaction.clone()))
+            .collect()
     }
 
     pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
