@@ -66,6 +66,12 @@ Install the binary:
 install -m 0755 guard /usr/local/bin/guard
 ```
 
+Create the service user:
+
+```bash
+useradd --system --home-dir /var/lib/guard --create-home --shell /usr/sbin/nologin guard
+```
+
 Install the environment file:
 
 ```bash
@@ -78,6 +84,10 @@ Install the unit:
 ```bash
 install -m 0644 deployment/systemd/guard.service /etc/systemd/system/guard.service
 ```
+
+By default, any local UNIX-socket caller can submit requests. To restrict
+access to specific client UIDs, add a comma-separated `--users` list to
+`ExecStart`, for example `--users 1000,1001`.
 
 Reload and start:
 
@@ -97,7 +107,8 @@ ls -l /run/guard/guard.sock
 
 - The service runs in server mode over a UNIX socket.
 - The socket can be world-connectable at the filesystem layer because authorization is enforced by peer UID in the server.
-- Restrict access with `--users` to the client UIDs that should be able to submit requests.
+- Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
+- The packaged unit stores persistent session state at `/var/lib/guard/state.db`, which remains writable under the default systemd sandbox profile.
 - For LLM-backed evaluation, provide credentials through the environment file rather than command-line arguments.
 - For static-policy-only deployments, use `--no-llm` and provide a `--policy` file.
 - Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `SSH_GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
