@@ -23,24 +23,104 @@ on:
       - opened
       - reopened
       - synchronize
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Dependabot pull request number to process"
+        required: true
+        type: number
 
 permissions:
   contents: read
 
 jobs:
   automerge:
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       issues: write
       pull-requests: write
     steps:
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          pr_number="${DISPATCH_PR_NUMBER:-${EVENT_PR_NUMBER:-}}"
+          if [ -z "$pr_number" ]; then
+            echo "No pull request number was provided."
+            exit 1
+          fi
+
+          author="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.user.login')"
+          if [ "$author" != "dependabot[bot]" ]; then
+            echo "PR #${pr_number} was opened by ${author}, not dependabot[bot]."
+            exit 1
+          fi
+
+          {
+            echo "number=${pr_number}"
+            echo "url=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.html_url')"
+            echo "head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
+            echo "head_ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.ref')"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Resolve update metadata
-        id: meta
+        id: fetch_meta
+        if: github.event_name == 'pull_request_target'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           alert-lookup: true
+
+      - name: Resolve dispatched update metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          FETCH_UPDATE_TYPE: ${{ steps.fetch_meta.outputs.update-type }}
+          FETCH_ALERT_STATE: ${{ steps.fetch_meta.outputs.alert-state }}
+          FETCH_PACKAGE_ECOSYSTEM: ${{ steps.fetch_meta.outputs.package-ecosystem }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          update_type="$FETCH_UPDATE_TYPE"
+          alert_state="$FETCH_ALERT_STATE"
+          package_ecosystem="$FETCH_PACKAGE_ECOSYSTEM"
+
+          if [ -z "$update_type" ]; then
+            body="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""')"
+            update_type="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*-[[:space:]]*update-type:[[:space:]]*//p' | head -1)"
+          fi
+          if [ -z "$update_type" ]; then
+            case "$HEAD_REF" in
+              *major*) update_type="version-update:semver-major" ;;
+              *minor*) update_type="version-update:semver-minor" ;;
+              *patch*) update_type="version-update:semver-patch" ;;
+            esac
+          fi
+
+          if [ -z "$package_ecosystem" ]; then
+            files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')"
+            if printf '%s\n' "$files" | grep -Eq '^\.github/workflows/'; then
+              package_ecosystem="github_actions"
+            elif printf '%s\n' "$files" | grep -Eq '(^|/)Cargo\.(toml|lock)$'; then
+              package_ecosystem="cargo"
+            else
+              package_ecosystem="unknown"
+            fi
+          fi
+
+          {
+            echo "update-type=${update_type}"
+            echo "alert-state=${alert_state}"
+            echo "package-ecosystem=${package_ecosystem}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Approve and enable auto-merge for safe bumps
         if: >-
@@ -50,7 +130,7 @@ jobs:
           steps.meta.outputs.package-ecosystem == 'github_actions'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
           gh pr review --approve "$PR_URL" || \
             echo "::warning::Could not approve PR with GITHUB_TOKEN; enabling auto-merge anyway."
@@ -63,8 +143,8 @@ jobs:
           steps.meta.outputs.package-ecosystem != 'github_actions'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           mkdir -p .cache/dependabot-review
           gh pr diff "$PR_URL" --patch > .cache/dependabot-review/diff.patch
@@ -98,7 +178,7 @@ jobs:
           steps.meta.outputs.package-ecosystem != 'github_actions'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_URL: ${{ steps.pr.outputs.url }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           if [ -n "$OPENROUTER_API_KEY" ]; then
@@ -185,7 +265,7 @@ jobs:
           steps.ai.outputs.manual == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
           gh label create "needs-manual-review" \
             --repo "$GITHUB_REPOSITORY" \
@@ -205,7 +285,7 @@ jobs:
           steps.ai.outputs.manual == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_URL: ${{ steps.pr.outputs.url }}
           SUMMARY: ${{ steps.ai.outputs.summary }}
         run: |
           gh label create "needs-manual-review" \
@@ -227,7 +307,7 @@ jobs:
           steps.ai.outputs.manual == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_URL: ${{ steps.pr.outputs.url }}
           SUMMARY: ${{ steps.ai.outputs.summary }}
         run: |
           gh pr comment "$PR_URL" --body "AI review did not require human review.
