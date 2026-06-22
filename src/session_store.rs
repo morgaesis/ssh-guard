@@ -63,7 +63,7 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, expires_at, prompt_append, granted_at
+                "SELECT token, allow_json, deny_json, expires_at, prompt_append, granted_at, static_only
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -78,6 +78,7 @@ impl SessionStore {
                         expires_at: decode_optional_u64(row.get(3)?)?,
                         prompt_append: row.get(4)?,
                         granted_at: decode_u64(row.get(5)?)?,
+                        static_only: decode_bool(row.get(6)?)?,
                     },
                 ))
             })?;
@@ -90,7 +91,7 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, granted_at, expires_at, ended_at, status, prompt_append
+                "SELECT token, allow_json, deny_json, granted_at, expires_at, ended_at, status, prompt_append, static_only
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
@@ -107,6 +108,7 @@ impl SessionStore {
                     ended_at: decode_u64(row.get(5)?)?,
                     status: decode_historical_status(&status)?,
                     prompt_append: row.get(7)?,
+                    static_only: decode_bool(row.get(8)?)?,
                 })
             })?;
             for row in rows {
@@ -169,15 +171,16 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, expires_at, prompt_append, granted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (token, allow_json, deny_json, expires_at, prompt_append, granted_at, static_only)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
                     encode_vec(&grant.deny)?,
                     encode_optional_u64(grant.expires_at)?,
                     grant.prompt_append,
-                    encode_u64(grant.granted_at)?
+                    encode_u64(grant.granted_at)?,
+                    encode_bool(grant.static_only)
                 ],
             )?;
         }
@@ -185,8 +188,8 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, granted_at, expires_at, ended_at, status, prompt_append)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (token, allow_json, deny_json, granted_at, expires_at, ended_at, status, prompt_append, static_only)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
@@ -195,7 +198,8 @@ impl SessionStore {
                     encode_optional_u64(grant.expires_at)?,
                     encode_u64(grant.ended_at)?,
                     encode_historical_status(grant.status),
-                    grant.prompt_append
+                    grant.prompt_append,
+                    encode_bool(grant.static_only)
                 ],
             )?;
         }
@@ -241,7 +245,8 @@ impl SessionStore {
                 deny_json TEXT NOT NULL,
                 expires_at INTEGER,
                 prompt_append TEXT,
-                granted_at INTEGER NOT NULL
+                granted_at INTEGER NOT NULL,
+                static_only INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS session_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,7 +257,8 @@ impl SessionStore {
                 expires_at INTEGER,
                 ended_at INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                prompt_append TEXT
+                prompt_append TEXT,
+                static_only INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_session_history_token ON session_history(token);
             CREATE INDEX IF NOT EXISTS idx_session_history_ended_at ON session_history(ended_at);
@@ -269,6 +275,18 @@ impl SessionStore {
             );
             CREATE INDEX IF NOT EXISTS idx_session_interactions_token ON session_interactions(token);
             CREATE INDEX IF NOT EXISTS idx_session_interactions_at ON session_interactions(at_unix);",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "static_only",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "static_only",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
     }
@@ -296,6 +314,18 @@ fn decode_optional_u64(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
     value.map(decode_u64).transpose()
 }
 
+fn encode_bool(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn decode_bool(value: i64) -> rusqlite::Result<bool> {
+    Ok(value != 0)
+}
+
 fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
     serde_json::from_str(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -304,6 +334,21 @@ fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
             Box::new(err),
         )
     })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn encode_historical_status(status: HistoricalStatus) -> &'static str {
@@ -329,6 +374,7 @@ fn encode_decision_source(source: SessionDecisionSource) -> &'static str {
     match source {
         SessionDecisionSource::SessionAllow => "session_allow",
         SessionDecisionSource::SessionDeny => "session_deny",
+        SessionDecisionSource::SessionStaticOnly => "session_static_only",
         SessionDecisionSource::Llm => "llm",
         SessionDecisionSource::StaticPolicy => "static_policy",
         SessionDecisionSource::Validation => "validation",
@@ -340,6 +386,7 @@ fn decode_decision_source(value: &str) -> rusqlite::Result<SessionDecisionSource
     match value {
         "session_allow" => Ok(SessionDecisionSource::SessionAllow),
         "session_deny" => Ok(SessionDecisionSource::SessionDeny),
+        "session_static_only" => Ok(SessionDecisionSource::SessionStaticOnly),
         "llm" => Ok(SessionDecisionSource::Llm),
         "static_policy" => Ok(SessionDecisionSource::StaticPolicy),
         "validation" => Ok(SessionDecisionSource::Validation),
@@ -399,6 +446,7 @@ mod tests {
                 expires_at: None,
                 prompt_append: Some("persistent".into()),
                 granted_at: now.saturating_sub(2),
+                static_only: true,
             },
         );
         let registry = SessionRegistry::from_parts(
@@ -412,6 +460,7 @@ mod tests {
                 ended_at: now.saturating_sub(5),
                 status: HistoricalStatus::Revoked,
                 prompt_append: None,
+                static_only: false,
             }],
             vec![(
                 "tok".into(),
@@ -442,6 +491,7 @@ mod tests {
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
         );
+        assert!(loaded.static_only_for("tok"));
         assert_eq!(loaded.list_history(None).len(), 1);
     }
 }

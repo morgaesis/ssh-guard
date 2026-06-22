@@ -7,6 +7,7 @@ pub struct ClientConfig {
     pub server_socket: Option<String>,
     pub server_tcp_port: Option<u16>,
     pub auth_token: Option<String>,
+    pub admin_token: Option<String>,
     pub default_user: Option<String>,
 }
 

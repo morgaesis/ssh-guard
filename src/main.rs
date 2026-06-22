@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 mod client_config;
+mod grant_rules;
 mod injection;
 mod mcp;
 mod redact;
@@ -94,6 +95,38 @@ enum MainArgs {
     /// Manage session grants (extra allow/deny for a specific session token)
     #[clap(subcommand)]
     Session(SessionCommands),
+    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`
+    Grant {
+        /// Opaque session token to update, or quoted prose to create a fresh session.
+        token: Option<String>,
+        /// Prose describing the intended access. Known domains are compiled to
+        /// static session rules; misses fall through to the LLM unless
+        /// --static-only is set.
+        #[arg(value_name = "PROSE")]
+        prose: Option<String>,
+        /// Glob pattern to allow in this session (repeatable)
+        #[arg(long = "allow", value_name = "GLOB")]
+        allow: Vec<String>,
+        /// Glob pattern to deny in this session (repeatable, beats allow)
+        #[arg(long = "deny", value_name = "GLOB")]
+        deny: Vec<String>,
+        /// Time-to-live in seconds; omit for no expiry
+        #[arg(long, value_name = "SECONDS")]
+        ttl: Option<u64>,
+        /// Free-form context appended to the LLM system prompt for evaluator
+        /// calls made under this session token.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
+        /// Read prompt from a file (alternative to --prompt).
+        #[arg(long, value_name = "PATH")]
+        prompt_file: Option<PathBuf>,
+        /// Deny session-rule misses instead of falling through to the LLM.
+        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        static_only: bool,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
     /// Show daemon status. Always prints client + server version,
     /// uptime, evaluation mode, and dry-run state. The full config
     /// snapshot is restricted to the daemon UID.
@@ -110,6 +143,11 @@ enum SessionCommands {
     /// trip. Prints `export GUARD_SESSION=<token>` on stdout so you can
     /// `eval $(guard session new ...)` to set it for the current shell.
     New {
+        /// Prose describing the intended access. Known domains are compiled to
+        /// static session rules; misses fall through to the LLM unless
+        /// --static-only is set.
+        #[arg(value_name = "PROSE")]
+        prose: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
         allow: Vec<String>,
@@ -125,6 +163,9 @@ enum SessionCommands {
         /// Read session context from a file.
         #[arg(long, value_name = "PATH")]
         prompt_file: Option<PathBuf>,
+        /// Deny session-rule misses instead of falling through to the LLM.
+        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        static_only: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -133,6 +174,11 @@ enum SessionCommands {
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
         token: String,
+        /// Prose describing the intended access. Known domains are compiled to
+        /// static session rules; misses fall through to the LLM unless
+        /// --static-only is set.
+        #[arg(value_name = "PROSE")]
+        prose: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
         allow: Vec<String>,
@@ -151,6 +197,9 @@ enum SessionCommands {
         /// exclusive with --prompt; --prompt-file wins if both are given.
         #[arg(long, value_name = "PATH")]
         prompt_file: Option<PathBuf>,
+        /// Deny session-rule misses instead of falling through to the LLM.
+        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        static_only: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -264,6 +313,11 @@ enum ServerCommands {
         /// Env: SSH_GUARD_AUTH_TOKEN.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
+
+        /// Separate token required for non-Ping TCP admin RPCs.
+        /// Env: SSH_GUARD_ADMIN_TOKEN.
+        #[arg(long, value_name = "TOKEN")]
+        admin_token: Option<String>,
 
         /// Group owning the UNIX socket.
         #[arg(long, value_name = "GROUP")]
@@ -450,6 +504,11 @@ enum ConfigCommands {
         /// Shared token for TCP connections.
         token: String,
     },
+    /// Set admin token
+    SetAdminToken {
+        /// Separate token for TCP admin RPCs.
+        token: String,
+    },
     /// Set default user
     SetUser {
         /// Default user label for client configuration.
@@ -564,6 +623,30 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
+        Ok(MainArgs::Grant {
+            token,
+            prose,
+            allow,
+            deny,
+            ttl,
+            prompt,
+            prompt_file,
+            static_only,
+            socket,
+        }) => {
+            handle_session(top_level_grant_to_session_command(
+                token,
+                prose,
+                allow,
+                deny,
+                ttl,
+                prompt,
+                prompt_file,
+                static_only,
+                socket,
+            ))
+            .await
+        }
         Ok(MainArgs::Status { socket }) => handle_status(socket).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
@@ -643,6 +726,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             socket,
             tcp_port,
             auth_token,
+            admin_token,
             socket_group,
             users,
             policy,
@@ -713,6 +797,14 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if tcp_port.is_some() && auth_token.is_none() {
                 anyhow::bail!(
                     "TCP server requires --auth-token or SSH_GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
+                );
+            }
+            let admin_token = admin_token
+                .filter(|token| !token.is_empty())
+                .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
+            if tcp_port.is_some() && admin_token.is_none() {
+                tracing::warn!(
+                    "TCP admin RPCs other than ping are disabled; set --admin-token or SSH_GUARD_ADMIN_TOKEN to use guard grant/status over TCP"
                 );
             }
 
@@ -1029,6 +1121,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 secrets,
                 redact,
                 auth_token,
+                admin_token,
                 socket_group,
                 allowed_uids,
                 shim_dir,
@@ -1276,10 +1369,23 @@ fn resolve_client_endpoint(
     }
 }
 
+fn admin_client(
+    socket_path: Option<PathBuf>,
+    tcp_port: Option<u16>,
+    config: &client_config::ClientConfig,
+) -> server::Client {
+    let client = server::Client::new(socket_path, tcp_port);
+    if let Some(token) = config.admin_token.clone() {
+        client.with_admin_token(token)
+    } else {
+        client
+    }
+}
+
 async fn handle_status(socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
-    let client = server::Client::new(socket_path.clone(), tcp_port);
+    let client = admin_client(socket_path.clone(), tcp_port, &config);
 
     // Client info first — useful even when the daemon is unreachable.
     println!("Client:");
@@ -1317,8 +1423,8 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
     println!("  mode           {}", mode);
     println!("  dry_run        {}", dry_run);
 
-    // Try the full Status RPC. Succeeds when the caller is the daemon
-    // UID; refused otherwise. There is no client-side admin token.
+    // Try the full Status RPC. Succeeds for daemon-UID Unix callers or
+    // TCP callers with the configured admin token.
     match client.send_admin(server::AdminRequest::Status).await {
         Ok(server::AdminResponse::Status { status }) => {
             if let Some(ref s) = status.socket_path {
@@ -1388,6 +1494,18 @@ fn format_prompt(prompt: Option<&str>, full: bool) -> String {
     }
 }
 
+fn read_grant_prompt(
+    prompt: Option<String>,
+    prompt_file: Option<&PathBuf>,
+) -> Result<Option<String>> {
+    match prompt_file {
+        Some(path) => Ok(Some(std::fs::read_to_string(path).with_context(|| {
+            format!("failed to read --prompt-file {}", path.display())
+        })?)),
+        None => Ok(prompt),
+    }
+}
+
 /// Parse a `--since` value into an absolute unix-seconds threshold.
 /// Accepts plain integer seconds or simple suffixes: `s`, `m`, `h`, `d`.
 fn parse_since_to_unix(value: &str) -> Result<u64> {
@@ -1426,6 +1544,54 @@ fn generate_session_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn top_level_grant_to_session_command(
+    token_or_prose: Option<String>,
+    prose: Option<String>,
+    allow: Vec<String>,
+    deny: Vec<String>,
+    ttl: Option<u64>,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    static_only: bool,
+    socket: Option<String>,
+) -> SessionCommands {
+    let single_positional_prose = prose.is_none()
+        && token_or_prose
+            .as_deref()
+            .is_some_and(looks_like_quoted_grant_prose);
+
+    if token_or_prose.is_none() || single_positional_prose {
+        let prose = prose.or(token_or_prose);
+        SessionCommands::New {
+            prose,
+            allow,
+            deny,
+            ttl,
+            prompt,
+            prompt_file,
+            static_only,
+            socket,
+        }
+    } else {
+        SessionCommands::Grant {
+            token: token_or_prose.expect("checked Some above"),
+            prose,
+            allow,
+            deny,
+            ttl,
+            prompt,
+            prompt_file,
+            static_only,
+            socket,
+        }
+    }
+}
+
+fn looks_like_quoted_grant_prose(value: &str) -> bool {
+    value.split_whitespace().nth(1).is_some()
+}
+
 async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -1433,38 +1599,38 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     // send. If no grant flags are present we just print and exit; otherwise
     // we send a SessionGrant for the freshly-minted token.
     if let SessionCommands::New {
+        prose,
         allow,
         deny,
         ttl,
         prompt,
         prompt_file,
+        static_only,
         socket,
     } = &subcommand
     {
         let token = generate_session_token();
-        let has_grant = !allow.is_empty()
+        let has_grant = prose.is_some()
+            || !allow.is_empty()
             || !deny.is_empty()
             || ttl.is_some()
             || prompt.is_some()
-            || prompt_file.is_some();
+            || prompt_file.is_some()
+            || *static_only;
 
         if has_grant {
-            let prompt_append =
-                match prompt_file {
-                    Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
-                        format!("failed to read --prompt-file {}", path.display())
-                    })?),
-                    None => prompt.clone(),
-                };
+            let prompt_append = read_grant_prompt(prompt.clone(), prompt_file.as_ref())?;
 
             let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
-            let client = server::Client::new(socket_path, tcp_port);
+            let client = admin_client(socket_path, tcp_port, &config);
             let request = server::AdminRequest::SessionGrant {
                 token: token.clone(),
                 allow: allow.clone(),
                 deny: deny.clone(),
                 ttl_secs: *ttl,
                 prompt_append,
+                prose: prose.clone(),
+                static_only: *static_only,
             };
             match client.send_admin(request).await? {
                 server::AdminResponse::Ok => {}
@@ -1499,20 +1665,16 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         SessionCommands::New { .. } => unreachable!("handled above"),
         SessionCommands::Grant {
             token,
+            prose,
             allow,
             deny,
             ttl,
             prompt,
             prompt_file,
+            static_only,
             socket,
         } => {
-            let prompt_append =
-                match prompt_file {
-                    Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
-                        format!("failed to read --prompt-file {}", path.display())
-                    })?),
-                    None => prompt,
-                };
+            let prompt_append = read_grant_prompt(prompt, prompt_file.as_ref())?;
             (
                 socket,
                 server::AdminRequest::SessionGrant {
@@ -1521,6 +1683,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     deny,
                     ttl_secs: ttl,
                     prompt_append,
+                    prose,
+                    static_only,
                 },
             )
         }
@@ -1563,7 +1727,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     };
 
     let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
-    let client = server::Client::new(socket_path, tcp_port);
+    let client = admin_client(socket_path, tcp_port, &config);
 
     match client.send_admin(request).await? {
         server::AdminResponse::Ok => {
@@ -1579,10 +1743,11 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             } else {
                 for g in &grants {
                     println!(
-                        "[active]  token={} allow={:?} deny={:?} granted_at={} expires_at={} prompt={}",
+                        "[active]  token={} allow={:?} deny={:?} static_only={} granted_at={} expires_at={} prompt={}",
                         g.token,
                         g.allow,
                         g.deny,
+                        g.static_only,
                         g.granted_at,
                         g.expires_at
                             .map(|t| t.to_string())
@@ -1596,11 +1761,12 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         server::HistoricalStatus::Expired => "[expired]",
                     };
                     println!(
-                        "{} token={} allow={:?} deny={:?} granted_at={} ended_at={} prompt={}",
+                        "{} token={} allow={:?} deny={:?} static_only={} granted_at={} ended_at={} prompt={}",
                         label,
                         h.token,
                         h.allow,
                         h.deny,
+                        h.static_only,
                         h.granted_at,
                         h.ended_at,
                         format_prompt(h.prompt_append.as_deref(), print_full_prompt),
@@ -1611,8 +1777,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         server::AdminResponse::SessionShow { report } => {
             if let Some(active) = report.active {
                 println!(
-                    "token={} status=active granted_at={} expires_at={} allow={:?} deny={:?}",
+                    "token={} status=active static_only={} granted_at={} expires_at={} allow={:?} deny={:?}",
                     active.token,
+                    active.static_only,
                     active.granted_at,
                     active
                         .expires_at
@@ -1635,8 +1802,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     server::HistoricalStatus::Expired => "expired",
                 };
                 println!(
-                    "history status={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} prompt={}",
+                    "history status={} static_only={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} prompt={}",
                     label,
+                    entry.static_only,
                     entry.granted_at,
                     entry.ended_at,
                     entry
@@ -1751,6 +1919,14 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
                     "(none)"
                 }
             );
+            println!(
+                "admin_token: {}",
+                if config.admin_token.is_some() {
+                    "***"
+                } else {
+                    "(none)"
+                }
+            );
         }
         ConfigCommands::SetServer { socket } => {
             let mut config =
@@ -1775,6 +1951,13 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             config.save()?;
             println!("Token set");
         }
+        ConfigCommands::SetAdminToken { token } => {
+            let mut config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
+            config.admin_token = Some(token);
+            config.save()?;
+            println!("Admin token set");
+        }
         ConfigCommands::SetUser { user } => {
             let mut config =
                 client_config::ClientConfig::load().context("failed to load client config")?;
@@ -1794,7 +1977,7 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
 async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
-    let client = server::Client::new(socket_path, tcp_port);
+    let client = admin_client(socket_path, tcp_port, &config);
 
     match subcommand {
         SecretCommands::Add { key, value } => {
@@ -2049,6 +2232,7 @@ mod tests {
                 socket,
                 tcp_port,
                 auth_token,
+                admin_token,
                 socket_group,
                 users,
                 policy,
@@ -2080,6 +2264,7 @@ mod tests {
                 socket,
                 tcp_port,
                 auth_token,
+                admin_token,
                 socket_group,
                 users,
                 policy,
@@ -2173,6 +2358,117 @@ mod tests {
             panic!("expected start");
         };
         assert_eq!(state_db, Some(PathBuf::from("/var/lib/guard/state.db")));
+    }
+
+    #[test]
+    fn test_server_start_admin_token_flag() {
+        let ServerCommands::Start { admin_token, .. } =
+            parse_start(&["guard", "server", "start", "--admin-token", "adm"])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(admin_token.as_deref(), Some("adm"));
+    }
+
+    #[test]
+    fn top_level_grant_parses_prose_and_static_only() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "tok",
+            "--static-only",
+            "readonly nextcloud kube access",
+        ]) {
+            Ok(MainArgs::Grant {
+                token,
+                prose,
+                static_only,
+                ..
+            }) => {
+                assert_eq!(token.as_deref(), Some("tok"));
+                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert!(static_only);
+            }
+            Ok(_) => panic!("expected top-level grant"),
+            Err(err) => panic!("expected grant parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn top_level_grant_bare_prose_mints_session() {
+        let command = top_level_grant_to_session_command(
+            Some("readonly nextcloud kube access".to_string()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(120),
+            None,
+            None,
+            true,
+            None,
+        );
+
+        match command {
+            SessionCommands::New {
+                prose,
+                ttl,
+                static_only,
+                ..
+            } => {
+                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert_eq!(ttl, Some(120));
+                assert!(static_only);
+            }
+            _ => panic!("expected top-level prose grant to mint a session"),
+        }
+    }
+
+    #[test]
+    fn top_level_grant_single_word_keeps_token_path() {
+        let command = top_level_grant_to_session_command(
+            Some("tok".to_string()),
+            None,
+            vec!["whoami".to_string()],
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+
+        match command {
+            SessionCommands::Grant { token, allow, .. } => {
+                assert_eq!(token, "tok");
+                assert_eq!(allow, vec!["whoami"]);
+            }
+            _ => panic!("expected single-word top-level grant to update a session"),
+        }
+    }
+
+    #[test]
+    fn session_grant_parses_prose_and_static_only_alias() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "session",
+            "grant",
+            "tok",
+            "--no-llm-fallback",
+            "readonly nextcloud kube access",
+        ]) {
+            Ok(MainArgs::Session(SessionCommands::Grant {
+                token,
+                prose,
+                static_only,
+                ..
+            })) => {
+                assert_eq!(token, "tok");
+                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert!(static_only);
+            }
+            Ok(_) => panic!("expected session grant"),
+            Err(err) => panic!("expected session grant parse, got {err}"),
+        }
     }
 
     /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment

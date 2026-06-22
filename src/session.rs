@@ -36,6 +36,10 @@ pub struct SessionGrant {
     /// related psql copy commands as expected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    /// If true, commands that miss the grant's static allow/deny rules are
+    /// denied instead of falling through to the normal evaluator.
+    #[serde(default)]
+    pub static_only: bool,
     /// Unix seconds when the grant was installed. Used by `session
     /// list` to show grant age.
     #[serde(default)]
@@ -67,6 +71,8 @@ pub struct HistoricalGrant {
     pub status: HistoricalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default)]
+    pub static_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +91,8 @@ pub struct SessionGrantSummary {
     pub granted_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default)]
+    pub static_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +100,7 @@ pub struct SessionGrantSummary {
 pub enum SessionDecisionSource {
     SessionAllow,
     SessionDeny,
+    SessionStaticOnly,
     Llm,
     StaticPolicy,
     Validation,
@@ -103,6 +112,7 @@ impl SessionDecisionSource {
         match self {
             Self::SessionAllow => "session_allow",
             Self::SessionDeny => "session_deny",
+            Self::SessionStaticOnly => "session_static_only",
             Self::Llm => "llm",
             Self::StaticPolicy => "static_policy",
             Self::Validation => "validation",
@@ -289,6 +299,7 @@ impl SessionRegistry {
                 expires_at: g.expires_at,
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
+                static_only: g.static_only,
             })
             .collect()
     }
@@ -328,6 +339,7 @@ impl SessionRegistry {
                     expires_at: grant.expires_at,
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
+                    static_only: grant.static_only,
                 })
             }
         });
@@ -395,6 +407,13 @@ impl SessionRegistry {
             return None;
         }
         grant.prompt_append.clone()
+    }
+
+    pub fn static_only_for(&self, token: &str) -> bool {
+        let Some(grant) = self.grants.get(token) else {
+            return false;
+        };
+        !grant.is_expired(current_unix_secs()) && grant.static_only
     }
 
     /// Remove expired entries (move them to history) and trim history
@@ -514,6 +533,7 @@ fn historical(
         ended_at,
         status,
         prompt_append: grant.prompt_append,
+        static_only: grant.static_only,
     }
 }
 
@@ -538,6 +558,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
             },
         );
         reg
@@ -584,6 +605,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
+                static_only: false,
             },
         );
         assert!(reg.check("tok", "mkdir", &["/tmp".into()]).is_none());
@@ -608,6 +630,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
+                static_only: false,
             },
         );
         assert_eq!(
@@ -628,6 +651,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
+                static_only: false,
             },
         );
         assert!(reg.prompt_append_for("tok").is_none());
@@ -644,6 +668,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
             },
         );
         reg.grant(
@@ -654,6 +679,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
             },
         );
         let listed = reg.list();
@@ -666,6 +692,24 @@ mod tests {
         let reg = reg_with("live", &[], &[]);
         assert!(reg.has("live"));
         assert!(!reg.has("ghost"));
+    }
+
+    #[test]
+    fn static_only_is_reported_for_live_grant() {
+        let mut reg = SessionRegistry::new();
+        reg.grant(
+            "tok".to_string(),
+            SessionGrant {
+                allow: vec![],
+                deny: vec![],
+                expires_at: None,
+                granted_at: 0,
+                prompt_append: None,
+                static_only: true,
+            },
+        );
+        assert!(reg.static_only_for("tok"));
+        assert!(!reg.static_only_for("missing"));
     }
 
     #[test]
@@ -690,6 +734,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
             },
         );
         reg.purge_expired();
@@ -710,6 +755,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
             },
         );
         reg.revoke("a");

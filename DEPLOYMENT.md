@@ -10,12 +10,19 @@ On Windows, guard runs with the TCP loopback transport instead of Unix sockets.
 Start it with `--tcp-port` (or use the Windows default `127.0.0.1:8123`) and
 configure clients with `guard config set-port 8123`. TCP callers do not carry a
 trusted Unix UID, so UID-scoped secret injection, `--exec-as-caller`, and
-daemon-UID admin RPCs remain Unix-socket-only.
+daemon-UID admin are unavailable. TCP admin RPCs such as `guard grant` require a
+separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec token is not sufficient.
 
 The helper script [`deployment/windows/guard-launch.ps1`](deployment/windows/guard-launch.ps1)
 starts the Windows daemon with loopback TCP, optional learned rules, and logs
 under `%LOCALAPPDATA%\guard`. Pass `-EnvFile` when credentials live outside the
-repository, for example in a WSL home directory.
+repository, for example in a WSL home directory. If Windows does not have a
+kubeconfig, the launcher attempts a one-time copy from Ubuntu WSL's
+`$KUBECONFIG` or `~/.kube/config` into `%USERPROFILE%\.kube\config` before
+starting the native Windows daemon; pass `-NoCopyKubeconfig` to disable that
+bootstrap. The launcher also generates and stores separate TCP exec/admin tokens
+with `guard config set-token` and `guard config set-admin-token` when they are
+missing.
 
 ## Recommended deployment
 

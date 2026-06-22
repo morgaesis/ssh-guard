@@ -4,7 +4,8 @@ param(
     [int]$Port = 8123,
     [ValidateSet("off", "suggest", "create")]
     [string]$LearnShims = "create",
-    [switch]$NoLearnRules
+    [switch]$NoLearnRules,
+    [switch]$NoCopyKubeconfig
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,6 +35,48 @@ function Get-GuardListenerProcess {
     return $null
 }
 
+function Copy-KubeConfigFromWslIfMissing {
+    if ($NoCopyKubeconfig) {
+        return
+    }
+    $target = if ($env:KUBECONFIG) {
+        ($env:KUBECONFIG -split [IO.Path]::PathSeparator)[0]
+    }
+    else {
+        Join-Path $env:USERPROFILE ".kube\config"
+    }
+    if (-not $target) {
+        return
+    }
+    if (Test-Path -LiteralPath $target) {
+        return
+    }
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    $script = 'p="${KUBECONFIG:-$HOME/.kube/config}"; p="${p%%:*}"; if [ -r "$p" ]; then cat "$p"; fi'
+    $content = $null
+    try {
+        $content = & wsl.exe -d Ubuntu sh -lc $script 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $content) {
+            $content = & wsl.exe sh -lc $script 2>$null
+        }
+    }
+    catch {
+        return
+    }
+    if (-not $content) {
+        return
+    }
+
+    $targetDir = Split-Path -Parent $target
+    if ($targetDir) {
+        New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    }
+    Set-Content -LiteralPath $target -Value ($content -join "`n") -Encoding utf8
+}
+
 $guard = Join-Path $RepoRoot "target\release\guard.exe"
 if (-not (Test-Path -LiteralPath $guard)) {
     $guard = "guard.exe"
@@ -52,7 +95,8 @@ $wanted = @(
     "SSH_GUARD_LLM_MODEL",
     "SSH_GUARD_LLM_MODELS",
     "SSH_GUARD_LLM_API_URL",
-    "SSH_GUARD_LLM_TIMEOUT"
+    "SSH_GUARD_LLM_TIMEOUT",
+    "SSH_GUARD_ADMIN_TOKEN"
 )
 
 if ($EnvFile -and (Test-Path -LiteralPath $EnvFile)) {
@@ -96,10 +140,32 @@ if (-not $env:SSH_GUARD_AUTH_TOKEN) {
     }
 }
 
+if (-not $env:SSH_GUARD_ADMIN_TOKEN) {
+    $clientConfig = Join-Path $env:APPDATA "guard\client.yaml"
+    if (Test-Path -LiteralPath $clientConfig) {
+        $tokenLine = Get-Content -LiteralPath $clientConfig |
+            Where-Object { $_ -match "^admin_token:" } |
+            Select-Object -First 1
+        if ($tokenLine) {
+            $token = ($tokenLine -replace "^admin_token:\s*", "").Trim().Trim('"').Trim("'")
+            if ($token) {
+                $env:SSH_GUARD_ADMIN_TOKEN = $token
+            }
+        }
+    }
+}
+
 if (-not $env:SSH_GUARD_AUTH_TOKEN) {
     $env:SSH_GUARD_AUTH_TOKEN = New-GuardToken
     & $guard config set-token $env:SSH_GUARD_AUTH_TOKEN | Out-Null
 }
+
+if (-not $env:SSH_GUARD_ADMIN_TOKEN) {
+    $env:SSH_GUARD_ADMIN_TOKEN = New-GuardToken
+    & $guard config set-admin-token $env:SSH_GUARD_ADMIN_TOKEN | Out-Null
+}
+
+Copy-KubeConfigFromWslIfMissing
 
 & $guard config set-port $Port | Out-Null
 

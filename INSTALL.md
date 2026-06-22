@@ -61,6 +61,7 @@ On Windows, use the loopback TCP transport:
 ```powershell
 guard server start --tcp-port 8123
 guard config set-port 8123
+guard config set-admin-token <admin-token>
 guard run whoami
 ```
 
@@ -76,6 +77,7 @@ Key variables:
 - `SSH_GUARD_MODE` -- Evaluation mode (default: `readonly`)
 - `SSH_GUARD_LLM_TIMEOUT` / `SSH_GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `30`)
 - `SSH_GUARD_AUTH_TOKEN` -- Shared token for TCP clients
+- `SSH_GUARD_ADMIN_TOKEN` -- Separate token for TCP admin RPCs such as `guard grant`
 - `SSH_GUARD_LEARN_RULES` -- Learn static allows from repeated low-risk approvals
 - `SSH_GUARD_LEARN_SHIMS` -- `off`, `suggest`, or `create` shorter service shims for promoted rules
 

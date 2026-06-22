@@ -10,6 +10,7 @@
 //! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
+use crate::grant_rules::{compile_session_grant_rules, CompiledGrantRules};
 use crate::injection::is_valid_env_name;
 use crate::redact::{
     redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
@@ -59,6 +60,7 @@ const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
 pub enum CallerIdentity {
     Unix { uid: u32 },
     Tcp { token: String },
+    TcpAdmin { token: String },
     Unknown,
 }
 
@@ -68,6 +70,7 @@ impl CallerIdentity {
         match self {
             Self::Unix { uid } => Some(uid.to_string()),
             Self::Tcp { token } => Some(token.clone()),
+            Self::TcpAdmin { token } => Some(token.clone()),
             Self::Unknown => None,
         }
     }
@@ -84,6 +87,14 @@ impl std::fmt::Display for CallerIdentity {
                     "***".to_string()
                 };
                 write!(f, "token={}", redacted)
+            }
+            Self::TcpAdmin { token } => {
+                let redacted = if token.len() > 8 {
+                    format!("{}...{}", &token[..4], &token[token.len() - 4..])
+                } else {
+                    "***".to_string()
+                };
+                write!(f, "admin_token={}", redacted)
             }
             Self::Unknown => write!(f, "unknown"),
         }
@@ -125,6 +136,10 @@ pub enum AdminRequest {
         ttl_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_append: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prose: Option<String>,
+        #[serde(default)]
+        static_only: bool,
     },
     SessionRevoke {
         token: String,
@@ -264,7 +279,11 @@ pub struct ServerStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum IncomingMessage {
-    Admin { admin: AdminRequest },
+    Admin {
+        admin: AdminRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_token: Option<String>,
+    },
     Execute(ExecuteRequest),
 }
 
@@ -304,6 +323,7 @@ pub struct ServerConfig {
     pub secrets: Arc<SecretManager>,
     pub redact: bool,
     pub auth_token: Option<String>,
+    pub admin_token: Option<String>,
     pub socket_group: Option<String>,
     pub allowed_uids: Option<Vec<u32>>,
     pub shim_dir: Option<PathBuf>,
@@ -340,6 +360,7 @@ impl ServerConfig {
         secrets: SecretManager,
         redact: bool,
         auth_token: Option<String>,
+        admin_token: Option<String>,
         socket_group: Option<String>,
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
@@ -359,6 +380,7 @@ impl ServerConfig {
             secrets: Arc::new(secrets),
             redact,
             auth_token,
+            admin_token,
             socket_group,
             allowed_uids,
             shim_dir,
@@ -403,6 +425,9 @@ impl ServerConfig {
                 return Ok(());
             }
         }
+        if matches!(caller, CallerIdentity::TcpAdmin { .. }) {
+            return Ok(());
+        }
         anyhow::bail!("admin RPC refused: caller is not the daemon UID");
     }
 
@@ -419,6 +444,23 @@ impl ServerConfig {
             if !len_match || byte_match != 0 {
                 anyhow::bail!("invalid auth token");
             }
+        }
+        Ok(())
+    }
+
+    fn validate_admin_token(&self, token: Option<&str>) -> Result<()> {
+        let Some(ref expected) = self.admin_token else {
+            anyhow::bail!("admin token is not configured");
+        };
+        let provided = token.unwrap_or("").as_bytes();
+        let expected = expected.as_bytes();
+        let len_match = provided.len() == expected.len();
+        let byte_match = provided
+            .iter()
+            .zip(expected.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if !len_match || byte_match != 0 {
+            anyhow::bail!("invalid admin token");
         }
         Ok(())
     }
@@ -484,6 +526,7 @@ impl Server {
         secrets: SecretManager,
         redact: bool,
         auth_token: Option<String>,
+        admin_token: Option<String>,
         socket_group: Option<String>,
         allowed_uids: Option<Vec<u32>>,
         shim_dir: Option<PathBuf>,
@@ -503,6 +546,7 @@ impl Server {
             secrets,
             redact,
             auth_token,
+            admin_token,
             socket_group,
             allowed_uids,
             shim_dir,
@@ -696,7 +740,7 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
         let caller = CallerIdentity::Unix { uid };
 
         let request = match incoming {
-            IncomingMessage::Admin { admin } => {
+            IncomingMessage::Admin { admin, .. } => {
                 let resp = handle_admin_request(config, &caller, admin).await;
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -794,6 +838,41 @@ fn emit_exec_audit_events(
     }
 }
 
+fn merge_unique(target: &mut Vec<String>, additions: Vec<String>) {
+    for value in additions {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
+    }
+}
+
+fn combine_session_prompt(
+    prompt_append: Option<String>,
+    prose: Option<&str>,
+    compiled: &CompiledGrantRules,
+) -> Option<String> {
+    let mut sections = Vec::new();
+    let prompt_append = prompt_append
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(prose) = prose.map(str::trim).filter(|value| !value.is_empty()) {
+        sections.push(format!("Session grant prose:\n{prose}"));
+    }
+    if !compiled.notes.is_empty() {
+        sections.push(format!(
+            "Generated static grant notes:\n- {}",
+            compiled.notes.join("\n- ")
+        ));
+    }
+    if sections.is_empty() {
+        return prompt_append;
+    }
+    if let Some(prompt) = prompt_append {
+        sections.push(format!("Additional session context:\n{prompt}"));
+    }
+    Some(sections.join("\n\n"))
+}
+
 async fn handle_admin_request(
     config: &ServerConfig,
     caller: &CallerIdentity,
@@ -811,16 +890,25 @@ async fn handle_admin_request(
     match request {
         AdminRequest::SessionGrant {
             token,
-            allow,
-            deny,
+            mut allow,
+            mut deny,
             ttl_secs,
             prompt_append,
+            prose,
+            static_only,
         } => {
             if token.is_empty() {
                 return AdminResponse::Error {
                     message: "session token must not be empty".to_string(),
                 };
             }
+            let compiled = prose
+                .as_deref()
+                .map(compile_session_grant_rules)
+                .unwrap_or_default();
+            merge_unique(&mut allow, compiled.allow.clone());
+            merge_unique(&mut deny, compiled.deny.clone());
+            let prompt_append = combine_session_prompt(prompt_append, prose.as_deref(), &compiled);
             let expires_at = ttl_secs.map(|secs| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -833,6 +921,7 @@ async fn handle_admin_request(
                 deny,
                 expires_at,
                 prompt_append,
+                static_only,
                 granted_at: 0, // SessionRegistry::grant fills the current time
             };
             let (before, after) = {
@@ -849,10 +938,13 @@ async fn handle_admin_request(
                 };
             }
             tracing::info!(
-                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?}",
+                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?} static_only={} generated_allow={} generated_deny={}",
                 caller,
                 token,
-                ttl_secs
+                ttl_secs,
+                static_only,
+                compiled.allow.len(),
+                compiled.deny.len()
             );
             AdminResponse::Ok
         }
@@ -891,8 +983,8 @@ async fn handle_admin_request(
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
             let reg = config.sessions.read().await;
-            let show_prompt =
-                matches!(caller, CallerIdentity::Unix { uid } if *uid == config.daemon_uid);
+            let show_prompt = matches!(caller, CallerIdentity::Unix { uid } if *uid == config.daemon_uid)
+                || matches!(caller, CallerIdentity::TcpAdmin { .. });
             let grants = reg
                 .list()
                 .into_iter()
@@ -1175,23 +1267,24 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
         };
 
         let request = match incoming {
-            IncomingMessage::Admin { admin } => {
-                // Admin over TCP can never satisfy the daemon-UID rule
-                // (no peer-credentials over loopback that we can trust),
-                // so only Ping is exposed here. Everything else is
-                // Unix-socket-only.
-                if !matches!(admin, AdminRequest::Ping) {
+            IncomingMessage::Admin { admin, admin_token } => {
+                let caller = if matches!(admin, AdminRequest::Ping) {
+                    CallerIdentity::Tcp {
+                        token: "<tcp>".to_string(),
+                    }
+                } else if let Err(e) = config.validate_admin_token(admin_token.as_deref()) {
                     let resp = AdminResponse::Error {
-                        message: "admin RPCs require a unix socket caller".to_string(),
+                        message: format!("admin RPC refused: {}", e),
                     };
                     writer
                         .write_all(serde_json::to_string(&resp)?.as_bytes())
                         .await?;
                     writer.write_all(b"\n").await?;
                     continue;
-                }
-                let caller = CallerIdentity::Tcp {
-                    token: "<tcp>".to_string(),
+                } else {
+                    CallerIdentity::TcpAdmin {
+                        token: admin_token.unwrap_or_else(|| "<missing>".to_string()),
+                    }
                 };
                 let resp = handle_admin_request(config, &caller, admin).await;
                 writer
@@ -1576,10 +1669,10 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // — silently falling through to base policy would let an agent run
     // with surprise rules when its operator-issued grant is gone.
     if let Some(ref token) = request.session_token {
-        let (decision, exists) = {
+        let (decision, exists, static_only) = {
             let reg = config.sessions.read().await;
             let decision = reg.check(token, &request.binary, &request.args);
-            (decision, reg.has(token))
+            (decision, reg.has(token), reg.static_only_for(token))
         };
         if !exists {
             let reason = format!(
@@ -1649,6 +1742,26 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     return result;
                 }
             }
+        }
+        if static_only {
+            let reason = "session static-only: no matching session allow rule".to_string();
+            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: SessionDecisionSource::SessionStaticOnly,
+                    reason: reason.clone(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            return ExecuteResult::denied(reason);
         }
     }
 
@@ -2709,6 +2822,7 @@ pub struct Client {
     socket_path: Option<PathBuf>,
     tcp_port: Option<u16>,
     auth_token: Option<String>,
+    admin_token: Option<String>,
     session_token: Option<String>,
 }
 
@@ -2718,12 +2832,18 @@ impl Client {
             socket_path,
             tcp_port,
             auth_token: None,
+            admin_token: None,
             session_token: None,
         }
     }
 
     pub fn with_auth(mut self, token: String) -> Self {
         self.auth_token = Some(token);
+        self
+    }
+
+    pub fn with_admin_token(mut self, token: String) -> Self {
+        self.admin_token = Some(token);
         self
     }
 
@@ -2746,7 +2866,10 @@ impl Client {
             AdminRequest::Status => "status",
             AdminRequest::Ping => "ping",
         };
-        let envelope = IncomingMessage::Admin { admin: request };
+        let envelope = IncomingMessage::Admin {
+            admin: request,
+            admin_token: self.admin_token.clone(),
+        };
         let line = serde_json::to_string(&envelope)?;
 
         if let Some(ref socket_path) = self.socket_path {
@@ -3499,6 +3622,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             ToolRegistry::empty(),
             Vec::new(),
@@ -3720,6 +3844,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_only_session_miss_denies_before_evaluator() {
+        let (cfg, _) = make_test_config();
+        let token = format!("static-only-{}", std::process::id());
+        {
+            let mut sessions = cfg.sessions.write().await;
+            sessions.grant(
+                token.clone(),
+                SessionGrant {
+                    allow: vec!["kubectl -n nextcloud get pods*".into()],
+                    deny: Vec::new(),
+                    expires_at: None,
+                    prompt_append: None,
+                    static_only: true,
+                    granted_at: 0,
+                },
+            );
+        }
+
+        let req = ExecuteRequest {
+            binary: "kubectl".to_string(),
+            args: vec!["get".into(), "pods".into(), "-n".into(), "default".into()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: Some(token),
+        };
+
+        let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result.policy_reason().contains("static-only"));
+    }
+
+    #[test]
+    fn tcp_admin_token_validation_is_separate_from_exec_token() {
+        let (mut cfg, _) = make_test_config();
+        cfg.auth_token = Some("exec-token".into());
+        cfg.admin_token = Some("admin-token".into());
+
+        assert!(cfg.validate_token(Some("exec-token")).is_ok());
+        assert!(cfg.validate_admin_token(Some("admin-token")).is_ok());
+        assert!(cfg.validate_admin_token(Some("exec-token")).is_err());
+        assert!(cfg
+            .validate_admin(&CallerIdentity::TcpAdmin {
+                token: "admin-token".into(),
+            })
+            .is_ok());
+        assert!(cfg
+            .validate_admin(&CallerIdentity::Tcp {
+                token: "exec-token".into(),
+            })
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn session_list_is_user_visible_but_prompt_is_hidden() {
         let (mut cfg, _) = make_test_config();
         cfg.daemon_uid = 777;
@@ -3737,6 +3916,8 @@ mod tests {
                 deny: Vec::new(),
                 ttl_secs: None,
                 prompt_append: Some("operator-only prompt".into()),
+                prose: None,
+                static_only: false,
             },
         )
         .await;
@@ -3784,6 +3965,8 @@ mod tests {
                 deny: vec!["rm*".into()],
                 ttl_secs: None,
                 prompt_append: Some("operator context".into()),
+                prose: None,
+                static_only: false,
             },
         )
         .await;
