@@ -65,7 +65,20 @@ guard config set-server guard
 guard run whoami
 ```
 
-A TCP loopback transport is also available:
+The named-pipe SID is the caller's principal, with full parity to a Unix peer
+uid, so consequence gating (`--gate consequence`), per-principal `--secret` /
+`--env` injection, and daemon-principal admin all work over the pipe. The
+operator is whoever runs as the daemon's own principal (its SID on Windows).
+`--exec-as-caller` is Unix-only; on Windows the daemon executes approved commands
+as its own service account. For the bypass-resistant gating deployment — guard as
+a Windows service under a dedicated service account with an ACL'd state and
+credential directory — use
+[`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1).
+See [DEPLOYMENT.md](DEPLOYMENT.md).
+
+A TCP loopback transport is also available. It carries only a bearer token and no
+local principal, so consequence gating and secret/`--env` injection are refused
+over TCP, and admin RPCs require a separate admin token:
 
 ```powershell
 guard server start --tcp-port 8123

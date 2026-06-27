@@ -108,11 +108,14 @@ uncertain class is held, never run. Operator-authored allows (static policy,
 trusted verbs) and the LLM-uncertain path are separated: the open-ended LLM path
 is gated; the operator-vetted surface is not.
 
-Gating is meaningful only where the daemon UID differs from the agent's (so the
-agent cannot approve its own held command). It requires a Unix-socket listener
-and is refused with `--tcp-port`; on Windows it is unavailable (run guard in
-WSL/Linux). Approval, denial, confirmation, and manual revert are **daemon-UID
-only** — the operator decides the irreversible steps, never the agent.
+Gating is meaningful only where the daemon's principal differs from the agent's
+(so the agent cannot approve its own held command). The principal is a Unix uid
+over a Unix-domain socket and a Windows SID over a named pipe; either way it is a
+kernel-verified local peer, so gating works on both platforms. It requires a
+local listener (`--socket`) and is refused with a TCP listener, which carries
+only a bearer token and no peer identity. Approval, denial, confirmation, and
+manual revert are restricted to **the daemon's own principal** — the operator
+decides the irreversible steps, never the agent.
 
 ```bash
 guard server start --gate consequence --exec-as-caller \
@@ -217,7 +220,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `SSH_GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `SSH_GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
-| `SSH_GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a Unix-socket listener. |
+| `SSH_GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
 | `SSH_GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
 
 The primary model is `openai/gpt-5.4-nano` via OpenRouter by default. Set it
@@ -435,17 +438,17 @@ guard session appeal <token> kubectl get httproute -n nextcloud
 
 An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant/revoke/show, because they can change durable authorization state.
 
-Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
+Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal; `guard session list` is visible over a local listener to exec-allowed callers, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon principal.
 
-For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
+For operator forensics, `guard session show <token>` is restricted to the daemon principal and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
 ## Per-run secret injection
 
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
-`guard secrets add/list/remove` are Unix-socket-only, per-user operations. Any exec-allowed local user can manage their own secret namespace; TCP clients cannot use secret storage or `--secret`, because the namespace is keyed from Unix peer credentials. When the daemon UID runs `guard secrets list`, it gets an aggregate names-only view across every UID namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+`guard secrets add/list/remove` and `--secret`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer — a Unix-socket uid or a Windows named-pipe SID — and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
 
-For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon UID. That view includes `uid=` for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
+For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon principal. That view annotates the owning principal for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
 
 Upgrade note: pre-namespace flat secrets are no longer served through normal per-user `guard secrets list` / `guard run --secret` paths. Migrate them before rollout:
 
@@ -487,7 +490,7 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 ## Admin authorization
 
-Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own UID** on Unix sockets. `session list` is the Unix-socket exception: exec-allowed local callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon UID. On TCP transports, non-Ping admin RPCs require the separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec `SSH_GUARD_AUTH_TOKEN` is not enough to mint grants.
+Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener — its uid over a Unix-domain socket, its SID over a Windows named pipe. `session list` is the local-listener exception: exec-allowed local callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon principal. On TCP transports, non-Ping admin RPCs require the separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec `SSH_GUARD_AUTH_TOKEN` is not enough to mint grants.
 
 The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
@@ -497,7 +500,9 @@ Because grants are now durable, broad sessions deserve the same care as any othe
 
 ## Execution identity
 
-By default the daemon executes approved commands as its own service identity. If you want guard to act as a local secret broker and redactor for per-user files such as `~/.aws/config` or `~/.cmk/config`, start a root-owned daemon with `--exec-as-caller` and only a Unix socket listener. In that mode guard authenticates the caller by Unix peer credentials and drops the child process to that UID before exec, so the command runs with the caller's filesystem access instead of the daemon's or root's. TCP listeners are intentionally incompatible with this mode because a token is not a trustworthy local UID.
+By default the daemon executes approved commands as its own service identity, on both platforms. That service identity is the containment boundary: an agent calling through the daemon runs commands with the daemon's authority, not its own, and approval of held commands rests on the daemon's principal being distinct from the agent's.
+
+`--exec-as-caller` (Unix only) extends this into a per-user secret broker and redactor for files such as `~/.aws/config` or `~/.cmk/config`. Start a root-owned daemon with `--exec-as-caller` and only a Unix socket listener; guard authenticates the caller by Unix peer credentials and drops the child process to that uid before exec, so the command runs with the caller's filesystem access instead of root's. TCP listeners are incompatible with this mode because a token is not a trustworthy local uid. Windows has no setuid-style identity drop, so containment there rests on running the daemon as a dedicated Windows service account: the daemon owns the named pipe, the state database, and any brokered credentials under an NTFS ACL that excludes the interactive agent's account. The agent connects to the pipe under its own SID — distinct from the daemon's — so it cannot approve its own held commands or read the daemon's state and credentials. See [`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1).
 
 ## Agent integration
 
