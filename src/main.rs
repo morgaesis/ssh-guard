@@ -14,6 +14,8 @@ mod session_store;
 mod shim;
 mod ssh;
 mod tool_config;
+#[cfg(windows)]
+mod winsvc;
 
 use guard::evaluate;
 use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
@@ -594,6 +596,14 @@ enum ServerCommands {
         /// Env: GUARD_VERBS.
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
+
+        /// Internal marker: launched under the Windows Service Control Manager.
+        /// The Windows installer sets this in the service binPath so startup
+        /// answers the SCM start/stop handshake instead of running in the
+        /// foreground. Hidden; it has no effect when not run as a Windows
+        /// service, and the daemon configuration is otherwise identical.
+        #[arg(long = "service", hide = true, action = ArgAction::SetTrue)]
+        service: bool,
     },
     /// Connect to guard server and execute a command
     Connect {
@@ -719,6 +729,23 @@ fn guard_env(suffix: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+
+    // Windows service entry. The installer registers the daemon with
+    // `server start ... --service`; when the Service Control Manager launches
+    // that command we must answer its start/stop handshake from a dispatcher
+    // thread rather than run in the foreground. Detect it from argv before any
+    // logging or arg parsing, and hand the process to the dispatcher (on a
+    // blocking thread so it owns its own runtime). An interactive run never
+    // sets `--service`, so the foreground path below is unaffected.
+    #[cfg(windows)]
+    {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if winsvc::is_service_invocation(&argv) {
+            return tokio::task::spawn_blocking(winsvc::run)
+                .await
+                .context("the service dispatcher thread panicked")?;
+        }
+    }
 
     // Log level: RUST_LOG > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > "info"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -944,6 +971,9 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             system_prompt_append,
             gate,
             verbs,
+            // Consumed in `main` (Windows SCM dispatch); irrelevant to the
+            // server run itself, which is identical in service and foreground.
+            service: _,
         } => {
             tracing::info!("Starting guard server...");
 
@@ -2991,6 +3021,7 @@ mod tests {
                 system_prompt_append,
                 gate,
                 verbs,
+                service,
             }) => ServerCommands::Start {
                 socket,
                 tcp_port,
@@ -3025,6 +3056,7 @@ mod tests {
                 system_prompt_append,
                 gate,
                 verbs,
+                service,
             },
             _ => panic!("expected server start args"),
         }

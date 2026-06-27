@@ -43,7 +43,7 @@
     Guard CLI flags used here are the only ones that exist (verified against
     src/main.rs clap definitions):
       server start --socket <name> --gate consequence --state-db <path>
-                   --verbs <path> [--no-llm]
+                   --verbs <path> --service [--no-llm]
       approve|deny|confirm|revert <handle> --socket <name>
       provisionals --socket <name>
       approvals [<handle>] --socket <name>
@@ -420,13 +420,16 @@ function Invoke-Install {
     #    --socket guard            -> named pipe \\.\pipe\guard with SID auth
     #    --gate consequence        -> reversibility routing + operator approval
     #    --state-db / --verbs      -> both inside the ACL'd boundary
+    #    --service                 -> answer the SCM start/stop handshake
+    #                                 (guard.exe is otherwise a console binary)
     #    --no-llm                  -> only when no key is configured
     $binArgs = @(
         'server', 'start',
         '--socket', $SocketName,
         '--gate', 'consequence',
         '--state-db', $StateDb,
-        '--verbs', $VerbsPath
+        '--verbs', $VerbsPath,
+        '--service'
     )
     if (-not $haveKey) { $binArgs += '--no-llm' }
 
