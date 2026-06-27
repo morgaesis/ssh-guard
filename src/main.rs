@@ -76,6 +76,10 @@ enum MainArgs {
     /// Server management
     #[clap(subcommand)]
     Server(ServerCommands),
+
+    /// Generate a container hardening profile (seccomp or AppArmor) to stdout.
+    #[clap(subcommand)]
+    Profile(ProfileCommands),
     /// Manage secrets
     #[clap(subcommand, alias = "secret")]
     Secrets(SecretCommands),
@@ -429,6 +433,27 @@ fn parse_env_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+#[derive(Subcommand)]
+enum ProfileCommands {
+    /// Emit a seccomp profile (use via `--security-opt seccomp=<file>` on
+    /// Docker/Podman). Default-allow with container-escape and host-tampering
+    /// syscalls denied.
+    Seccomp,
+    /// Emit an AppArmor profile confining the daemon to its binary, data
+    /// directory, and child-command execution, denying host tampering.
+    Apparmor {
+        /// AppArmor profile name.
+        #[arg(long, default_value = "guard")]
+        name: String,
+        /// Absolute path to the guard binary the profile attaches to.
+        #[arg(long, default_value = "/usr/local/bin/guard")]
+        exe: String,
+        /// Data directory (state + brokered credentials) guard may read/write.
+        #[arg(long = "data-dir", default_value = "/var/lib/guard")]
+        data_dir: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -802,6 +827,7 @@ async fn main() -> Result<()> {
             run_exec(binary, args, env_vars, secret_vars, gating).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
+        Ok(MainArgs::Profile(cmd)) => handle_profile(cmd),
         Ok(MainArgs::Provisionals { socket }) => handle_provisionals(socket).await,
         Ok(MainArgs::Confirm { handle, socket }) => {
             handle_gate_action(socket, "confirm", handle).await
@@ -941,6 +967,25 @@ fn default_guard_state_dir() -> Option<PathBuf> {
         return Some(dir.join("guard"));
     }
     dirs::home_dir().map(|dir| dir.join(".guard"))
+}
+
+fn handle_profile(cmd: ProfileCommands) -> Result<()> {
+    match cmd {
+        ProfileCommands::Seccomp => {
+            println!("{}", guard::profile::seccomp_json());
+        }
+        ProfileCommands::Apparmor {
+            name,
+            exe,
+            data_dir,
+        } => {
+            print!(
+                "{}",
+                guard::profile::apparmor_profile(&name, &exe, &data_dir)
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
