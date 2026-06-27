@@ -956,23 +956,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .context("invalid --gate value (expected 'off' or 'consequence')")?
                 .unwrap_or_default();
             if gate_mode.is_on() {
-                // The operator gate (confirm/approve) is daemon-UID-only and only
-                // a Unix-socket peer can ever be the daemon UID. Over TCP, or on a
-                // Windows named pipe, no caller could approve a held command, so
-                // refuse those listeners rather than ship a dead-end.
-                #[cfg(windows)]
-                anyhow::bail!(
-                    "--gate consequence is not supported on Windows: the operator-approval gate requires Unix peer-credential authorization. Run guard in WSL/Linux for consequence gating."
-                );
-                #[cfg(unix)]
-                {
-                    if tcp_port.is_some() {
-                        anyhow::bail!(
-                            "--gate consequence requires a Unix-socket listener; it is incompatible with --tcp-port (the operator approval gate is daemon-UID-only and unreachable over TCP)"
-                        );
-                    }
-                    tracing::info!("Consequence gating enabled (mode: {})", gate_mode);
-                }
+                tracing::info!("Consequence gating enabled (mode: {})", gate_mode);
             }
 
             // --users is a Unix-uid allow-list enforced via SO_PEERCRED. The
@@ -1017,6 +1001,26 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                         None
                     }
                 });
+
+            // Consequence gating is principal-scoped: only a kernel-verified
+            // local peer (a Unix-socket uid or a Windows named-pipe SID) can be
+            // the operator. A TCP listener carries only a bearer token, so it
+            // both cannot reach the operator gate and needlessly widens the exec
+            // surface. Enforce on the FINAL resolved transport — after --tcp-port,
+            // SSH_GUARD_TCP_PORT, and the platform default — so an env-set TCP
+            // port cannot slip a listener in beside the gate.
+            if gate_mode.is_on() {
+                if tcp_port.is_some() {
+                    anyhow::bail!(
+                        "--gate consequence is incompatible with a TCP listener (--tcp-port or SSH_GUARD_TCP_PORT); the operator approval gate is principal-scoped and unreachable over TCP. Use a local socket via --socket."
+                    );
+                }
+                if socket_path.is_none() {
+                    anyhow::bail!(
+                        "--gate consequence requires a local listener: pass --socket (a Unix-domain socket on Unix, a named pipe on Windows). TCP carries no peer identity and cannot reach the operator approval gate."
+                    );
+                }
+            }
 
             if let Some(ref path) = socket_path {
                 tracing::info!("Socket: {}", path.display());
@@ -2786,6 +2790,8 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                                 println!("  - {}  origin=legacy", item.key);
                             } else if let Some(uid) = item.uid {
                                 println!("  - {}  uid={}", item.key, uid);
+                            } else if let Some(principal) = &item.principal {
+                                println!("  - {}  principal={}", item.key, principal);
                             } else {
                                 println!("  - {}", item.key);
                             }

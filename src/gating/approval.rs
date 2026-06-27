@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use super::{GateError, Reversibility};
+use crate::principal::{scope_eq, PrincipalKey};
 
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
 /// replayed verbatim at approve time. Secret *values* are never stored — only the
@@ -39,8 +40,15 @@ pub struct ApprovalSnapshot {
     pub verb_name: Option<String>,
     pub verb_params: BTreeMap<String, String>,
     pub catalog_version: Option<u64>,
-    /// Unix uid of the original caller, to reconstruct exec identity.
-    pub caller_uid: Option<u32>,
+    /// Principal of the original caller, to reconstruct exec identity.
+    /// Deserializes from the legacy numeric `caller_uid` form so rows written by
+    /// an older daemon survive an upgrade.
+    #[serde(
+        default,
+        alias = "caller_uid",
+        deserialize_with = "crate::principal::principal_from_legacy"
+    )]
+    pub principal: Option<PrincipalKey>,
 }
 
 impl ApprovalSnapshot {
@@ -207,10 +215,14 @@ impl ApprovalRegistry {
             .count()
     }
 
-    pub fn outstanding_for(&self, uid: Option<u32>) -> usize {
+    /// Count of outstanding holds created by a principal, for the per-caller
+    /// cap. Absence never matches absence (`scope_eq` semantics), so
+    /// unauthenticated callers do not share a quota bucket.
+    pub fn outstanding_for(&self, principal: Option<&PrincipalKey>) -> usize {
+        let owner = principal.cloned();
         self.items
             .values()
-            .filter(|a| a.status.is_pending() && a.snapshot.caller_uid == uid)
+            .filter(|a| a.status.is_pending() && scope_eq(&a.snapshot.principal, &owner))
             .count()
     }
 
@@ -341,7 +353,7 @@ mod tests {
             verb_name: None,
             verb_params: BTreeMap::new(),
             catalog_version: None,
-            caller_uid: Some(1001),
+            principal: Some(PrincipalKey::from_uid(1001)),
         }
     }
 
@@ -422,9 +434,21 @@ mod tests {
         r.enqueue(held("a", 100, 3600));
         r.enqueue(held("b", 100, 3600));
         assert_eq!(r.outstanding(), 2);
-        assert_eq!(r.outstanding_for(Some(1001)), 2);
+        assert_eq!(r.outstanding_for(Some(&PrincipalKey::from_uid(1001))), 2);
         r.deny("a", 150, "no".into()).unwrap();
         assert_eq!(r.outstanding(), 1);
+    }
+
+    #[test]
+    fn none_owner_never_shares_quota_with_none_caller() {
+        // A hold owned by an unauthenticated caller (`None`) must not count
+        // toward another `None`-scope caller's per-caller cap.
+        let mut r = ApprovalRegistry::new();
+        let mut anon = held("anon", 100, 3600);
+        anon.snapshot.principal = None;
+        r.enqueue(anon);
+        assert_eq!(r.outstanding(), 1);
+        assert_eq!(r.outstanding_for(None), 0);
     }
 
     #[test]

@@ -1,15 +1,22 @@
 //! Secret broker for managing sensitive credentials across multiple backends.
 //!
-//! Secrets are stored per-UID: each caller has its own private namespace
+//! Secrets are stored per-principal: each caller has its own private namespace
 //! keyed by key name. Two users can reuse the same key name (e.g.
 //! `OPNSENSE_API_KEY`) without collision, and one user cannot read, list,
-//! overwrite, or delete another user's secrets. The daemon UID has a
+//! overwrite, or delete another user's secrets. The daemon principal has a
 //! separate admin-only `list_all` entry point that returns the full
-//! (uid, key) set for observability; it still cannot read another user's
-//! values through the normal `get` path (which requires the owning UID).
+//! (principal, key) set for observability; it still cannot read another user's
+//! values through the normal `get` path (which requires the owning principal).
+//!
+//! A principal is a [`PrincipalKey`]: a Unix uid string on Unix, a SID on
+//! Windows. The per-principal storage segment is `PrincipalKey::segment()`,
+//! which yields `u<uid>` for a uid (preserving the existing on-disk
+//! `pass guard/u<uid>/...` and `secrets.yaml` `{<uid>: ...}` layout with no
+//! migration) and a filesystem/env-safe form for SIDs.
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -25,23 +32,27 @@ use tokio::process::Command as AsyncCommand;
 use tokio::sync::RwLock;
 
 /// Directory within pass where secrets are stored. Entries live at
-/// `guard/u<uid>/<key>` so one user's secrets cannot collide with
-/// another's.
+/// `guard/<segment>/<key>` (e.g. `guard/u<uid>/<key>`) so one user's secrets
+/// cannot collide with another's.
 const PASS_PREFIX: &str = "guard/";
 
 /// Prefix for environment variable secrets. Full form is
-/// `GUARD_SECRET_U<uid>_<KEY>`.
+/// `GUARD_SECRET_<segment>_<KEY>` (e.g. `GUARD_SECRET_U<uid>_<KEY>`).
 const ENV_PREFIX: &str = "GUARD_SECRET_";
 
 /// Filename for the local encrypted secrets file.
 const SECRETS_FILE: &str = "secrets.yaml";
-pub const LEGACY_UID_SENTINEL: u32 = u32::MAX;
-type NamespacedSecretKey = (u32, String);
-type PassStoreEntries = (Vec<NamespacedSecretKey>, Vec<String>);
 
-fn uid_segment(uid: u32) -> String {
-    format!("u{}", uid)
+/// Reserved principal used to tag entries recovered from the pre-namespacing
+/// flat layout (`pass guard/<key>`, bare `GUARD_SECRET_<KEY>`, or a legacy flat
+/// `secrets.yaml`). It is a non-colliding sentinel string: no real uid or SID
+/// produces it, so it cannot be addressed as a normal namespace.
+pub fn legacy_sentinel() -> PrincipalKey {
+    PrincipalKey::from_raw("__legacy__")
 }
+
+type NamespacedSecretKey = (PrincipalKey, String);
+type PassStoreEntries = (Vec<NamespacedSecretKey>, Vec<String>);
 
 /// Trait for secret storage backends.
 ///
@@ -51,23 +62,23 @@ pub trait SecretBackend: Send + Sync {
     /// Returns the backend name for logging/debugging.
     fn name(&self) -> &str;
 
-    /// Retrieve a secret by (uid, key).
-    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>>;
+    /// Retrieve a secret by (principal, key).
+    async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>>;
 
-    /// List secret keys owned by `uid`.
-    async fn list(&self, uid: u32) -> Result<Vec<String>>;
+    /// List secret keys owned by `principal`.
+    async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>>;
 
-    /// Admin view: list every (uid, key) pair in the store. The daemon
+    /// Admin view: list every (principal, key) pair in the store. The daemon
     /// uses this for its aggregate `secrets list`. Backends that cannot
-    /// enumerate by UID (env backend) should still return everything
+    /// enumerate by principal (env backend) should still return everything
     /// they can recover.
-    async fn list_all(&self) -> Result<Vec<(u32, String)>>;
+    async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>>;
 
-    /// Store a secret under `uid`.
-    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()>;
+    /// Store a secret under `principal`.
+    async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()>;
 
-    /// Delete a secret owned by `uid`.
-    async fn delete(&self, uid: u32, key: &str) -> Result<()>;
+    /// Delete a secret owned by `principal`.
+    async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,12 +100,8 @@ impl PassBackend {
         }
     }
 
-    fn pass_path(&self, uid: u32, key: &str) -> String {
-        format!("{}{}/{}", PASS_PREFIX, uid_segment(uid), key)
-    }
-
-    fn legacy_pass_path(&self, key: &str) -> String {
-        format!("{}{}", PASS_PREFIX, key)
+    fn pass_path(&self, principal: &PrincipalKey, key: &str) -> String {
+        format!("{}{}/{}", PASS_PREFIX, principal.segment(), key)
     }
 
     fn store_dir(&self) -> Option<&Path> {
@@ -156,6 +163,25 @@ fn pass_store_initialized() -> bool {
         .unwrap_or(false)
 }
 
+/// Recover the owning principal from a stored namespace segment. A `u<digits>`
+/// segment is a Unix uid and round-trips exactly to `PrincipalKey::from_uid`.
+/// Any other segment is a SID-derived segment (non-alphanumerics already
+/// collapsed to `_`); it is wrapped verbatim as the principal. SID segments are
+/// not perfectly invertible to the original SID, so the recovered principal is
+/// a stable display/grouping label for the admin aggregate view; per-caller
+/// `list`/`get`/`set`/`delete` never round-trip through this — they address the
+/// store by the live caller's `segment()`, which is exact.
+fn principal_from_segment(segment: &str) -> PrincipalKey {
+    if let Some(uid_str) = segment.strip_prefix('u') {
+        if !uid_str.is_empty() && uid_str.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(uid) = uid_str.parse::<u32>() {
+                return PrincipalKey::from_uid(uid);
+            }
+        }
+    }
+    PrincipalKey::from_raw(segment)
+}
+
 fn collect_pass_entries(
     namespace_root: &Path,
     dir: &Path,
@@ -189,14 +215,16 @@ fn collect_pass_entries(
         if let Some(stem) = last.strip_suffix(".gpg") {
             *last = stem.to_string();
         }
-        if let Some(uid_str) = components[0].strip_prefix('u') {
-            if let Ok(uid) = uid_str.parse::<u32>() {
-                let key = key_parts[1..].join("/");
-                if !key.is_empty() {
-                    namespaced.push((uid, key));
-                }
-                continue;
+        // A namespaced entry lives under a per-principal segment directory
+        // (`guard/<segment>/<key...>`, two-plus components). A bare file
+        // directly under `guard/` is a pre-namespacing flat entry.
+        if components.len() >= 2 {
+            let principal = principal_from_segment(&components[0]);
+            let key = key_parts[1..].join("/");
+            if !key.is_empty() {
+                namespaced.push((principal, key));
             }
+            continue;
         }
         let key = key_parts.join("/");
         if !key.is_empty() {
@@ -232,37 +260,46 @@ impl SecretBackend for PassBackend {
         "pass"
     }
 
-    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
-        self.get_entry(&self.pass_path(uid, key)).await
+    async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>> {
+        self.get_entry(&self.pass_path(principal, key)).await
     }
 
-    async fn list(&self, uid: u32) -> Result<Vec<String>> {
+    async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>> {
         let Some(store_dir) = self.store_dir() else {
             return Ok(Vec::new());
         };
+        // Filter by storage segment, which is exact for the live caller even
+        // when the recovered-from-disk principal is only a display label.
+        let want = principal.segment();
         let (namespaced, _) = list_pass_store_entries(store_dir)?;
         let mut keys: Vec<String> = namespaced
             .into_iter()
-            .filter_map(|(entry_uid, key)| if entry_uid == uid { Some(key) } else { None })
+            .filter_map(|(entry_principal, key)| {
+                if entry_principal.segment() == want {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
             .collect();
         keys.sort();
         keys.dedup();
         Ok(keys)
     }
 
-    async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+    async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>> {
         let Some(store_dir) = self.store_dir() else {
             return Ok(Vec::new());
         };
         let (mut namespaced, legacy) = list_pass_store_entries(store_dir)?;
-        namespaced.extend(legacy.into_iter().map(|key| (LEGACY_UID_SENTINEL, key)));
+        namespaced.extend(legacy.into_iter().map(|key| (legacy_sentinel(), key)));
         namespaced.sort();
         namespaced.dedup();
         Ok(namespaced)
     }
 
-    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
-        let path = self.pass_path(uid, key);
+    async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
+        let path = self.pass_path(principal, key);
 
         let mut cmd = AsyncCommand::new("pass");
         cmd.args(["insert", "--force", "--multiline", &path]);
@@ -289,8 +326,8 @@ impl SecretBackend for PassBackend {
         Ok(())
     }
 
-    async fn delete(&self, uid: u32, key: &str) -> Result<()> {
-        let path = self.pass_path(uid, key);
+    async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
+        let path = self.pass_path(principal, key);
         let mut cmd = AsyncCommand::new("pass");
         cmd.args(["rm", "-f", &path]);
         if let Some(store_dir) = self.store_dir() {
@@ -312,7 +349,8 @@ impl SecretBackend for PassBackend {
 // ---------------------------------------------------------------------------
 
 /// Secret backend backed by environment variables. Layout is
-/// `GUARD_SECRET_U<uid>_<KEY>`.
+/// `GUARD_SECRET_<SEGMENT>_<KEY>`; for a Unix uid the segment is `U<uid>`,
+/// preserving the existing `GUARD_SECRET_U<uid>_<KEY>` form with no migration.
 #[derive(Debug, Clone)]
 pub struct EnvBackend {
     _priv: (),
@@ -323,16 +361,25 @@ impl EnvBackend {
         Self { _priv: () }
     }
 
-    fn env_key(uid: u32, secret_key: &str) -> String {
-        format!("{}U{}_{}", ENV_PREFIX, uid, secret_key)
+    /// The per-principal env segment. `PrincipalKey::segment()` yields `u<uid>`
+    /// for a uid and an alphanumeric/`_` form for a SID; environment variable
+    /// names are conventionally uppercase and case-sensitive, so the segment is
+    /// uppercased. For a uid this is `U<uid>`, exactly the legacy layout.
+    fn env_segment(principal: &PrincipalKey) -> String {
+        principal.segment().to_ascii_uppercase()
     }
 
-    fn legacy_env_key(secret_key: &str) -> String {
-        format!("{}{}", ENV_PREFIX, secret_key)
+    fn env_key(principal: &PrincipalKey, secret_key: &str) -> String {
+        format!(
+            "{}{}_{}",
+            ENV_PREFIX,
+            Self::env_segment(principal),
+            secret_key
+        )
     }
 
-    fn user_prefix(uid: u32) -> String {
-        format!("{}U{}_", ENV_PREFIX, uid)
+    fn user_prefix(principal: &PrincipalKey) -> String {
+        format!("{}{}_", ENV_PREFIX, Self::env_segment(principal))
     }
 }
 
@@ -348,12 +395,12 @@ impl SecretBackend for EnvBackend {
         "env"
     }
 
-    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
-        Ok(env::var(Self::env_key(uid, key)).ok())
+    async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>> {
+        Ok(env::var(Self::env_key(principal, key)).ok())
     }
 
-    async fn list(&self, uid: u32) -> Result<Vec<String>> {
-        let prefix = Self::user_prefix(uid);
+    async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>> {
+        let prefix = Self::user_prefix(principal);
         let mut keys = Vec::new();
         for (env_key, _) in env::vars() {
             if let Some(key) = env_key.strip_prefix(&prefix) {
@@ -365,20 +412,30 @@ impl SecretBackend for EnvBackend {
         Ok(keys)
     }
 
-    async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+    async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>> {
+        // The env layout has no unambiguous delimiter between a SID segment and
+        // the key (both contain `_`), so the aggregate view recovers the uid
+        // namespace (`U<digits>_<key>`) exactly and tags everything else as a
+        // pre-namespacing flat entry. Per-caller `list`/`get` are unaffected:
+        // they match the full `user_prefix`, which is exact for any principal.
         let mut out = Vec::new();
         for (env_key, _) in env::vars() {
             if let Some(rest) = env_key.strip_prefix(ENV_PREFIX) {
                 if let Some(after_u) = rest.strip_prefix('U') {
                     if let Some((uid_str, key)) = after_u.split_once('_') {
-                        if let Ok(uid) = uid_str.parse::<u32>() {
-                            if !key.is_empty() {
-                                out.push((uid, key.to_string()));
+                        if !uid_str.is_empty()
+                            && uid_str.bytes().all(|b| b.is_ascii_digit())
+                            && !key.is_empty()
+                        {
+                            if let Ok(uid) = uid_str.parse::<u32>() {
+                                out.push((PrincipalKey::from_uid(uid), key.to_string()));
+                                continue;
                             }
                         }
                     }
-                } else if !rest.is_empty() {
-                    out.push((LEGACY_UID_SENTINEL, rest.to_string()));
+                }
+                if !rest.is_empty() {
+                    out.push((legacy_sentinel(), rest.to_string()));
                 }
             }
         }
@@ -387,13 +444,13 @@ impl SecretBackend for EnvBackend {
         Ok(out)
     }
 
-    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
-        env::set_var(Self::env_key(uid, key), value);
+    async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
+        env::set_var(Self::env_key(principal, key), value);
         Ok(())
     }
 
-    async fn delete(&self, uid: u32, key: &str) -> Result<()> {
-        env::remove_var(Self::env_key(uid, key));
+    async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
+        env::remove_var(Self::env_key(principal, key));
         Ok(())
     }
 }
@@ -403,19 +460,36 @@ impl SecretBackend for EnvBackend {
 // ---------------------------------------------------------------------------
 
 /// Secret backend backed by an encrypted YAML file.
-/// The on-disk shape is `{ <uid>: { <key>: <value> } }`.
+/// The on-disk shape is `{ <principal>: { <key>: <value> } }`. For a Unix uid
+/// the principal key is the bare decimal uid (`{ 1000: { ... } }`), exactly the
+/// pre-principal layout, so existing files read with no migration; a Windows SID
+/// principal is the SID string.
 #[derive(Debug, Clone)]
 pub struct LocalBackend {
     path: PathBuf,
     gpg_recipient: Option<String>,
 }
 
-type LocalStore = HashMap<u32, HashMap<String, String>>;
+/// In-memory namespaced store, keyed by the principal's raw string. A Unix uid
+/// principal is its decimal string (`"1000"`); the on-disk YAML key is the bare
+/// scalar `1000`, and an integer YAML key is normalized to this string form on
+/// load, so legacy uid-keyed files round-trip.
+type LocalStore = HashMap<String, HashMap<String, String>>;
 type LegacyLocalStore = HashMap<String, String>;
 
 enum LocalStoreVariant {
     Namespaced(LocalStore),
     Legacy(LegacyLocalStore),
+}
+
+/// Normalize a YAML mapping key (which may be an integer for legacy uid-keyed
+/// files, or a string) to the principal's raw string form.
+fn yaml_key_to_principal_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 impl LocalBackend {
@@ -473,8 +547,27 @@ impl LocalBackend {
         }
 
         let content = String::from_utf8_lossy(&output.stdout);
-        if let Ok(store) = serde_yaml::from_str::<LocalStore>(&content) {
-            return Ok(LocalStoreVariant::Namespaced(store));
+        // The namespaced shape is `{ <principal>: { <key>: <value> } }`. Parse
+        // through `Value` so a legacy integer uid key (`1000:`) and a string
+        // key (`"1000":` or a SID) both normalize to the principal raw string.
+        if let Ok(serde_yaml::Value::Mapping(map)) =
+            serde_yaml::from_str::<serde_yaml::Value>(&content)
+        {
+            let mut namespaced: LocalStore = HashMap::new();
+            let mut all_namespaced = true;
+            for (k, v) in &map {
+                let (Some(principal), Ok(inner)) = (
+                    yaml_key_to_principal_string(k),
+                    serde_yaml::from_value::<HashMap<String, String>>(v.clone()),
+                ) else {
+                    all_namespaced = false;
+                    break;
+                };
+                namespaced.insert(principal, inner);
+            }
+            if all_namespaced {
+                return Ok(LocalStoreVariant::Namespaced(namespaced));
+            }
         }
         if let Ok(store) = serde_yaml::from_str::<LegacyLocalStore>(&content) {
             return Ok(LocalStoreVariant::Legacy(store));
@@ -543,19 +636,21 @@ impl SecretBackend for LocalBackend {
         "local"
     }
 
-    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+    async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>> {
+        let ns = principal.as_str();
         match self.load_store_variant().await? {
             LocalStoreVariant::Namespaced(store) => {
-                Ok(store.get(&uid).and_then(|m| m.get(key)).cloned())
+                Ok(store.get(ns).and_then(|m| m.get(key)).cloned())
             }
             LocalStoreVariant::Legacy(_) => Ok(None),
         }
     }
 
-    async fn list(&self, uid: u32) -> Result<Vec<String>> {
+    async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>> {
+        let ns = principal.as_str();
         let mut keys: Vec<String> = match self.load_store_variant().await? {
             LocalStoreVariant::Namespaced(store) => store
-                .get(&uid)
+                .get(ns)
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default(),
             LocalStoreVariant::Legacy(_) => Vec::new(),
@@ -565,16 +660,19 @@ impl SecretBackend for LocalBackend {
         Ok(keys)
     }
 
-    async fn list_all(&self) -> Result<Vec<(u32, String)>> {
-        let mut out: Vec<(u32, String)> = match self.load_store_variant().await? {
+    async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>> {
+        let mut out: Vec<(PrincipalKey, String)> = match self.load_store_variant().await? {
             LocalStoreVariant::Namespaced(store) => store
                 .iter()
-                .flat_map(|(uid, m)| m.keys().map(move |k| (*uid, k.clone())))
+                .flat_map(|(ns, m)| {
+                    let principal = PrincipalKey::from_raw(ns.clone());
+                    m.keys().map(move |k| (principal.clone(), k.clone()))
+                })
                 .collect(),
             LocalStoreVariant::Legacy(store) => store
                 .keys()
                 .cloned()
-                .map(|k| (LEGACY_UID_SENTINEL, k))
+                .map(|k| (legacy_sentinel(), k))
                 .collect(),
         };
         out.sort();
@@ -582,11 +680,12 @@ impl SecretBackend for LocalBackend {
         Ok(out)
     }
 
-    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
+    async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
+        let ns = principal.as_str().to_string();
         match self.load_store_variant().await? {
             LocalStoreVariant::Namespaced(mut store) => {
                 store
-                    .entry(uid)
+                    .entry(ns)
                     .or_default()
                     .insert(key.to_string(), value.to_string());
                 self.save_store_variant(&LocalStoreVariant::Namespaced(store))
@@ -598,13 +697,14 @@ impl SecretBackend for LocalBackend {
         }
     }
 
-    async fn delete(&self, uid: u32, key: &str) -> Result<()> {
+    async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
+        let ns = principal.as_str();
         match self.load_store_variant().await? {
             LocalStoreVariant::Namespaced(mut store) => {
-                if let Some(m) = store.get_mut(&uid) {
+                if let Some(m) = store.get_mut(ns) {
                     m.remove(key);
                     if m.is_empty() {
-                        store.remove(&uid);
+                        store.remove(ns);
                     }
                 }
                 self.save_store_variant(&LocalStoreVariant::Namespaced(store))
@@ -621,8 +721,14 @@ impl SecretBackend for LocalBackend {
 // SecretFd
 // ---------------------------------------------------------------------------
 
-/// File-descriptor wrapper for secret injection. The secret is written to
-/// a temporary file with 0600 permissions and cleaned up on drop.
+/// File-descriptor wrapper for secret injection. The secret is written to a
+/// temporary file readable only by the owner, and cleaned up on drop.
+///
+/// Owner-only access is enforced differently per platform:
+/// - Unix: an explicit `0600` mode on the file.
+/// - Windows: the temp dir is created under the daemon service account's
+///   `%TEMP%`, which inherits that account's owner-scoped default ACL; no
+///   other account (including the unrelated agent account) can read it.
 #[derive(Debug)]
 pub struct SecretFd {
     pub path: PathBuf,
@@ -638,8 +744,9 @@ impl SecretFd {
         let path = temp_dir.path().join("secret");
 
         fs::write(&path, secret)?;
-        // On Windows the temp dir is already owner-scoped by its default ACL;
-        // the 0600 mode applies only on Unix.
+        // Restrict to the owner. On Unix this is the 0600 mode bit; on Windows
+        // the file inherits the owner-scoped default ACL of the service
+        // account's per-user temp directory (see the type-level docs).
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
@@ -665,7 +772,7 @@ impl Drop for SecretFd {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct CacheKey {
-    uid: u32,
+    principal: PrincipalKey,
     key: String,
 }
 
@@ -700,9 +807,9 @@ impl SecretManager {
         self.backend.name()
     }
 
-    pub async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+    pub async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>> {
         let ck = CacheKey {
-            uid,
+            principal: principal.clone(),
             key: key.to_string(),
         };
         {
@@ -712,7 +819,7 @@ impl SecretManager {
             }
         }
 
-        let value = self.backend.get(uid, key).await?;
+        let value = self.backend.get(principal, key).await?;
 
         if let Some(ref v) = value {
             let mut cache = self.cache.write().await;
@@ -722,20 +829,20 @@ impl SecretManager {
         Ok(value)
     }
 
-    pub async fn list(&self, uid: u32) -> Result<Vec<String>> {
-        self.backend.list(uid).await
+    pub async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>> {
+        self.backend.list(principal).await
     }
 
-    pub async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+    pub async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>> {
         self.backend.list_all().await
     }
 
-    pub async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
-        self.backend.set(uid, key, value).await?;
+    pub async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
+        self.backend.set(principal, key, value).await?;
         let mut cache = self.cache.write().await;
         cache.insert(
             CacheKey {
-                uid,
+                principal: principal.clone(),
                 key: key.to_string(),
             },
             value.to_string(),
@@ -743,18 +850,18 @@ impl SecretManager {
         Ok(())
     }
 
-    pub async fn delete(&self, uid: u32, key: &str) -> Result<()> {
-        self.backend.delete(uid, key).await?;
+    pub async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
+        self.backend.delete(principal, key).await?;
         let mut cache = self.cache.write().await;
         cache.remove(&CacheKey {
-            uid,
+            principal: principal.clone(),
             key: key.to_string(),
         });
         Ok(())
     }
 
-    pub async fn inject_fd(&self, uid: u32, key: &str) -> Result<SecretFd> {
-        let secret = match self.get(uid, key).await? {
+    pub async fn inject_fd(&self, principal: &PrincipalKey, key: &str) -> Result<SecretFd> {
+        let secret = match self.get(principal, key).await? {
             Some(s) => s,
             None => anyhow::bail!("secret not found: {}", key),
         };
@@ -857,9 +964,13 @@ mod tests {
     use std::env;
     use std::sync::Mutex;
 
+    fn p(uid: u32) -> PrincipalKey {
+        PrincipalKey::from_uid(uid)
+    }
+
     #[derive(Debug, Default)]
     struct MockBackend {
-        store: Mutex<HashMap<(u32, String), String>>,
+        store: Mutex<HashMap<(PrincipalKey, String), String>>,
     }
 
     impl MockBackend {
@@ -876,34 +987,34 @@ mod tests {
             "mock"
         }
 
-        async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+        async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>> {
             let store = self.store.lock().unwrap();
-            Ok(store.get(&(uid, key.to_string())).cloned())
+            Ok(store.get(&(principal.clone(), key.to_string())).cloned())
         }
 
-        async fn list(&self, uid: u32) -> Result<Vec<String>> {
+        async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>> {
             let store = self.store.lock().unwrap();
             Ok(store
                 .keys()
-                .filter(|(u, _)| *u == uid)
+                .filter(|(u, _)| u == principal)
                 .map(|(_, k)| k.clone())
                 .collect())
         }
 
-        async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+        async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>> {
             let store = self.store.lock().unwrap();
             Ok(store.keys().cloned().collect())
         }
 
-        async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
+        async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
             let mut store = self.store.lock().unwrap();
-            store.insert((uid, key.to_string()), value.to_string());
+            store.insert((principal.clone(), key.to_string()), value.to_string());
             Ok(())
         }
 
-        async fn delete(&self, uid: u32, key: &str) -> Result<()> {
+        async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
             let mut store = self.store.lock().unwrap();
-            store.remove(&(uid, key.to_string()));
+            store.remove(&(principal.clone(), key.to_string()));
             Ok(())
         }
     }
@@ -913,53 +1024,76 @@ mod tests {
         let backend = Arc::new(MockBackend::new());
         let manager = SecretManager::new(backend);
 
-        manager.set(1000, "api_key", "alice-key").await.unwrap();
-        manager.set(1001, "api_key", "bob-key").await.unwrap();
+        manager.set(&p(1000), "api_key", "alice-key").await.unwrap();
+        manager.set(&p(1001), "api_key", "bob-key").await.unwrap();
 
         assert_eq!(
-            manager.get(1000, "api_key").await.unwrap(),
+            manager.get(&p(1000), "api_key").await.unwrap(),
             Some("alice-key".to_string())
         );
         assert_eq!(
-            manager.get(1001, "api_key").await.unwrap(),
+            manager.get(&p(1001), "api_key").await.unwrap(),
             Some("bob-key".to_string())
         );
-        assert_eq!(manager.get(1002, "api_key").await.unwrap(), None);
+        assert_eq!(manager.get(&p(1002), "api_key").await.unwrap(), None);
 
-        let alice_keys = manager.list(1000).await.unwrap();
+        let alice_keys = manager.list(&p(1000)).await.unwrap();
         assert_eq!(alice_keys, vec!["api_key".to_string()]);
 
         let all = manager.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
 
-        manager.delete(1000, "api_key").await.unwrap();
-        assert_eq!(manager.get(1000, "api_key").await.unwrap(), None);
+        manager.delete(&p(1000), "api_key").await.unwrap();
+        assert_eq!(manager.get(&p(1000), "api_key").await.unwrap(), None);
         // Bob's still there.
         assert_eq!(
-            manager.get(1001, "api_key").await.unwrap(),
+            manager.get(&p(1001), "api_key").await.unwrap(),
             Some("bob-key".to_string())
         );
     }
 
     #[tokio::test]
-    async fn secret_manager_cache_is_uid_keyed() {
+    async fn secret_manager_per_principal_isolates_sid_from_uid() {
+        // A Windows SID principal and a Unix uid principal are distinct
+        // namespaces even when a key name collides.
         let backend = Arc::new(MockBackend::new());
         let manager = SecretManager::new(backend);
 
-        manager.set(1000, "k", "alice").await.unwrap();
-        manager.set(1001, "k", "bob").await.unwrap();
+        let sid = PrincipalKey::from_sid("S-1-5-21-1-2-3-1001");
+        manager.set(&p(1000), "api_key", "unix-val").await.unwrap();
+        manager.set(&sid, "api_key", "win-val").await.unwrap();
+
+        assert_eq!(
+            manager.get(&sid, "api_key").await.unwrap(),
+            Some("win-val".to_string())
+        );
+        assert_eq!(
+            manager.get(&p(1000), "api_key").await.unwrap(),
+            Some("unix-val".to_string())
+        );
+        // The uid principal cannot see the SID's value and vice versa.
+        assert_eq!(manager.list(&sid).await.unwrap(), vec!["api_key"]);
+    }
+
+    #[tokio::test]
+    async fn secret_manager_cache_is_principal_keyed() {
+        let backend = Arc::new(MockBackend::new());
+        let manager = SecretManager::new(backend);
+
+        manager.set(&p(1000), "k", "alice").await.unwrap();
+        manager.set(&p(1001), "k", "bob").await.unwrap();
 
         // Populate cache
-        let _ = manager.get(1000, "k").await;
-        let _ = manager.get(1001, "k").await;
+        let _ = manager.get(&p(1000), "k").await;
+        let _ = manager.get(&p(1001), "k").await;
 
         let cache = manager.cache.read().await;
         let alice_ck = CacheKey {
-            uid: 1000,
+            principal: p(1000),
             key: "k".into(),
         };
         let bob_ck = CacheKey {
-            uid: 1001,
+            principal: p(1001),
             key: "k".into(),
         };
         assert_eq!(cache.get(&alice_ck).map(String::as_str), Some("alice"));
@@ -989,27 +1123,44 @@ mod tests {
     #[tokio::test]
     async fn env_backend_namespaces_by_uid() {
         let backend = EnvBackend::new();
+        // The on-disk env layout is the uppercase `U<uid>` segment; a uid
+        // principal's `segment()` (`u<uid>`) is uppercased to match it, so
+        // existing `GUARD_SECRET_U<uid>_<KEY>` vars are read with no migration.
         env::set_var("GUARD_SECRET_U2000_EB_KEY", "v2000");
         env::set_var("GUARD_SECRET_U2001_EB_KEY", "v2001");
 
         assert_eq!(
-            backend.get(2000, "EB_KEY").await.unwrap(),
+            backend.get(&p(2000), "EB_KEY").await.unwrap(),
             Some("v2000".to_string())
         );
         assert_eq!(
-            backend.get(2001, "EB_KEY").await.unwrap(),
+            backend.get(&p(2001), "EB_KEY").await.unwrap(),
             Some("v2001".to_string())
         );
 
-        let keys = backend.list(2000).await.unwrap();
+        let keys = backend.list(&p(2000)).await.unwrap();
         assert!(keys.contains(&"EB_KEY".to_string()));
 
         let all = backend.list_all().await.unwrap();
-        assert!(all.contains(&(2000u32, "EB_KEY".to_string())));
-        assert!(all.contains(&(2001u32, "EB_KEY".to_string())));
+        assert!(all.contains(&(p(2000), "EB_KEY".to_string())));
+        assert!(all.contains(&(p(2001), "EB_KEY".to_string())));
 
         env::remove_var("GUARD_SECRET_U2000_EB_KEY");
         env::remove_var("GUARD_SECRET_U2001_EB_KEY");
+    }
+
+    #[tokio::test]
+    async fn env_backend_set_uses_legacy_uppercase_uid_layout() {
+        // Writing through the principal API must produce exactly the historical
+        // `GUARD_SECRET_U<uid>_<KEY>` variable so a uid namespace is wire- and
+        // disk-compatible across the retype.
+        let backend = EnvBackend::new();
+        let key = format!("SETFMT_{}", std::process::id());
+        backend.set(&p(4242), &key, "v").await.unwrap();
+        let expected = format!("GUARD_SECRET_U4242_{key}");
+        assert_eq!(env::var(&expected).ok(), Some("v".to_string()));
+        backend.delete(&p(4242), &key).await.unwrap();
+        assert!(env::var(&expected).is_err());
     }
 
     #[tokio::test]
@@ -1017,9 +1168,9 @@ mod tests {
         let backend = EnvBackend::new();
         env::set_var("GUARD_SECRET_LEGACY_KEY", "legacy");
 
-        assert_eq!(backend.get(2000, "LEGACY_KEY").await.unwrap(), None);
+        assert_eq!(backend.get(&p(2000), "LEGACY_KEY").await.unwrap(), None);
         assert!(!backend
-            .list(2000)
+            .list(&p(2000))
             .await
             .unwrap()
             .contains(&"LEGACY_KEY".to_string()));
@@ -1027,7 +1178,7 @@ mod tests {
             .list_all()
             .await
             .unwrap()
-            .contains(&(LEGACY_UID_SENTINEL, "LEGACY_KEY".to_string())));
+            .contains(&(legacy_sentinel(), "LEGACY_KEY".to_string())));
 
         env::remove_var("GUARD_SECRET_LEGACY_KEY");
     }
@@ -1042,28 +1193,70 @@ mod tests {
     }
 
     #[test]
-    fn pass_store_listing_walks_uid_namespaces() {
+    fn pass_store_listing_walks_principal_namespaces() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(".cache")
             .join(format!("pass-store-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("guard/u1000")).unwrap();
         fs::create_dir_all(root.join("guard/u1001/nested")).unwrap();
+        // A SID-derived segment (the form `PrincipalKey::segment()` emits).
+        fs::create_dir_all(root.join("guard/S_1_5_21_1_2_3_1001")).unwrap();
         fs::write(root.join("guard/u1000/OPNSENSE_API_KEY.gpg"), b"x").unwrap();
         fs::write(root.join("guard/u1001/nested/token.gpg"), b"y").unwrap();
+        fs::write(root.join("guard/S_1_5_21_1_2_3_1001/WIN_KEY.gpg"), b"w").unwrap();
         fs::write(root.join("guard/LEGACY.gpg"), b"z").unwrap();
         fs::write(root.join("guard/.gpg-id"), b"test").unwrap();
 
         let (all, legacy) = list_pass_store_entries(&root).unwrap();
+        // Entries are sorted lexically by principal string: the decimal uids
+        // sort ahead of the `S`-prefixed SID segment.
         assert_eq!(
             all,
             vec![
-                (1000u32, "OPNSENSE_API_KEY".to_string()),
-                (1001u32, "nested/token".to_string())
+                (PrincipalKey::from_uid(1000), "OPNSENSE_API_KEY".to_string()),
+                (PrincipalKey::from_uid(1001), "nested/token".to_string()),
+                (
+                    PrincipalKey::from_raw("S_1_5_21_1_2_3_1001"),
+                    "WIN_KEY".to_string()
+                ),
             ]
         );
         assert_eq!(legacy, vec!["LEGACY".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_store_yaml_key_normalizes_integer_uid_to_principal_string() {
+        // A pre-principal `secrets.yaml` stores the bare integer uid as the
+        // mapping key (`1000: { ... }`). The load path normalizes that integer
+        // key to the uid principal's raw string, so the matching uid principal
+        // reads its own namespace with no migration. A string SID key is
+        // preserved verbatim.
+        let legacy_int: serde_yaml::Value =
+            serde_yaml::from_str("1000:\n  OPNSENSE_API_KEY: v\n").unwrap();
+        let serde_yaml::Value::Mapping(map) = legacy_int else {
+            panic!("expected mapping");
+        };
+        let (int_key, inner) = map.iter().next().unwrap();
+        assert_eq!(
+            yaml_key_to_principal_string(int_key).as_deref(),
+            Some(PrincipalKey::from_uid(1000).as_str())
+        );
+        // The inner map deserializes as the per-key value store.
+        let inner: HashMap<String, String> = serde_yaml::from_value(inner.clone()).unwrap();
+        assert_eq!(inner.get("OPNSENSE_API_KEY").map(String::as_str), Some("v"));
+
+        let sid_keyed: serde_yaml::Value =
+            serde_yaml::from_str("S-1-5-21-1-2-3-1001:\n  WIN_KEY: v\n").unwrap();
+        let serde_yaml::Value::Mapping(map) = sid_keyed else {
+            panic!("expected mapping");
+        };
+        let (sid_key, _) = map.iter().next().unwrap();
+        assert_eq!(
+            yaml_key_to_principal_string(sid_key).as_deref(),
+            Some(PrincipalKey::from_sid("S-1-5-21-1-2-3-1001").as_str())
+        );
     }
 }
