@@ -9,25 +9,74 @@ Use this when `guard` should listen on a local UNIX socket and serve local clien
 On Windows, guard's native local transport is a named pipe with SID-based peer
 authentication, selected with `--socket <name>` (the same flag that selects a
 UNIX domain socket on Unix; the name maps to `\\.\pipe\<name>`). Point clients at
-it with `guard config set-server <name>`. Connect access is governed by the pipe
+it with `guard config set-server <name>`. The named-pipe SID is the caller's
+cross-platform principal, with exact parity to a Unix peer uid, so consequence
+gating, per-principal secret/`--env` injection, and daemon-principal admin all
+work over the pipe. The operator is whoever runs as the daemon's own principal
+(its SID on Windows, its uid on Unix). Connect access is governed by the pipe
 ACL — Administrators/SYSTEM/Authenticated Users by default; tighten it to a
-specific agent SID on a multi-user host. A TCP loopback transport is also
-available with `--tcp-port` (default `127.0.0.1:8123`) and a shared
-`SSH_GUARD_AUTH_TOKEN`. Either way, Windows callers are not Unix peers, so
-UID-scoped secret injection, `--exec-as-caller`, consequence gating, and
-daemon-UID admin are unavailable; TCP admin RPCs such as `guard grant` require a
-separate `SSH_GUARD_ADMIN_TOKEN`.
+specific agent SID on a multi-user host.
 
-The helper script [`deployment/windows/guard-launch.ps1`](deployment/windows/guard-launch.ps1)
-starts the Windows daemon with loopback TCP, optional learned rules, and logs
-under `%LOCALAPPDATA%\guard`. Pass `-EnvFile` when credentials live outside the
-repository, for example in a WSL home directory. If Windows does not have a
-kubeconfig, the launcher attempts a one-time copy from Ubuntu WSL's
-`$KUBECONFIG` or `~/.kube/config` into `%USERPROFILE%\.kube\config` before
-starting the native Windows daemon; pass `-NoCopyKubeconfig` to disable that
-bootstrap. The launcher also generates and stores separate TCP exec/admin tokens
-with `guard config set-token` and `guard config set-admin-token` when they are
-missing.
+A TCP loopback transport is also available with `--tcp-port` (default
+`127.0.0.1:8123`) and a shared `SSH_GUARD_AUTH_TOKEN`. A TCP caller carries only
+a bearer token and no local principal, so over TCP consequence gating is refused,
+secret/`--env` injection is refused, and non-Ping admin RPCs such as `guard grant`
+require the separate `SSH_GUARD_ADMIN_TOKEN`. `--exec-as-caller` (setuid-style
+identity drop) is Unix-only; on Windows the daemon always executes approved
+commands as its own service account, and containment rests on that account
+isolation rather than an identity swap.
+
+The installer [`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1)
+provisions the bypass-resistant Windows service model: it registers guard as a
+Windows service running under the virtual service account `NT SERVICE\guard`,
+which owns the named pipe, the state database (`C:\ProgramData\guard\state.db`),
+the verb catalog, and any brokered credentials under an NTFS ACL that grants only
+the guard SID, SYSTEM, and Administrators and removes Users/Authenticated
+Users/Everyone. Because the interactive agent runs as a different, non-admin SID,
+it cannot satisfy the daemon's admin check to approve its own held commands and
+cannot read the brokered credentials or state. Run install/uninstall and the
+operator actions (`approve`, `deny`, `confirm`, `revert`) from an elevated
+PowerShell; `status`, `provisionals`, and `approvals` are read-only. Pass
+`-EnvFile` to supply an LLM API key; with no key the service runs `--no-llm`
+(static/verb policy only).
+
+## Orchestrated workers with operator approval
+
+Consequence gating and session grants compose into a foreman/worker pattern for
+autonomous fleets. An orchestrator (the foreman) holds the operator role; the
+daemon runs as a separate principal (a dedicated uid on Unix, the service
+account on Windows); workers are agents that reach the system only through
+`guard run` and `guard verb`.
+
+1. The foreman mints a scoped session grant for each worker —
+   `guard session new --allow '<glob>' --prompt '<intent>' --ttl <secs>`, or
+   `guard grant` with a prose description — and hands the worker the resulting
+   `GUARD_SESSION` token. The grant narrows what the worker may attempt without
+   relaxing the global mode.
+
+2. The foreman loads a gated verb catalog with `--verbs`
+   ([`examples/verbs-kubectl.yaml`](examples/verbs-kubectl.yaml) is a reference).
+   Each verb pins a binary and an anchored, pattern-validated argv template, and
+   declares a consequence class. The catalog's `context` parameter is an explicit
+   allowlist of non-production clusters; a production context is not in the
+   alternation, so every verb rejects it and a worker cannot target production
+   through any verb.
+
+3. Workers call `guard verb run <name> --param k=v` or `guard run <cmd>` through
+   the daemon. With `--gate consequence`, reversible operations (read-only
+   inspection) run immediately, recoverable operations run behind an auto-revert
+   envelope, and irreversible operations are held for operator approval and not
+   executed.
+
+4. The foreman reviews held work with `guard approvals` / `guard provisionals`
+   and decides with `guard approve|deny|confirm|revert <handle>`. These control
+   RPCs are accepted only from the daemon's own principal, so a worker can never
+   approve its own held command — the irreversible steps stay with the operator.
+
+The trust boundary is the principal split: workers run as a different principal
+than the daemon, so the gate, the secret namespace, and the approval RPCs are all
+beyond their reach. This holds identically on Unix (uid separation) and Windows
+(service-account isolation with ACL'd state and credential directories).
 
 ## Recommended deployment
 
@@ -61,9 +110,11 @@ commands after policy approval.
 - The agent should not have access to the guard process's `/proc/*/environ` or `/proc/*/cmdline` (ensured by running as a different user with standard procfs hidepid or systemd's `ProtectProc`).
 - For containers, use `env_clear` (enabled by default) so child processes never see the API key. Output redaction (also default) catches secrets in command output.
 
-The current server validates caller UIDs but does not drop privileges to the
-caller before execution. It executes commands as the service identity. A root
-service is therefore a privileged broker, not per-user impersonation.
+By default the server validates caller UIDs but executes commands as its own
+service identity, so a root service is a privileged broker, not per-user
+impersonation. A Unix root daemon started with `--exec-as-caller` over a
+Unix-socket-only listener instead drops each child to the calling uid before
+exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only.
 
 ## Files
 
@@ -129,10 +180,13 @@ ls -l /run/guard/guard.sock
 ## Notes
 
 - The service runs in server mode over a UNIX socket.
-- On Windows, run `guard server start --tcp-port 8123 --learn-rules` from a
-  service manager or scheduled task and set `SSH_GUARD_LLM_API_KEY` /
-  `OPENROUTER_API_KEY` in that service environment. Use `guard config set-port
-  8123` for clients on the same host.
+- On Windows, run `deployment/windows/install-guard.ps1` to register the
+  service-account model over a named pipe; this is required for consequence
+  gating and credential brokering, since both authorize on the named-pipe SID.
+  For a no-gating deployment, run `guard server start --tcp-port 8123
+  --learn-rules` from a service manager or scheduled task, set
+  `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` in that service environment, and
+  use `guard config set-port 8123` for clients on the same host.
 - The socket can be world-connectable at the filesystem layer because authorization is enforced by peer UID in the server.
 - Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
 - The packaged unit stores persistent session state at `/var/lib/guard/state.db`, which remains writable under the default systemd sandbox profile.

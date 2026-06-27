@@ -8,6 +8,7 @@ Source of truth hierarchy:
 4. `src/session.rs` and `src/session_store.rs` -- session grant model, retention rules, and SQLite-backed persistence for grants, session interaction history, and consequence-gating runtime state (provisional executions and operator approvals).
 5. `src/mcp.rs` -- stdio MCP facade: exposes `guard_run` tool for agent clients, backed by the daemon protocol.
 6. `src/gating/` -- consequence-gating model. `mod.rs` holds the shared protocol types (`Reversibility`, `GateMode`, `Coverage`) and the pure routing function `decide_gate`. `provisional.rs` and `approval.rs` are the containment-envelope and operator-approval state machines (pure: the daemon supplies the clock, exec, and persistence). `verb.rs` is the operator-authored verb catalog (typed templates, anchored-pattern validation, rendering).
+7. `src/principal.rs` -- `PrincipalKey`, the cross-platform caller/daemon identity. A Unix uid and a Windows named-pipe SID are both wrapped as a `PrincipalKey`; every operator/owner comparison, secret-namespace scoping, and gating-authorization decision is expressed against this type. The only platform-specific code is how the key is produced (a uid string on Unix, a SID string on Windows); all downstream comparisons are shared.
 
 ## Execution flow
 
@@ -45,33 +46,48 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 7. **Static policy** (optional, opt-in): Glob-pattern allow and deny lists for fast decisions on deterministically safe or unsafe commands. Allow matches skip the LLM; deny matches reject without an LLM call. Everything else falls through to the LLM evaluator. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics. See `examples/` for reference policies.
 
-8. **Consequence gating** (optional, opt-in via `--gate consequence`): After an LLM allow, the daemon routes the command by the reversibility class the evaluator returned. `reversible` (low-risk) executes immediately; `recoverable` executes inside a containment envelope that auto-reverts unless an operator confirms; `irreversible` (or high-risk, or unclassified) is held for daemon-UID operator approval and not executed. Routing is fail-safe — a missing class holds, and reversibility can only raise the gate. Operator-authored deterministic allows (static policy, trusted verbs) bypass the gate; only the open-ended LLM path is routed. The held command is bound to an immutable execution snapshot (binary, args, env, secret-key mapping, rendered verb, catalog version); approval executes that snapshot verbatim and a verb-catalog change since the hold voids it. Provisional and approval state persist in the state database; startup recovery never fires a revert unattended (past-deadline provisionals become `needs_operator_decision`). A free-form `--revert` is policy-evaluated at arm time; a verb's revert is operator-authored and pre-authorized. A single sweeper task fires due auto-reverts (after a startup grace) and expires unattended holds (fail-closed deny).
+8. **Consequence gating** (optional, opt-in via `--gate consequence`): After an LLM allow, the daemon routes the command by the reversibility class the evaluator returned. `reversible` (low-risk) executes immediately; `recoverable` executes inside a containment envelope that auto-reverts unless an operator confirms; `irreversible` (or high-risk, or unclassified) is held for operator approval and not executed. The operator is whoever runs as the daemon's own principal (its uid on Unix, its SID on Windows). Routing is fail-safe — a missing class holds, and reversibility can only raise the gate. Operator-authored deterministic allows (static policy, trusted verbs) bypass the gate; only the open-ended LLM path is routed. The held command is bound to an immutable execution snapshot (binary, args, env, secret-key mapping, rendered verb, catalog version); approval executes that snapshot verbatim and a verb-catalog change since the hold voids it. Provisional and approval state persist in the state database; startup recovery never fires a revert unattended (past-deadline provisionals become `needs_operator_decision`). A free-form `--revert` is policy-evaluated at arm time; a verb's revert is operator-authored and pre-authorized. A single sweeper task fires due auto-reverts (after a startup grace) and expires unattended holds (fail-closed deny).
 
 9. **Verb catalog** (optional, opt-in via `--verbs`): An operator-authored, hot-reloaded catalog of typed operations. Each verb fixes a binary and an argv template with pattern-validated, anchored parameters; rendering substitutes each placeholder as exactly one argv element, so parameter and flag injection are structurally impossible. A verb declares its consequence class (which drives the gate) and, for recoverable verbs, a structured rollback. A `trusted` verb skips the LLM evaluator — a deterministic allow path comparable to a static-policy allow — while still enforcing parameter patterns. Agents cannot add or alter verbs; the catalog is the slow, operator-reviewed surface.
 
 ## Admin authorization
 
-Admin RPCs (session grant/revoke/show/list and the full `status` snapshot) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. The model is intentionally simple:
+Admin RPCs (session grant/revoke/show/list and the full `status` snapshot) are gated separately from exec. Without this separation, an exec-allowed principal could mint a session whose `--prompt` overrides the LLM policy. The model is intentionally simple and identical on both platforms, expressed against the caller's `PrincipalKey` (a uid on Unix, a named-pipe SID on Windows):
 
-- **Admin = the daemon's own UID.** That process can already control the daemon by signals, /proc, or restarting the service. The socket boundary adds nothing against it.
-- **There is no client-side admin token.** A token-based path would have to live somewhere — env var, config file — and any agent process running as the same user could read it. The admin/agent split is enforced by UID separation only.
+- **Admin = the daemon's own principal.** That process can already control the daemon by signals, /proc, or restarting the service. The transport boundary adds nothing against it. `validate_admin` accepts an admin RPC only when the connecting peer's principal equals the daemon's own — `daemon_principal`, resolved from the daemon's uid on Unix or its process SID on Windows.
+- **There is no client-side admin token on a local listener.** A token-based path would have to live somewhere — env var, config file — and any agent process running as the same principal could read it. The admin/agent split is enforced by principal separation only. (A TCP listener, which carries no local principal, instead requires the separate `SSH_GUARD_ADMIN_TOKEN` for non-Ping admin RPCs.)
 
-The consequence-gate control RPCs follow the same model. `Approve`, `Deny`, `Confirm`, and `Revert` are daemon-UID-only: a corrupted agent must never be able to confirm or approve its own held action. The read RPCs (`Provisionals`, `ApprovalList`, `ApprovalShow`, `VerbList`) are open to exec-allowed callers but self-scope — a non-daemon caller sees only its own provisionals/approvals (by recorded peer uid), and `ApprovalShow` requires the unguessable handle. Because this authorization rests on a peer UID that differs from the agent's, `--gate consequence` requires a Unix-socket listener (it is refused with `--tcp-port` and unavailable on Windows). Handles are minted from the same entropy source as session tokens.
+The consequence-gate control RPCs follow the same model. `Approve`, `Deny`, `Confirm`, and `Revert` are restricted to the daemon's own principal: a corrupted agent must never be able to confirm or approve its own held action. The read RPCs (`Provisionals`, `ApprovalList`, `ApprovalShow`, `VerbList`) are open to exec-allowed callers but self-scope — a non-daemon caller sees only its own provisionals/approvals (by recorded principal), and `ApprovalShow` requires the unguessable handle. Because this authorization rests on a kernel-verified local peer principal distinct from the agent's, `--gate consequence` requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows) and is refused with a TCP listener, which carries only a bearer token and no peer identity. Handles are minted from the same entropy source as session tokens.
 
 The non-privileged `Ping` admin RPC is always permitted to UIDs that can already exec, and returns version, uptime, mode, and dry-run state. That is enough for a `guard status` liveness check without fingerprinting the deployment (no LLM model identity, no redaction posture, no session counts). The privileged `Status` RPC additionally reveals the resolved state database path so the daemon owner can inspect where durable session state is stored.
 
 ## Execution authority
 
 The server executes approved commands as the daemon process identity by
-default. It authenticates local clients by peer UID (`--users`) but only
-impersonates that UID when explicitly started with `--exec-as-caller`. That
-mode requires a root daemon and a Unix-socket-only deployment; the server uses
-peer credentials to identify the caller, resolves the caller's passwd entry,
-initializes supplementary groups, and drops the child process to that UID/GID
-before exec. An unprivileged, hardened service is a policy gate and secret
-broker for commands that service identity can already run. A root service
-without `--exec-as-caller` is a privileged command broker: approved local
-commands run with root authority, similar to a sudo policy boundary.
+default, on both platforms. That service identity is the containment boundary:
+an agent reaches the system only through the daemon and so runs with the
+daemon's authority, never its own, and held-command approval rests on the
+daemon's principal being distinct from the agent's.
+
+`--exec-as-caller` is a Unix-only extension. It impersonates the calling uid:
+the mode requires a root daemon and a Unix-socket-only deployment; the server
+uses peer credentials to identify the caller, resolves the caller's passwd
+entry, initializes supplementary groups, and drops the child process to that
+UID/GID before exec, turning the daemon into a per-user secret broker and
+redactor for files the caller can already read. Windows has no setuid-style
+identity drop, so the flag is rejected there. A root Unix service without
+`--exec-as-caller` is a privileged command broker: approved local commands run
+with root authority, similar to a sudo policy boundary.
+
+On Windows, bypass-resistance comes from account isolation rather than an
+identity swap. The daemon runs as a dedicated Windows service account that owns
+the named-pipe transport, the SQLite state database, and any brokered
+credentials, all under an NTFS ACL that grants the service account, SYSTEM, and
+Administrators while removing the interactive (agent) account. The agent
+connects to the pipe under its own SID, which is not the daemon's, so it cannot
+satisfy `validate_admin` to approve its own held commands and cannot read the
+daemon's state or brokered credentials. `deployment/windows/install-guard.ps1`
+provisions this model.
 
 Systemd hardening changes what approved commands can do. In particular,
 `NoNewPrivileges=true` prevents setuid helpers such as `sudo` from elevating,
