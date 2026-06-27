@@ -2250,6 +2250,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retry_on_429_with_non_numeric_retry_after() {
+        // A Retry-After expressed as an HTTP-date (not delta-seconds) must not
+        // break the wire path: it parses to None, the evaluator falls back to
+        // its exponential backoff, and the retry still reaches success. Guards
+        // against a regression that assumed Retry-After is always an integer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses = vec![
+            (
+                429,
+                r#"{"error":"rate limited"}"#.to_string(),
+                Some("Wed, 21 Oct 2026 07:28:00 GMT".to_string()),
+            ),
+            (200, tool_call_body("APPROVE"), None),
+        ];
+        let mock = tokio::spawn(run_mock(listener, responses));
+
+        let evaluator = mock_server_evaluator(port, 2, vec![]).await;
+        let result = evaluator.evaluate_llm("id", None).await;
+        assert!(result.is_allow(), "got: {}", result);
+        let _ = mock.await;
+    }
+
+    #[tokio::test]
     async fn test_retry_on_500_then_success() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
