@@ -15,7 +15,7 @@ use crate::injection::is_valid_env_name;
 use crate::redact::{
     redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
 };
-use crate::secrets::{SecretManager, LEGACY_UID_SENTINEL};
+use crate::secrets::{legacy_sentinel, SecretManager};
 use crate::session::{
     HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
     SessionGrant, SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
@@ -26,6 +26,7 @@ use guard::gating::approval::{Approval, ApprovalRegistry, ApprovalSnapshot, Appr
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{decide_gate, Coverage, GateMode, GateOutcome, Reversibility};
+use guard::principal::{scope_eq, PrincipalKey};
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
@@ -124,6 +125,28 @@ impl CallerIdentity {
             Self::Tcp { token } => Some(token.clone()),
             Self::TcpAdmin { token } => Some(token.clone()),
             Self::Unknown => None,
+        }
+    }
+
+    /// The caller's cross-platform principal key, or `None` for an
+    /// unauthenticated caller. This is the single identity used for every
+    /// gating authorization and ownership decision, giving a Windows SID caller
+    /// full parity with a Unix uid caller.
+    pub fn principal(&self) -> Option<PrincipalKey> {
+        self.user_key().map(PrincipalKey::from_raw)
+    }
+
+    /// True only for a kernel-verified LOCAL peer — a Unix-socket uid or a
+    /// Windows named-pipe SID. A bearer-token TCP caller (`Tcp`/`TcpAdmin`) and
+    /// `Unknown` are NOT local peers, even though a TCP caller carries a token
+    /// as its principal. Credential and environment injection are gated on this
+    /// so a remote token-holder can never control a child's runtime environment.
+    pub fn is_local_peer(&self) -> bool {
+        match self {
+            Self::Unix { .. } => true,
+            #[cfg(windows)]
+            Self::Windows { .. } => true,
+            _ => false,
         }
     }
 }
@@ -444,7 +467,7 @@ pub struct ProvisionalSummary {
     pub created_unix: u64,
     pub deadline_unix: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller_uid: Option<u32>,
+    pub principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert_exit: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,7 +489,7 @@ pub struct ApprovalSummary {
     pub created_unix: u64,
     pub deadline_unix: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller_uid: Option<u32>,
+    pub principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -492,7 +515,7 @@ impl ProvisionalSummary {
             reason: p.reason.clone(),
             created_unix: p.created_unix,
             deadline_unix: p.deadline_unix,
-            caller_uid: p.caller_uid,
+            principal: p.principal.as_ref().map(|p| p.as_str().to_string()),
             revert_exit: p.revert_exit,
             revert_detail: p.revert_detail.clone(),
         }
@@ -511,7 +534,11 @@ impl ApprovalSummary {
             fingerprint: a.snapshot.fingerprint(),
             created_unix: a.created_unix,
             deadline_unix: a.deadline_unix(),
-            caller_uid: a.snapshot.caller_uid,
+            principal: a
+                .snapshot
+                .principal
+                .as_ref()
+                .map(|p| p.as_str().to_string()),
             exit_code: a.result_exit,
             stdout: a.result_stdout.clone(),
             stderr: a.result_stderr.clone(),
@@ -523,8 +550,13 @@ impl ApprovalSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretDetail {
     pub key: String,
+    /// Owning uid for a Unix uid principal; `None` for a SID or legacy entry.
+    /// Display-only; retained for back-compat with older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+    /// Owning principal string (uid or SID); `None` for a legacy flat entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     #[serde(default)]
     pub legacy: bool,
 }
@@ -667,6 +699,11 @@ pub struct ServerConfig {
     /// Effective UID of the daemon process. Admin RPCs require the
     /// caller to be this UID; there is no token-based elevation.
     pub daemon_uid: u32,
+    /// The daemon's own cross-platform principal: its uid on Unix, its process
+    /// SID on Windows. Operator/admin RPCs require the caller's principal to
+    /// equal this — the single "is the operator" source of truth on both
+    /// platforms.
+    pub daemon_principal: PrincipalKey,
     pub state_db_path: Option<PathBuf>,
     /// Consequence-gating mode. `Off` preserves legacy behavior; `Consequence`
     /// routes LLM-approved commands by reversibility.
@@ -719,6 +756,7 @@ impl ServerConfig {
             session_store,
             exec_as_caller,
             daemon_uid: current_uid(),
+            daemon_principal: resolve_daemon_principal(),
             sessions: Arc::new(RwLock::new(sessions)),
             started_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -754,15 +792,17 @@ impl ServerConfig {
     /// Without this rule, an exec-allowed agent process could mint
     /// sessions whose `--prompt` overrides the LLM policy from itself.
     fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
-        if let CallerIdentity::Unix { uid } = caller {
-            if *uid == self.daemon_uid {
-                return Ok(());
-            }
+        // The operator is whoever runs as the daemon's own principal: its uid on
+        // Unix, its SID on Windows. One comparison, both platforms. A Unix
+        // caller's principal is the uid string, equal to daemon_principal
+        // exactly when uid == daemon_uid, so Unix behavior is unchanged.
+        if matches!(caller.principal(), Some(ref p) if self.daemon_principal.eq_ci(p)) {
+            return Ok(());
         }
         if matches!(caller, CallerIdentity::TcpAdmin { .. }) {
             return Ok(());
         }
-        anyhow::bail!("admin RPC refused: caller is not the daemon UID");
+        anyhow::bail!("admin RPC refused: caller is not the daemon principal");
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
@@ -1260,7 +1300,7 @@ mod winplat {
 
     /// SID string of the daemon's own process token. Used to grant the daemon
     /// full control of the pipe DACL so it can create additional instances.
-    unsafe fn process_user_sid() -> Result<String> {
+    pub(super) unsafe fn process_user_sid() -> Result<String> {
         let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             bail!(
@@ -1949,7 +1989,7 @@ async fn handle_admin_request(
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
             let reg = config.sessions.read().await;
-            let show_prompt = matches!(caller, CallerIdentity::Unix { uid } if *uid == config.daemon_uid)
+            let show_prompt = matches!(caller.principal(), Some(ref p) if config.daemon_principal.eq_ci(p))
                 || matches!(caller, CallerIdentity::TcpAdmin { .. });
             let grants = reg
                 .list()
@@ -2012,20 +2052,20 @@ async fn handle_admin_request(
                     message: format!("invalid secret key: '{}'", key),
                 };
             }
-            let caller_uid = match caller {
-                CallerIdentity::Unix { uid } => *uid,
+            let principal = match caller.principal() {
+                Some(principal) if caller.is_local_peer() => principal,
                 _ => {
                     return AdminResponse::Error {
-                        message: "secret operations require a unix socket caller".to_string(),
+                        message: "secret ops require an authenticated local caller".to_string(),
                     };
                 }
             };
-            match config.secrets.set(caller_uid, &key, &value).await {
+            match config.secrets.set(&principal, &key, &value).await {
                 Ok(()) => {
                     tracing::info!(
-                        "[AUDIT] SECRET_SET caller={} uid={} key={}",
+                        "[AUDIT] SECRET_SET caller={} principal={} key={}",
                         caller,
-                        caller_uid,
+                        principal,
                         key
                     );
                     AdminResponse::Ok
@@ -2041,20 +2081,20 @@ async fn handle_admin_request(
                     message: format!("invalid secret key: '{}'", key),
                 };
             }
-            let caller_uid = match caller {
-                CallerIdentity::Unix { uid } => *uid,
+            let principal = match caller.principal() {
+                Some(principal) if caller.is_local_peer() => principal,
                 _ => {
                     return AdminResponse::Error {
-                        message: "secret operations require a unix socket caller".to_string(),
+                        message: "secret ops require an authenticated local caller".to_string(),
                     };
                 }
             };
-            match config.secrets.delete(caller_uid, &key).await {
+            match config.secrets.delete(&principal, &key).await {
                 Ok(()) => {
                     tracing::info!(
-                        "[AUDIT] SECRET_DELETE caller={} uid={} key={}",
+                        "[AUDIT] SECRET_DELETE caller={} principal={} key={}",
                         caller,
-                        caller_uid,
+                        principal,
                         key
                     );
                     AdminResponse::Ok
@@ -2070,15 +2110,15 @@ async fn handle_admin_request(
                     message: format!("invalid secret key: '{}'", key),
                 };
             }
-            let caller_uid = match caller {
-                CallerIdentity::Unix { uid } => *uid,
+            let principal = match caller.principal() {
+                Some(principal) if caller.is_local_peer() => principal,
                 _ => {
                     return AdminResponse::Error {
-                        message: "secret operations require a unix socket caller".to_string(),
+                        message: "secret ops require an authenticated local caller".to_string(),
                     };
                 }
             };
-            match config.secrets.get(caller_uid, &key).await {
+            match config.secrets.get(&principal, &key).await {
                 Ok(value) => AdminResponse::SecretExists {
                     exists: value.is_some(),
                 },
@@ -2088,15 +2128,15 @@ async fn handle_admin_request(
             }
         }
         AdminRequest::SecretList => {
-            let caller_uid = match caller {
-                CallerIdentity::Unix { uid } => *uid,
+            let principal = match caller.principal() {
+                Some(principal) if caller.is_local_peer() => principal,
                 _ => {
                     return AdminResponse::Error {
-                        message: "secret operations require a unix socket caller".to_string(),
+                        message: "secret ops require an authenticated local caller".to_string(),
                     };
                 }
             };
-            if caller_uid == config.daemon_uid {
+            if config.daemon_principal.eq_ci(&principal) {
                 match config.secrets.list_all().await {
                     Ok(pairs) => {
                         let mut keys: Vec<String> = pairs.into_iter().map(|(_, key)| key).collect();
@@ -2108,7 +2148,7 @@ async fn handle_admin_request(
                     },
                 }
             } else {
-                match config.secrets.list(caller_uid).await {
+                match config.secrets.list(&principal).await {
                     Ok(keys) => AdminResponse::SecretList { keys },
                     Err(e) => AdminResponse::Error {
                         message: format!("failed to list secrets: {}", e),
@@ -2118,22 +2158,33 @@ async fn handle_admin_request(
         }
         AdminRequest::SecretListDetailed => match config.secrets.list_all().await {
             Ok(pairs) => {
+                let legacy = legacy_sentinel();
                 let mut items: Vec<SecretDetail> = pairs
                     .into_iter()
-                    .map(|(uid, key)| SecretDetail {
-                        key,
-                        uid: if uid == LEGACY_UID_SENTINEL {
-                            None
-                        } else {
-                            Some(uid)
-                        },
-                        legacy: uid == LEGACY_UID_SENTINEL,
+                    .map(|(principal, key)| {
+                        let is_legacy = principal.eq_ci(&legacy);
+                        SecretDetail {
+                            key,
+                            // The display uid field is populated only for a pure
+                            // uid principal; SID and legacy entries carry no uid.
+                            uid: if is_legacy {
+                                None
+                            } else {
+                                principal.as_str().parse::<u32>().ok()
+                            },
+                            principal: if is_legacy {
+                                None
+                            } else {
+                                Some(principal.into_string())
+                            },
+                            legacy: is_legacy,
+                        }
                     })
                     .collect();
                 items.sort_by(|a, b| {
                     a.legacy
                         .cmp(&b.legacy)
-                        .then_with(|| a.uid.cmp(&b.uid))
+                        .then_with(|| a.principal.cmp(&b.principal))
                         .then_with(|| a.key.cmp(&b.key))
                 });
                 AdminResponse::SecretListDetailed { items }
@@ -2214,39 +2265,39 @@ async fn handle_admin_request(
         AdminRequest::Approve { handle } => handle_approve(config, caller, &handle).await,
         AdminRequest::Deny { handle } => handle_deny(config, caller, &handle).await,
         AdminRequest::Provisionals => {
-            let (is_daemon, caller_uid) = caller_scope(config, caller);
+            let (is_daemon, caller_key) = caller_scope(config, caller);
             let items = config
                 .provisional
                 .read()
                 .await
                 .list()
                 .iter()
-                .filter(|p| is_daemon || p.caller_uid == caller_uid)
+                .filter(|p| is_daemon || scope_eq(&p.principal, &caller_key))
                 .map(ProvisionalSummary::from_row)
                 .collect();
             AdminResponse::Provisionals { items }
         }
         AdminRequest::ApprovalList => {
-            let (is_daemon, caller_uid) = caller_scope(config, caller);
+            let (is_daemon, caller_key) = caller_scope(config, caller);
             let items = config
                 .approvals
                 .read()
                 .await
                 .list()
                 .iter()
-                .filter(|a| is_daemon || a.snapshot.caller_uid == caller_uid)
+                .filter(|a| is_daemon || scope_eq(&a.snapshot.principal, &caller_key))
                 .map(ApprovalSummary::from_row)
                 .collect();
             AdminResponse::Approvals { items }
         }
         AdminRequest::ApprovalShow { handle } => {
-            let (is_daemon, caller_uid) = caller_scope(config, caller);
+            let (is_daemon, caller_key) = caller_scope(config, caller);
             let found = config.approvals.read().await.get(&handle).cloned();
             match found {
                 // Handle is an unguessable bearer secret; the owner (or daemon)
                 // may read its status and result. Others get NotFound, not a
                 // leak of existence.
-                Some(a) if is_daemon || a.snapshot.caller_uid == caller_uid => {
+                Some(a) if is_daemon || scope_eq(&a.snapshot.principal, &caller_key) => {
                     AdminResponse::ApprovalShow {
                         item: ApprovalSummary::from_row(&a),
                     }
@@ -2284,12 +2335,16 @@ async fn handle_admin_request(
     }
 }
 
-/// Returns `(is_daemon_uid, caller_uid)` for read-scoping.
-fn caller_scope(config: &ServerConfig, caller: &CallerIdentity) -> (bool, Option<u32>) {
-    match caller {
-        CallerIdentity::Unix { uid } => (*uid == config.daemon_uid, Some(*uid)),
-        _ => (false, None),
-    }
+/// Returns `(is_daemon, caller_principal)` for read-scoping. A caller is the
+/// daemon (operator) when its principal equals the daemon's; row visibility is
+/// then either daemon-wide or scoped to the caller's own principal via
+/// `scope_eq` (so two unauthenticated `None` callers never share rows).
+fn caller_scope(config: &ServerConfig, caller: &CallerIdentity) -> (bool, Option<PrincipalKey>) {
+    let p = caller.principal();
+    (
+        matches!(p, Some(ref k) if config.daemon_principal.eq_ci(k)),
+        p,
+    )
 }
 
 async fn handle_confirm(
@@ -3891,17 +3946,14 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     }
 
     let user_key = caller.user_key();
-    let tool_env_uid = match caller {
-        CallerIdentity::Unix { uid } => Some(*uid),
-        _ => None,
-    };
+    let caller_principal = caller.principal();
     let tool_env = {
         let mut reg = config.tool_registry.write().await;
         let _ = reg.reload_if_stale();
         reg.resolve_env(
             &request.binary,
             &config.secrets,
-            tool_env_uid,
+            caller_principal.as_ref(),
             user_key.as_deref(),
         )
         .await
@@ -3923,37 +3975,38 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
-    // Per-run --env injection, like --secret, is only honored for callers with a
-    // trusted local UID namespace. A non-Unix (Windows named-pipe) caller cannot
-    // set child environment variables, so it cannot redirect a tool's config or
-    // endpoint lookup (e.g. cmk's %HOME%/%USERPROFILE%) via --env.
-    if !request.env.is_empty() && !matches!(caller, CallerIdentity::Unix { .. }) {
+    // Per-run --env injection is honored for any authenticated local caller
+    // (a Unix uid OR a Windows SID), but never for an unauthenticated/TCP
+    // caller, which has no trusted local identity. The daemon sets the child
+    // environment at spawn; the agent is a different process and cannot read
+    // the child's environment, so this does not leak across callers.
+    if !request.env.is_empty() && !caller.is_local_peer() {
         return ExecuteResult::exec_failed(
             allow_reason,
-            "per-run --env injection requires a caller with a trusted local UID namespace"
-                .to_string(),
+            "per-run --env injection requires an authenticated local caller".to_string(),
         );
     }
     for (key, value) in &request.env {
         tool_env.insert(key.clone(), value.clone());
     }
 
-    // Per-run --secret injection is only available to callers with a trusted
-    // local UID namespace (Unix peer credentials). It is required only when the
-    // request actually asks for secrets; a request with none proceeds on any
-    // transport (e.g. a Windows named-pipe caller).
+    // Per-run --secret injection is honored for any authenticated local caller
+    // (Unix uid OR Windows SID); secrets are resolved from that caller's own
+    // namespace via its principal. Required only when the request asks for
+    // secrets; a request with none proceeds on any transport. An
+    // unauthenticated/TCP caller has no principal and is refused.
     if !request.secrets.is_empty() {
-        let caller_uid = match caller {
-            CallerIdentity::Unix { uid } => *uid,
+        let principal = match caller.principal() {
+            Some(principal) if caller.is_local_peer() => principal,
             _ => {
                 return ExecuteResult::exec_failed(
                     allow_reason,
-                    "secret injection requires a caller with a trusted local UID namespace (unix peer credentials)".to_string(),
+                    "secret injection requires an authenticated local caller".to_string(),
                 );
             }
         };
         for (env_var, secret_key) in &request.secrets {
-            let value = match config.secrets.get(caller_uid, secret_key).await {
+            let value = match config.secrets.get(&principal, secret_key).await {
                 Ok(Some(value)) => value,
                 Ok(None) => {
                     return ExecuteResult::exec_failed(
@@ -4105,13 +4158,33 @@ fn new_handle() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Rebuild a caller identity from a stored uid so deferred execution (sweeper
-/// revert, operator approve) runs under the original caller's identity rather
-/// than silently as the daemon. A `None` uid means the daemon executes as its
-/// own identity (non-exec-as-caller deployments).
-fn reconstruct_caller(caller_uid: Option<u32>, fallback: &CallerIdentity) -> CallerIdentity {
-    match caller_uid {
-        Some(uid) => CallerIdentity::Unix { uid },
+/// Rebuild a caller identity from a stored row owner so deferred execution
+/// (sweeper revert, operator approve) runs under the original caller's identity
+/// rather than silently as the daemon. On Unix a principal whose key parses as a
+/// decimal uid reconstructs `Unix { uid }` (round-tripping the legacy uid
+/// identity exactly); on Windows the key is the caller's SID, so it reconstructs
+/// `Windows { sid }`. A `None` owner (or an unparseable Unix key) means the
+/// daemon executes as its own identity (non-exec-as-caller deployments).
+fn reconstruct_caller(
+    principal: Option<PrincipalKey>,
+    fallback: &CallerIdentity,
+) -> CallerIdentity {
+    match principal {
+        Some(key) => {
+            #[cfg(windows)]
+            {
+                CallerIdentity::Windows {
+                    sid: key.into_string(),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                match key.as_str().parse::<u32>() {
+                    Ok(uid) => CallerIdentity::Unix { uid },
+                    Err(_) => fallback.clone(),
+                }
+            }
+        }
         None => fallback.clone(),
     }
 }
@@ -4136,14 +4209,17 @@ fn invalid_binary_reason(binary: &str) -> Option<String> {
 
 /// True when a new hold/provisional would exceed the per-caller or global cap.
 /// Counts outstanding rows across both registries (a local-DoS guard).
-async fn gate_capacity_reason(config: &ServerConfig, caller_uid: Option<u32>) -> Option<String> {
+async fn gate_capacity_reason(
+    config: &ServerConfig,
+    caller_principal: Option<&PrincipalKey>,
+) -> Option<String> {
     let (prov_global, prov_caller) = {
         let reg = config.provisional.read().await;
-        (reg.outstanding(), reg.outstanding_for(caller_uid))
+        (reg.outstanding(), reg.outstanding_for(caller_principal))
     };
     let (appr_global, appr_caller) = {
         let reg = config.approvals.read().await;
-        (reg.outstanding(), reg.outstanding_for(caller_uid))
+        (reg.outstanding(), reg.outstanding_for(caller_principal))
     };
     let global = prov_global + appr_global;
     let per_caller = prov_caller + appr_caller;
@@ -4252,10 +4328,9 @@ async fn route_gated_allow<W: AsyncWrite + Unpin>(
         .await;
     }
 
-    let caller_uid = match caller {
-        CallerIdentity::Unix { uid } => Some(*uid),
-        _ => None,
-    };
+    // The row owner is the caller's cross-platform principal (uid string on
+    // Unix, SID on Windows). A non-Unix caller is no longer dropped to None.
+    let caller_principal = caller.principal();
     let force_hold = request.require_approval.unwrap_or(false);
     let revert_available = request.revert.is_some();
     let outcome = decide_gate(
@@ -4283,7 +4358,7 @@ async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 request,
                 config,
                 caller,
-                caller_uid,
+                caller_principal,
                 inputs.reason,
                 inputs.revert_preauthorized,
                 depth,
@@ -4297,7 +4372,7 @@ async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 request,
                 config,
                 caller,
-                caller_uid,
+                caller_principal,
                 inputs.reason,
                 inputs.risk,
                 inputs.reversibility,
@@ -4317,7 +4392,7 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
     caller: &CallerIdentity,
-    caller_uid: Option<u32>,
+    caller_principal: Option<PrincipalKey>,
     reason: String,
     revert_preauthorized: bool,
     depth: u32,
@@ -4351,7 +4426,7 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
             return ExecuteResult::denied(why);
         }
     }
-    if let Some(why) = gate_capacity_reason(config, caller_uid).await {
+    if let Some(why) = gate_capacity_reason(config, caller_principal.as_ref()).await {
         return ExecuteResult::denied(why);
     }
 
@@ -4366,7 +4441,7 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
         .clamp(1, MAX_CONFIRM_WITHIN_SECS);
     let provisional = Provisional {
         handle: handle.clone(),
-        caller_uid,
+        principal: caller_principal,
         binary: request.binary.clone(),
         args: request.args.clone(),
         revert_binary: revert.binary.clone(),
@@ -4444,7 +4519,7 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
     caller: &CallerIdentity,
-    caller_uid: Option<u32>,
+    caller_principal: Option<PrincipalKey>,
     reason: String,
     risk: Option<i32>,
     reversibility: Option<Reversibility>,
@@ -4461,7 +4536,7 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
             Coverage::hold(),
         );
     }
-    if let Some(why) = gate_capacity_reason(config, caller_uid).await {
+    if let Some(why) = gate_capacity_reason(config, caller_principal.as_ref()).await {
         return ExecuteResult::denied(why);
     }
 
@@ -4483,7 +4558,7 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
         verb_name: verb.as_ref().map(|v| v.name.clone()),
         verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
-        caller_uid,
+        principal: caller_principal,
     };
     let approval = Approval {
         handle: handle.clone(),
@@ -4602,7 +4677,7 @@ async fn execute_snapshot(
     snapshot: &ApprovalSnapshot,
     reason: &str,
 ) -> ExecuteResult {
-    let caller = reconstruct_caller(snapshot.caller_uid, &CallerIdentity::Unknown);
+    let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
     let request = ExecuteRequest {
         binary: snapshot.binary.clone(),
         args: snapshot.args.clone(),
@@ -4716,7 +4791,7 @@ async fn gating_sweeper(config: ServerConfig) {
 /// Run the revert for a provisional under the original caller's identity, with no
 /// client stream. Used by the sweeper and `guard revert`.
 async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
-    let caller = reconstruct_caller(p.caller_uid, &CallerIdentity::Unknown);
+    let caller = reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown);
     let request = ExecuteRequest {
         binary: p.revert_binary.clone(),
         args: p.revert_args.clone(),
@@ -4742,6 +4817,30 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         &mut sink,
     )
     .await
+}
+
+/// The daemon's own principal: its uid on Unix, its process SID on Windows.
+/// On Windows, if the SID cannot be resolved (effectively impossible — a
+/// process always has a token), fall back to a sentinel that no caller can ever
+/// match, so operator authorization fails closed (commands stay held) rather
+/// than open.
+fn resolve_daemon_principal() -> PrincipalKey {
+    #[cfg(unix)]
+    {
+        PrincipalKey::from_uid(current_uid())
+    }
+    #[cfg(windows)]
+    {
+        match unsafe { winplat::process_user_sid() } {
+            Ok(sid) => PrincipalKey::from_sid(sid),
+            Err(e) => {
+                tracing::error!(
+                    "daemon SID resolution failed ({e}); operator approval disabled (fail-closed)"
+                );
+                PrincipalKey::from_raw("\u{0}daemon-sid-unresolved\u{0}")
+            }
+        }
+    }
 }
 
 /// Read the daemon's effective UID on Unix. Windows has no Unix UID; TCP
@@ -5027,11 +5126,11 @@ async fn validate_request_injections(
         }
     }
 
-    let caller_uid = match caller {
-        CallerIdentity::Unix { uid } => *uid,
+    let principal = match caller.principal() {
+        Some(principal) if caller.is_local_peer() => principal,
         _ => {
             if !request.secrets.is_empty() {
-                return Err("secret injection requires a caller with a trusted local UID namespace (unix peer credentials)".to_string());
+                return Err("secret injection requires an authenticated local caller".to_string());
             }
             return Ok(());
         }
@@ -5044,7 +5143,7 @@ async fn validate_request_injections(
         if let Some(reason) = invalid_shell_secret_reference(command_line, env_var, secret_key) {
             return Err(reason);
         }
-        match config.secrets.get(caller_uid, secret_key).await {
+        match config.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(format!(
@@ -5942,6 +6041,91 @@ mod tests {
         assert!(err.contains("conflicting injection for 'API_TOKEN'"));
     }
 
+    #[test]
+    fn is_local_peer_excludes_tcp_and_unknown() {
+        assert!(CallerIdentity::Unix { uid: 0 }.is_local_peer());
+        assert!(!CallerIdentity::Tcp { token: "t".into() }.is_local_peer());
+        assert!(!CallerIdentity::TcpAdmin { token: "t".into() }.is_local_peer());
+        assert!(!CallerIdentity::Unknown.is_local_peer());
+        #[cfg(windows)]
+        assert!(CallerIdentity::Windows {
+            sid: "S-1-5-18".into()
+        }
+        .is_local_peer());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconstruct_caller_round_trips_windows_sid() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let rebuilt =
+            reconstruct_caller(Some(PrincipalKey::from_sid(sid)), &CallerIdentity::Unknown);
+        assert!(matches!(rebuilt, CallerIdentity::Windows { sid: s } if s == sid));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_name_normalizes_bare_name() {
+        assert_eq!(
+            winplat::pipe_name(std::path::Path::new("guard")),
+            r"\\.\pipe\guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_refuses_non_local_tcp_caller() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "echo".to_string(),
+            args: vec!["ok".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::from([("API_TOKEN".to_string(), "api/token".to_string())]),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        // A bearer-token TCP caller carries a token principal but is NOT a
+        // kernel-verified local peer; secret/env injection must be refused so a
+        // remote token-holder cannot control the child's environment.
+        for caller in [
+            CallerIdentity::Tcp {
+                token: "exec-token".into(),
+            },
+            CallerIdentity::TcpAdmin {
+                token: "admin-token".into(),
+            },
+            CallerIdentity::Unknown,
+        ] {
+            let err = validate_request_injections(&request, &cfg, &caller, "echo ok")
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("authenticated local caller"),
+                "caller {caller:?} must be refused injection, got: {err}"
+            );
+        }
+        // A local Unix caller passes the transport check (it fails later only if
+        // the secret is absent, never with the local-caller refusal).
+        if let Err(e) = validate_request_injections(
+            &request,
+            &cfg,
+            &CallerIdentity::Unix { uid: 1000 },
+            "echo ok",
+        )
+        .await
+        {
+            assert!(
+                !e.contains("authenticated local caller"),
+                "local caller wrongly refused: {e}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn missing_requested_secret_denies_before_policy_evaluation() {
         let (cfg, _) = make_test_config();
@@ -5972,7 +6156,11 @@ mod tests {
     async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
         let (cfg, _) = make_test_config();
         cfg.secrets
-            .set(1000, "opnsense-apikey-secret", "dummy_api_key_12345")
+            .set(
+                &PrincipalKey::from_uid(1000),
+                "opnsense-apikey-secret",
+                "dummy_api_key_12345",
+            )
             .await
             .unwrap();
         let request = ExecuteRequest {
@@ -6185,6 +6373,7 @@ mod tests {
     async fn secret_list_is_per_user_namespaced() {
         let (mut cfg, _) = make_test_config();
         cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
 
         // Unique key so parallel tests sharing the EnvBackend don't
         // collide.
@@ -6248,11 +6437,21 @@ mod tests {
 
         // A's secret still there, value "alice" intact.
         assert_eq!(
-            cfg.secrets.get(20_000, &key).await.unwrap().as_deref(),
+            cfg.secrets
+                .get(&PrincipalKey::from_uid(20_000), &key)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("alice")
         );
         // B's is gone.
-        assert_eq!(cfg.secrets.get(20_001, &key).await.unwrap(), None);
+        assert_eq!(
+            cfg.secrets
+                .get(&PrincipalKey::from_uid(20_001), &key)
+                .await
+                .unwrap(),
+            None
+        );
 
         // Cleanup.
         let _ = handle_admin_request(
@@ -6272,7 +6471,10 @@ mod tests {
         let key = format!("EXEC_ISO_{}", std::process::id());
 
         // user_a stores THE secret.
-        cfg.secrets.set(30_000, &key, "alice-value").await.unwrap();
+        cfg.secrets
+            .set(&PrincipalKey::from_uid(30_000), &key, "alice-value")
+            .await
+            .unwrap();
 
         // user_b asks to inject $key into their exec call.
         let mut secrets_map = HashMap::new();
@@ -6302,7 +6504,10 @@ mod tests {
         );
 
         // Cleanup.
-        let _ = cfg.secrets.delete(30_000, &key).await;
+        let _ = cfg
+            .secrets
+            .delete(&PrincipalKey::from_uid(30_000), &key)
+            .await;
     }
 
     #[tokio::test]
@@ -6419,6 +6624,7 @@ mod tests {
     async fn session_list_is_user_visible_but_prompt_is_hidden() {
         let (mut cfg, _) = make_test_config();
         cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
 
         let daemon = CallerIdentity::Unix { uid: 777 };
         let user = CallerIdentity::Unix { uid: 20_002 };
@@ -6472,6 +6678,7 @@ mod tests {
     async fn session_show_reports_recent_stats() {
         let (mut cfg, _) = make_test_config();
         cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
 
         let daemon = CallerIdentity::Unix { uid: 777 };
         let token = format!("session-show-{}", std::process::id());

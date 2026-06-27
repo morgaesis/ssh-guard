@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::GateError;
+use crate::principal::{scope_eq, PrincipalKey};
 
 /// Lifecycle of a provisional execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +71,17 @@ impl ProvisionalStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provisional {
     pub handle: String,
-    /// Unix uid of the caller that created this, used to reconstruct the exec
+    /// Principal of the caller that created this, used to reconstruct the exec
     /// identity for the revert (so under `--exec-as-caller` the revert runs as
-    /// the original uid). `None` means the daemon executes as its own identity.
-    pub caller_uid: Option<u32>,
+    /// the original caller). `None` means the daemon executes as its own
+    /// identity. Deserializes from the legacy numeric `caller_uid` form so rows
+    /// written by an older daemon survive an upgrade.
+    #[serde(
+        default,
+        alias = "caller_uid",
+        deserialize_with = "crate::principal::principal_from_legacy"
+    )]
+    pub principal: Option<PrincipalKey>,
     pub binary: String,
     pub args: Vec<String>,
     /// The structured revert command (no shell). Operator-authored (verb) or an
@@ -172,11 +180,14 @@ impl ProvisionalRegistry {
             .count()
     }
 
-    /// Count of outstanding provisionals created by a uid, for the per-caller cap.
-    pub fn outstanding_for(&self, uid: Option<u32>) -> usize {
+    /// Count of outstanding provisionals created by a principal, for the
+    /// per-caller cap. Absence never matches absence (`scope_eq` semantics), so
+    /// unauthenticated callers do not share a quota bucket.
+    pub fn outstanding_for(&self, principal: Option<&PrincipalKey>) -> usize {
+        let owner = principal.cloned();
         self.items
             .values()
-            .filter(|p| p.status.is_outstanding() && p.caller_uid == uid)
+            .filter(|p| p.status.is_outstanding() && scope_eq(&p.principal, &owner))
             .count()
     }
 
@@ -292,10 +303,10 @@ impl ProvisionalRegistry {
 mod tests {
     use super::*;
 
-    fn armed(handle: &str, uid: Option<u32>, deadline: u64) -> Provisional {
+    fn armed(handle: &str, principal: Option<PrincipalKey>, deadline: u64) -> Provisional {
         Provisional {
             handle: handle.to_string(),
-            caller_uid: uid,
+            principal,
             binary: "systemctl".into(),
             args: vec!["restart".into(), "app".into()],
             revert_binary: "systemctl".into(),
@@ -313,7 +324,7 @@ mod tests {
     #[test]
     fn confirm_cancels_timer() {
         let mut r = ProvisionalRegistry::new();
-        r.insert(armed("h1", Some(1001), 200));
+        r.insert(armed("h1", Some(PrincipalKey::from_uid(1001)), 200));
         let p = r.confirm("h1").unwrap();
         assert_eq!(p.status, ProvisionalStatus::Confirmed);
         // A confirmed provisional is never due.
@@ -323,9 +334,9 @@ mod tests {
     #[test]
     fn take_due_only_claims_armed_past_deadline() {
         let mut r = ProvisionalRegistry::new();
-        r.insert(armed("due", Some(1001), 150));
-        r.insert(armed("future", Some(1001), 500));
-        let mut not_done = armed("notdone", Some(1001), 150);
+        r.insert(armed("due", Some(PrincipalKey::from_uid(1001)), 150));
+        r.insert(armed("future", Some(PrincipalKey::from_uid(1001)), 500));
+        let mut not_done = armed("notdone", Some(PrincipalKey::from_uid(1001)), 150);
         not_done.forward_done = false;
         r.insert(not_done);
 
@@ -340,8 +351,8 @@ mod tests {
     #[test]
     fn revert_outcomes_recorded() {
         let mut r = ProvisionalRegistry::new();
-        r.insert(armed("ok", Some(1001), 150));
-        r.insert(armed("bad", Some(1001), 150));
+        r.insert(armed("ok", Some(PrincipalKey::from_uid(1001)), 150));
+        r.insert(armed("bad", Some(PrincipalKey::from_uid(1001)), 150));
         let _ = r.take_due(200);
         r.set_reverted("ok", Some(0));
         r.set_revert_failed("bad", Some(1), "boom".into());
@@ -357,7 +368,7 @@ mod tests {
 
     #[test]
     fn startup_recovery_never_auto_fires() {
-        let p = armed("h1", Some(1001), 150); // deadline already passed at "now"
+        let p = armed("h1", Some(PrincipalKey::from_uid(1001)), 150); // deadline already passed at "now"
         let (mut reg, moved) = ProvisionalRegistry::from_rows(vec![p]);
         assert_eq!(moved, vec!["h1".to_string()]);
         assert_eq!(
@@ -372,15 +383,27 @@ mod tests {
 
     #[test]
     fn caps_count_outstanding_only() {
+        let p1001 = PrincipalKey::from_uid(1001);
         let mut r = ProvisionalRegistry::new();
-        r.insert(armed("a", Some(1001), 200));
-        r.insert(armed("b", Some(1001), 200));
-        r.insert(armed("c", Some(1002), 200));
+        r.insert(armed("a", Some(p1001.clone()), 200));
+        r.insert(armed("b", Some(p1001.clone()), 200));
+        r.insert(armed("c", Some(PrincipalKey::from_uid(1002)), 200));
         assert_eq!(r.outstanding(), 3);
-        assert_eq!(r.outstanding_for(Some(1001)), 2);
+        assert_eq!(r.outstanding_for(Some(&p1001)), 2);
         r.confirm("a").unwrap();
         assert_eq!(r.outstanding(), 2);
-        assert_eq!(r.outstanding_for(Some(1001)), 1);
+        assert_eq!(r.outstanding_for(Some(&p1001)), 1);
+    }
+
+    #[test]
+    fn none_owner_never_shares_quota_with_none_caller() {
+        // A row owned by an unauthenticated caller (`None`) must not count
+        // toward another `None`-scope caller's per-caller cap: two missing
+        // principals never match.
+        let mut r = ProvisionalRegistry::new();
+        r.insert(armed("anon", None, 200));
+        assert_eq!(r.outstanding(), 1);
+        assert_eq!(r.outstanding_for(None), 0);
     }
 
     #[test]
@@ -392,7 +415,7 @@ mod tests {
     #[test]
     fn prune_terminal_drops_old_confirmed() {
         let mut r = ProvisionalRegistry::new();
-        r.insert(armed("old", Some(1001), 200));
+        r.insert(armed("old", Some(PrincipalKey::from_uid(1001)), 200));
         r.confirm("old").unwrap();
         let dropped = r.prune_terminal(100 + 999_999, 1000);
         assert_eq!(dropped, vec!["old".to_string()]);

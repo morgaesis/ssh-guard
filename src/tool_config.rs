@@ -1,5 +1,6 @@
 use crate::secrets::SecretManager;
 use anyhow::{bail, Context, Result};
+use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,15 +134,15 @@ impl ToolRegistry {
     /// Returns an empty map if the tool is not registered.
     /// Fails if a referenced secret key is not found in the store.
     ///
-    /// `caller_uid` is the identity whose secret namespace the resolver
-    /// reads from. `user_key` (typically the same UID as a string, or a
-    /// TCP token label) picks per-user overrides out of the tool config
-    /// file.
+    /// `principal` is the identity whose secret namespace the resolver reads
+    /// from (a Unix uid or a Windows SID). `user_key` (typically the same uid
+    /// as a string, the SID string, or a TCP token label) picks per-user
+    /// overrides out of the tool config file.
     pub async fn resolve_env(
         &self,
         tool: &str,
         secrets: &SecretManager,
-        caller_uid: Option<u32>,
+        principal: Option<&PrincipalKey>,
         user_key: Option<&str>,
     ) -> Result<HashMap<String, String>> {
         let Some(tool_config) = self.get(tool) else {
@@ -151,11 +152,13 @@ impl ToolRegistry {
         let mut env = tool_config.env.clone();
 
         for (env_var, secret_key) in &tool_config.secrets {
-            let caller_uid = caller_uid.ok_or_else(|| {
-                anyhow::anyhow!("tool config secret injection requires a unix socket caller")
+            let principal = principal.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tool config secret injection requires an authenticated local caller"
+                )
             })?;
             let value = secrets
-                .get(caller_uid, secret_key)
+                .get(principal, secret_key)
                 .await
                 .with_context(|| format!("failed to read secret '{secret_key}'"))?
                 .ok_or_else(|| {
@@ -174,13 +177,13 @@ impl ToolRegistry {
                     env.insert(k.clone(), v.clone());
                 }
                 for (env_var, secret_key) in &user_override.secrets {
-                    let caller_uid = caller_uid.ok_or_else(|| {
+                    let principal = principal.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "tool config secret injection requires a unix socket caller"
+                            "tool config secret injection requires an authenticated local caller"
                         )
                     })?;
                     let value = secrets
-                        .get(caller_uid, secret_key)
+                        .get(principal, secret_key)
                         .await
                         .with_context(|| format!("failed to read secret '{secret_key}'"))?
                         .ok_or_else(|| {
