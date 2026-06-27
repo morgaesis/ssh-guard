@@ -760,6 +760,7 @@ impl VaultBackend {
             Ok(a) if !a.trim().is_empty() => a.trim_end_matches('/').to_string(),
             _ => bail!("VAULT_ADDR is not set; required for the vault backend"),
         };
+        warn_if_cleartext_url(&addr, "VAULT_ADDR");
 
         let auth = match env::var("VAULT_TOKEN") {
             Ok(t) if !t.is_empty() => VaultAuth::Token(t),
@@ -1036,6 +1037,7 @@ impl InfisicalBackend {
             .unwrap_or_else(|| "https://app.infisical.com".to_string())
             .trim_end_matches('/')
             .to_string();
+        warn_if_cleartext_url(&url, "INFISICAL_API_URL");
 
         let client_id = env::var("INFISICAL_CLIENT_ID")
             .ok()
@@ -1485,6 +1487,23 @@ impl std::str::FromStr for BackendType {
                 other
             )),
         }
+    }
+}
+
+/// Warn when a backend base URL uses cleartext `http://` (other than loopback):
+/// the auth token and secret values would traverse it unencrypted. reqwest still
+/// validates TLS certificates by default, so this only flags an explicit
+/// downgrade to http.
+fn warn_if_cleartext_url(url: &str, var: &str) {
+    let lower = url.to_ascii_lowercase();
+    let loopback = lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]");
+    if lower.starts_with("http://") && !loopback {
+        tracing::warn!(
+            "{} uses cleartext http://; the auth token and secret values will be sent unencrypted. Use https://.",
+            var
+        );
     }
 }
 

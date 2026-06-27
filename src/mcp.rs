@@ -380,12 +380,22 @@ async fn handle_http_connection<E: GuardExecutor, A: GuardAdmin>(
     server: Arc<Mutex<McpServer<E, A>>>,
     token: &str,
 ) -> Result<()> {
-    let request = match read_http_request(&mut stream).await {
-        Ok(request) => request,
-        Err(HttpError::Status(code, message)) => {
+    // Bound the time spent reading one request so a stalled (slowloris-style)
+    // connection cannot hold a task open indefinitely before the bearer check.
+    let request = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        read_http_request(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(request)) => request,
+        Ok(Err(HttpError::Status(code, message))) => {
             return write_http_response(&mut stream, code, &error_body(&message)).await;
         }
-        Err(HttpError::Io(error)) => return Err(error.into()),
+        Ok(Err(HttpError::Io(error))) => return Err(error.into()),
+        Err(_) => {
+            return write_http_response(&mut stream, 408, &error_body("request timeout")).await;
+        }
     };
 
     if request.method != "POST" {
@@ -492,8 +502,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// `Content-Length` body bytes. Headers are parsed case-insensitively. We bound
 /// both the header section and the body so an unauthenticated peer cannot force
 /// unbounded buffering.
+/// Cap on the request header section (request line + headers). Combined with the
+/// body cap, this bounds the total bytes an unauthenticated peer can make the
+/// server buffer for one request, even via a single header line with no newline.
+const MAX_HTTP_HEADER_SECTION: usize = 64 * 1024;
+
 async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRequest, HttpError> {
-    let mut reader = BufReader::new(stream);
+    // Bound the total bytes read for one request (header section + body): reads
+    // past the limit return EOF and degrade to a 400, so a single connection
+    // cannot force unbounded buffering before the bearer check.
+    let mut reader = BufReader::new(stream).take((MAX_HTTP_HEADER_SECTION + MAX_HTTP_BODY) as u64);
     let mut request_line = String::new();
     let read = reader.read_line(&mut request_line).await?;
     if read == 0 {
@@ -610,6 +628,7 @@ fn http_reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         _ => "Error",
     }
