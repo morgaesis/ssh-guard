@@ -198,3 +198,30 @@ fn init_service_logging() {
         .with_writer(make_writer)
         .try_init();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_invocation_requires_server_start_and_marker() {
+        // `server start ... --service` (the installer's binPath) is a service start.
+        assert!(is_service_invocation(&[
+            "server".into(),
+            "start".into(),
+            "--socket".into(),
+            "guard".into(),
+            "--service".into(),
+        ]));
+        // The marker alone, or on another subcommand, is not.
+        assert!(!is_service_invocation(&["run".into(), "--service".into()]));
+        assert!(!is_service_invocation(&["--service".into()]));
+        // Interactive `server start` (no marker) is the foreground path.
+        assert!(!is_service_invocation(&[
+            "server".into(),
+            "start".into(),
+            "--socket".into(),
+            "guard".into(),
+        ]));
+    }
+}

@@ -59,7 +59,7 @@
 
 - Seccomp/AppArmor profile generation: `guard profile seccomp` emits a default-allow seccomp profile that denies container-escape and host-tampering syscalls; `guard profile apparmor` emits a profile confining the daemon to its binary, data directory, and child-command execution. Both are operator-adaptable starting points for containerized deployments.
 
-- Streamable HTTP MCP transport: `guard mcp serve --http <addr>` exposes the MCP server over a token-authenticated (`--token` / `GUARD_MCP_TOKEN`) HTTP endpoint reusing the stdio request handler, alongside MCP tools that proxy existing daemon capabilities (verb catalog, approvals) without a parallel policy path.
+- Streamable HTTP MCP transport: `guard mcp serve --http <addr>` exposes the MCP server over a token-authenticated (`--http-token` / `GUARD_MCP_TOKEN`) HTTP endpoint reusing the stdio request handler, alongside MCP tools that proxy existing daemon capabilities (verb catalog, approvals) without a parallel policy path. The bearer token authorizes the connection; every HTTP caller presents to the daemon as the single MCP-process principal, so it is a localhost / single-tenant transport.
 
 - Live 429 / `Retry-After` wire-format coverage: mock-HTTP integration tests exercise the 429 + `Retry-After` retry, server-error retry, fallback-chain traversal, retry exhaustion, and a non-numeric (HTTP-date) `Retry-After` over a real socket.
 

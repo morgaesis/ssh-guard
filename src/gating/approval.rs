@@ -23,14 +23,16 @@ use super::{GateError, Reversibility};
 use crate::principal::{scope_eq, PrincipalKey};
 
 /// Optional binding of held secret VALUES to the artifact the operator reviewed.
-/// Captured at hold time as salted SHA-256 hashes of each resolved secret value
-/// (never the value itself), keyed by the injected env-var name. Verified at
-/// approve time: if a mapped value changed since the hold, approval fails closed.
-/// This closes the window where a same-principal caller alters its own mapped
-/// secret values between hold and approval. `None`/empty means no binding was
-/// captured (an older row, or no secret resolved at hold time) and verification
-/// is skipped for back-compat. The salt makes a stored hash not a plain value
-/// hash, so the snapshot does not leak a brute-forceable digest of the secret.
+/// Captured at hold time, keyed by the injected env-var name: every referenced
+/// secret is bound — a resolved one by a salted SHA-256 hash of its value (never
+/// the value itself), an unresolved one by a sentinel. Verified at approve time:
+/// if a mapped value changed, a bound-resolved secret vanished, or a
+/// bound-unresolved secret now resolves, approval fails closed. This closes the
+/// window where a same-principal caller alters (or creates) its own mapped
+/// secret values between hold and approval. `None` means no binding was captured
+/// (an older row, or a hold with no referenced secrets) and verification is
+/// skipped for back-compat. The salt makes a stored hash not a plain value hash,
+/// so the snapshot does not leak a brute-forceable digest of the secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
 pub struct SecretBinding {
     /// Per-hold random salt (hex).

@@ -119,6 +119,10 @@ profile {name} {exe} flags=(attach_disconnected) {{
   /usr/local/bin/* rix,
   /bin/* rix,
   /sbin/* rix,
+  # Some allowed tools exec helpers from libexec paths (e.g. git runs
+  # /usr/lib/git-core/git-*). Grant execute there too; extend per tool as needed.
+  /usr/lib/git-core/* rix,
+  /usr/libexec/** rix,
 
   # Read-only system config the children commonly need.
   /etc/** r,

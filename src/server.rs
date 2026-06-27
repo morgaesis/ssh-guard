@@ -1070,17 +1070,31 @@ impl Server {
             anyhow::bail!("no socket path or TCP port specified");
         }
 
-        // A listener loop only returns on a fatal error; surface it rather than
-        // exiting silently (a swallowed error looks like a clean shutdown).
+        // A listener loop only returns on a fatal error (e.g. it could not bind);
+        // surface it as an error return rather than exiting silently. This makes
+        // the process exit non-zero, so the Windows service reports a failure and
+        // the SCM restart action engages instead of the daemon sitting STOPPED
+        // after a bind failure while having briefly reported RUNNING.
+        let mut listener_error: Option<anyhow::Error> = None;
         for result in futures::future::join_all(futures).await {
             match result {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!("listener exited with error: {:#}", e),
-                Err(e) => tracing::error!("listener task panicked: {}", e),
+                Ok(Err(e)) => {
+                    tracing::error!("listener exited with error: {:#}", e);
+                    listener_error.get_or_insert(e);
+                }
+                Err(e) => {
+                    tracing::error!("listener task panicked: {}", e);
+                    listener_error
+                        .get_or_insert_with(|| anyhow::anyhow!("listener task panicked: {}", e));
+                }
             }
         }
 
-        Ok(())
+        match listener_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Platform dispatch for the local listener: UNIX domain socket on Unix,
@@ -4757,25 +4771,26 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
     let handle = new_handle();
     let now = now_unix();
 
-    // Secret-value binding (best effort): hash each referenced secret value NOW
-    // so a same-principal caller cannot swap its mapped values between this hold
-    // and the operator's approval. A binding is captured only for secrets that
-    // resolve here; if none resolve (or there are no secrets), no binding is
-    // stored and approve-time verification is skipped (back-compat).
+    // Secret-value binding: hash each referenced secret value NOW so a
+    // same-principal caller cannot swap its mapped values between this hold and
+    // the operator's approval. The binding is MANDATORY when there are secrets
+    // and a principal: every referenced secret is bound, a resolved one by its
+    // salted hash and an unresolved one by a sentinel. Binding the unresolved
+    // case closes the gap where a caller makes a secret unresolvable at hold
+    // (so it would otherwise be unbound) and then creates it with a chosen value
+    // before approval. Verification at approve time fails closed on any change.
     let secret_binding = match caller_principal.clone() {
         Some(principal) if !request.secrets.is_empty() => {
             let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
             let mut hashes = std::collections::BTreeMap::new();
             for (env_var, secret_name) in &request.secrets {
-                if let Ok(Some(value)) = config.secrets.get(&principal, secret_name).await {
-                    hashes.insert(env_var.clone(), hash_secret_value(&salt, &value));
-                }
+                let entry = match config.secrets.get(&principal, secret_name).await {
+                    Ok(Some(value)) => hash_secret_value(&salt, &value),
+                    _ => SECRET_BINDING_UNRESOLVED.to_string(),
+                };
+                hashes.insert(env_var.clone(), entry);
             }
-            if hashes.is_empty() {
-                None
-            } else {
-                Some(guard::gating::approval::SecretBinding { salt, hashes })
-            }
+            Some(guard::gating::approval::SecretBinding { salt, hashes })
         }
         _ => None,
     };
@@ -4910,6 +4925,13 @@ fn approval_to_result(a: &Approval) -> ExecuteResult {
     }
 }
 
+/// Sentinel stored in a [`SecretBinding`] for a secret that did not resolve at
+/// hold time. It is not a 64-char SHA-256 hex digest, so it can never collide
+/// with a real value hash. A binding entry equal to this means "the secret was
+/// absent when the operator reviewed the hold"; if it resolves at approve time,
+/// verification fails closed.
+const SECRET_BINDING_UNRESOLVED: &str = "<unresolved-at-hold>";
+
 /// Lowercase hex-encode bytes without pulling in a hex crate.
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -4952,17 +4974,19 @@ async fn execute_snapshot(
             );
         };
         for (env_var, secret_name) in &snapshot.secret_keys {
-            let value = match config.secrets.get(&principal, secret_name).await {
-                Ok(Some(v)) => v,
-                Ok(None) => {
-                    return ExecuteResult::exec_failed(
-                        reason.to_string(),
-                        format!(
-                            "approval rejected: bound secret '{}' no longer resolves",
-                            secret_name
-                        ),
-                    );
-                }
+            // Every secret was bound at hold; a missing entry means the request
+            // was altered between hold and approval. Fail closed.
+            let Some(expected) = binding.hashes.get(env_var) else {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    format!(
+                        "approval rejected: secret '{}' was not bound at hold",
+                        secret_name
+                    ),
+                );
+            };
+            let resolved = match config.secrets.get(&principal, secret_name).await {
+                Ok(v) => v,
                 Err(e) => {
                     return ExecuteResult::exec_failed(
                         reason.to_string(),
@@ -4973,11 +4997,18 @@ async fn execute_snapshot(
                     );
                 }
             };
-            let matches = binding
-                .hashes
-                .get(env_var)
-                .is_some_and(|expected| hash_secret_value(&binding.salt, &value) == *expected);
-            if !matches {
+            let consistent = match (expected.as_str(), resolved) {
+                // Unresolved at hold and still unresolved: consistent (the exec
+                // path surfaces the missing secret on its own).
+                (SECRET_BINDING_UNRESOLVED, None) => true,
+                // Unresolved at hold but now resolves: the swap attack. Reject.
+                (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
+                // Bound to a value: it must still resolve to the same value.
+                (hash, Some(v)) => hash_secret_value(&binding.salt, &v) == hash,
+                // Was bound to a value, now gone. Reject.
+                (_, None) => false,
+            };
+            if !consistent {
                 return ExecuteResult::exec_failed(
                     reason.to_string(),
                     "approval rejected: a mapped secret value changed since the command was held"
@@ -7788,6 +7819,88 @@ mod tests {
         }
 
         let _ = cfg.secrets.delete(&p, "BIND_OK_KEY").await;
+    }
+
+    /// The binding is mandatory: a secret that is UNRESOLVED at hold is bound by
+    /// a sentinel, so a same-principal caller cannot disable verification by
+    /// making a secret absent at hold and then creating it with a chosen value
+    /// before approval. Approval fails closed when the absent secret appears.
+    #[tokio::test]
+    async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
+        let (cfg, _operator, agent) = gating_config(7203, 4203);
+        let agent_principal = agent.principal();
+        let p = agent_principal.clone().expect("agent principal");
+        // The secret does NOT exist at hold time.
+        let _ = cfg.secrets.delete(&p, "BIND_LATE_KEY").await;
+
+        let mut secrets = HashMap::new();
+        secrets.insert("INJECTED".to_string(), "BIND_LATE_KEY".to_string());
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets,
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let held = hold_for_approval(
+            request,
+            &cfg,
+            &agent,
+            agent_principal.clone(),
+            "needs review".to_string(),
+            Some(8),
+            Some(Reversibility::Irreversible),
+            None,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &held.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+        let snapshot = cfg
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap()
+            .snapshot;
+        // A binding is captured even though the secret was unresolved at hold.
+        assert!(
+            snapshot.secret_binding.is_some(),
+            "the binding must be mandatory, capturing a sentinel for the absent secret"
+        );
+
+        // The caller now creates the previously-absent secret with a chosen value.
+        cfg.secrets
+            .set(&p, "BIND_LATE_KEY", "sneaked-in")
+            .await
+            .unwrap();
+
+        let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+        match &result.exec {
+            ExecOutcome::Failed { reason, started } => {
+                assert!(!started, "the command must not have started");
+                assert!(
+                    reason.contains("changed since the command was held"),
+                    "got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected a fail-closed rejection, got {:?}", other),
+        }
+
+        let _ = cfg.secrets.delete(&p, "BIND_LATE_KEY").await;
     }
 
     /// The approval discussion thread accepts notes from the operator and from
