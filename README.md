@@ -219,7 +219,9 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
 | `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
-| `GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
+| `GUARD_BACKEND` | (auto) | Secret backend: `pass`, `env`, `local`, `vault`, or `infisical`. Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. `vault` uses `VAULT_ADDR` with `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (KV v2, mount `VAULT_KV_MOUNT`, default `secret`); `infisical` uses `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`/`INFISICAL_PROJECT_ID` (Universal Auth, env `INFISICAL_ENVIRONMENT`). |
+| `GUARD_SERVER_UID` | (daemon principal) | Owner principal the daemon reads its own `LLM_API_KEY` secret under when no key is supplied by flag or env. Lets the daemon source its key from the configured backend instead of an external `vault agent` / `infisical run` wrapper. |
+| `GUARD_ALLOW_BIN` | (none) | Comma-separated binary allow-list. When set, only these binaries may execute, on every route, regardless of the LLM decision. Bare names match by command name via the daemon PATH; path-qualified entries must match exactly. |
 | `GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
 | `GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
 

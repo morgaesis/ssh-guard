@@ -43,23 +43,28 @@
 
 - Verb catalog (`--verbs`): an operator-authored, hot-reloaded catalog of typed operations with anchored pattern-validated parameters, declared consequence class, and structured rollback. `guard verb list` / `guard verb run` render templates into argv with no shell, making parameter and flag injection structurally impossible. `trusted` verbs are a deterministic allow path; agents cannot add or alter verbs.
 
+- Unified `guard` branding: configuration variables use the `GUARD_` prefix, resolved through a single `guard::env::guard_env` helper that still honors the legacy `SSH_GUARD_` names as fallbacks, so existing deployments keep working without renaming.
+
+- Native Windows service host: `guard server start --service` answers the Service Control Manager start/stop handshake through the windows-service dispatcher, running the same daemon path as the foreground process (one configuration surface). `deployment/windows/install-guard.ps1` registers the service with that marker under `NT SERVICE\guard`; a service has no console, so the daemon logs to a file inside the ACL-locked data directory.
+
+- Pluggable secret backends: `BackendType::Vault` (HashiCorp Vault HTTP API, KV v2, `VAULT_ADDR` with token or AppRole auth) and `BackendType::Infisical` (Infisical HTTP API, Universal Auth machine identity), selected via `GUARD_BACKEND`, with the same `get`/`list`/`set`/`delete` semantics as `pass`/`env`/`local` and per-principal path namespacing.
+
+- Unified daemon startup secret: when no LLM key is supplied by flag or env, the daemon reads its own `LLM_API_KEY` from the secret backend as a secret owned by the server principal (`GUARD_SERVER_UID`, else the daemon's own principal), reusing the shared fetch/cache/redaction path instead of bespoke env loading — no external `vault agent` / `infisical run` wrapper around `guard server start`.
+
+- Server binary allow-list (`--allow-bin` / `GUARD_ALLOW_BIN`): an operator-configured hard floor enforced before evaluation on every execution route, independent of the LLM decision. Bare names match by command name through the daemon PATH; path-qualified binaries require an exact entry, so a payload at an arbitrary path named after an allowed tool cannot pass basename matching.
+
+- Secret-value binding for held commands: a hold captures a salted SHA-256 hash of each mapped secret value (never the value), and approval re-resolves and fails closed if any value changed since the hold, closing the same-principal swap window between operator review and execution.
+
+- Approval discussion thread: a held command carries a notes thread the operator and the hold's original requester can append to before a decision (`guard approval-note`, the ApprovalNote RPC), extending the gate beyond a single accept/deny. The thread renders in `guard approvals <handle>`, persists with the hold, and freezes once decided.
+
+- Seccomp/AppArmor profile generation: `guard profile seccomp` emits a default-allow seccomp profile that denies container-escape and host-tampering syscalls; `guard profile apparmor` emits a profile confining the daemon to its binary, data directory, and child-command execution. Both are operator-adaptable starting points for containerized deployments.
+
+- Streamable HTTP MCP transport: `guard mcp serve --http <addr>` exposes the MCP server over a token-authenticated (`--token` / `GUARD_MCP_TOKEN`) HTTP endpoint reusing the stdio request handler, alongside MCP tools that proxy existing daemon capabilities (verb catalog, approvals) without a parallel policy path.
+
+- Live 429 / `Retry-After` wire-format coverage: mock-HTTP integration tests exercise the 429 + `Retry-After` retry, server-error retry, fallback-chain traversal, retry exhaustion, and a non-numeric (HTTP-date) `Retry-After` over a real socket.
+
 ## Next
 
-- Pluggable secret backends via the existing `SecretBackend` trait in `src/secrets.rs`. Two new variants:
-  - `BackendType::Infisical` — fetch via the Infisical CLI (`infisical secrets get/list`) using a Universal Auth machine identity, or via the HTTP API directly. Selected via `GUARD_BACKEND=infisical`.
-  - `BackendType::Vault` — fetch via the HashiCorp Vault HTTP API using `VAULT_ADDR` + AppRole or token auth, with KV v2 as the default mount. Selected via `GUARD_BACKEND=vault`.
-
-  Same `get` / `list` / `set` / `delete` semantics as `pass`, `env`, `local`. Per-user namespacing (`u<uid>/<key>`) maps to a path prefix in the backend.
-
-- Unify the daemon's own startup secret (currently `GUARD_LLM_API_KEY` read from process env) onto the same `SecretBackend` trait. The server reads its own LLM key as if it were a secret owned by a sentinel daemon UID (e.g. uid 0 or a configurable `GUARD_SERVER_UID`), so it reuses the existing fetch / cache / redaction plumbing instead of bespoke env-var loading. Removes the need for external `infisical run` / `vault agent` wrappers around `guard server start`.
-
-- Native Windows service host: make `guard.exe` service-aware (the Service Control Manager start/stop handshake) so it runs directly under the Windows Service manager. The console binary otherwise requires a scheduled-task launcher to run as the dedicated `NT SERVICE\guard` account.
-- Interactive approval chat per session: the consequence-gate operator hold delivers human-in-the-loop approval at points of no return; a richer conversational approval flow (multi-turn context with the operator) would extend it beyond the current accept/deny/confirm decisions.
-- Secret-value binding for held commands: the approval snapshot pins the secret-key *mapping*; optionally hash the resolved values at hold time and reject on mismatch at approve time, so a same-uid caller cannot alter its own mapped secret values before approval.
-- Pre-LLM validation for secret injection requests: invalid env names, missing secrets, and misleading shell references to invalid env names should fail before evaluator approval.
-- Live integration test for 429 / `Retry-After` mocking (the unit test suite already covers the retry rules; an HTTP-mock integration test would catch wire-format regressions).
-- Binary allowlist for the server (restrict which binaries can be executed, not just what arguments are passed).
-- Seccomp/AppArmor profile generation for containerized deployments.
-- Streamable HTTP MCP transport only after there is a concrete deployment need and an authentication model for it.
-- Additional MCP tools only when they map cleanly onto existing guard capabilities instead of creating parallel policy paths.
-- Research: full resampling protocol / Time Travel from the Ctrl-Z paper as a followup for multi-step attack resilience. Not a current design goal, but tracked (see `BASHCONTROL.md`).
+- Secret-value binding hardening: extend the held-command value binding to the verb-rendered argv, so an operator-reviewed verb invocation also fails closed if a referenced secret changes between hold and approval.
+- MCP transport breadth: server-initiated SSE streaming on the HTTP MCP endpoint, added only when an agent runtime needs streamed tool output rather than the current request/response shape.
+- Research: full resampling protocol / Time Travel from the Ctrl-Z paper as a followup for multi-step attack resilience. Not a current design goal, but tracked, with a prototype design against the existing state DB and CTF harness in `BASHCONTROL.md`.
