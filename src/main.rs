@@ -1318,20 +1318,9 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.system_prompt_append_path(path.clone());
             }
 
-            // Collect known secret values for exact-match output redaction BEFORE
-            // moving eval_config into the evaluator.
-            let mut redact_secrets: Vec<String> = Vec::new();
-            if let Some(ref key) = eval_config.llm.api_key {
-                if !key.is_empty() {
-                    redact_secrets.push(key.clone());
-                }
-            }
-
-            tracing::info!("Creating evaluator...");
-            let evaluator =
-                evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
-            tracing::info!("Evaluator created successfully");
-
+            // Secret backend is built BEFORE the evaluator so the daemon can
+            // source its own LLM key from the backend when none was supplied by
+            // flag or env (see the unified-startup-secret block below).
             tracing::info!("Initializing secret backend...");
             let backend_type = match guard_env("BACKEND") {
                 Some(value) => value
@@ -1351,6 +1340,64 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .context("Failed to create secret backend")?;
             let secrets = secrets::SecretManager::new(backend);
             tracing::info!("Secret backend ready");
+
+            // Unify the daemon's own startup secret onto the secret backend: when
+            // no LLM key was supplied via --llm-api-key or env, read it from the
+            // backend as a secret owned by the server principal (GUARD_SERVER_UID,
+            // else the daemon's own principal). This reuses the same fetch / cache
+            // / redaction path as any brokered secret, so the daemon can source
+            // its key from pass/vault/infisical without an external `vault agent`
+            // or `infisical run` wrapper around `guard server start`.
+            if llm_enabled
+                && eval_config
+                    .llm
+                    .api_key
+                    .as_ref()
+                    .map(|k| k.is_empty())
+                    .unwrap_or(true)
+            {
+                let server_principal = match guard_env("SERVER_UID") {
+                    Some(uid_str) => match uid_str.trim().parse::<u32>() {
+                        Ok(uid) => guard::principal::PrincipalKey::from_uid(uid),
+                        Err(_) => {
+                            tracing::warn!(
+                                "GUARD_SERVER_UID is not a valid uid; using the daemon principal"
+                            );
+                            server::resolve_daemon_principal()
+                        }
+                    },
+                    None => server::resolve_daemon_principal(),
+                };
+                match secrets.get(&server_principal, "LLM_API_KEY").await {
+                    Ok(Some(key)) if !key.is_empty() => {
+                        tracing::info!(
+                            "Loaded LLM API key from the {} secret backend (owner {})",
+                            secrets.backend_name(),
+                            server_principal.as_str()
+                        );
+                        eval_config = eval_config.llm_api_key(key);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Could not read LLM API key from the secret backend: {}", e)
+                    }
+                }
+            }
+
+            // Collect known secret values for exact-match output redaction BEFORE
+            // moving eval_config into the evaluator. This includes a backend-
+            // sourced daemon key resolved just above.
+            let mut redact_secrets: Vec<String> = Vec::new();
+            if let Some(ref key) = eval_config.llm.api_key {
+                if !key.is_empty() {
+                    redact_secrets.push(key.clone());
+                }
+            }
+
+            tracing::info!("Creating evaluator...");
+            let evaluator =
+                evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
+            tracing::info!("Evaluator created successfully");
 
             // Redaction is server-side only, controlled by CLI flag.
             // NOT readable from child env (prevents GUARD_REDACT=false bypass).

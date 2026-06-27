@@ -4956,7 +4956,7 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
 /// process always has a token), fall back to a sentinel that no caller can ever
 /// match, so operator authorization fails closed (commands stay held) rather
 /// than open.
-fn resolve_daemon_principal() -> PrincipalKey {
+pub fn resolve_daemon_principal() -> PrincipalKey {
     #[cfg(unix)]
     {
         PrincipalKey::from_uid(current_uid())
