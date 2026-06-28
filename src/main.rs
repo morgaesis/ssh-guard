@@ -650,6 +650,37 @@ enum ServerCommands {
         #[arg(long = "child-env", value_name = "VAR[,VAR]", value_delimiter = ',')]
         child_env: Option<Vec<String>>,
 
+        /// Front the Kubernetes apiserver with a TLS-terminating proxy on ADDR
+        /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (helm,
+        /// kubectl, terraform, k9s, client libraries) is gated against
+        /// --api-policy and re-originated to the real apiserver with the
+        /// credentials only the daemon holds. Requires --kubeconfig; incompatible
+        /// with --exec-as-caller. Env: GUARD_KUBE_PROXY.
+        #[arg(long = "kube-proxy", value_name = "ADDR")]
+        kube_proxy: Option<String>,
+
+        /// The operator's real kubeconfig the proxy uses upstream. The daemon
+        /// holds these credentials; the brokered config it emits carries none.
+        /// Env: GUARD_KUBE_PROXY_KUBECONFIG.
+        #[arg(long = "kubeconfig", value_name = "PATH")]
+        kubeconfig: Option<PathBuf>,
+
+        /// kubeconfig context to use upstream (default: its current-context).
+        /// Env: GUARD_KUBE_CONTEXT.
+        #[arg(long = "kube-context", value_name = "NAME")]
+        kube_context: Option<String>,
+
+        /// Operator API policy for the proxy (see examples/api-policy.yaml).
+        /// Hot-reloaded on change. Absent means default-deny. Env: GUARD_API_POLICY.
+        #[arg(long = "api-policy", value_name = "PATH")]
+        api_policy: Option<PathBuf>,
+
+        /// Write the agent-facing brokered kubeconfig here at startup. It points
+        /// at the proxy and carries no credential; agents set KUBECONFIG to it.
+        /// Env: GUARD_BROKERED_KUBECONFIG_OUT.
+        #[arg(long = "brokered-kubeconfig-out", value_name = "PATH")]
+        brokered_kubeconfig_out: Option<PathBuf>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
@@ -1063,6 +1094,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             verbs,
             allow_bin,
             child_env,
+            kube_proxy,
+            kubeconfig,
+            kube_context,
+            api_policy,
+            brokered_kubeconfig_out,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -1608,6 +1644,68 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if !child_env_vars.is_empty() {
                 tracing::info!("Child-env passthrough: {:?}", child_env_vars);
                 srv.set_extra_child_env(child_env_vars);
+            }
+
+            // Kubernetes API proxy: flag wins, else GUARD_KUBE_PROXY. When set,
+            // the daemon fronts the apiserver and gates each API operation.
+            let kube_proxy_addr = kube_proxy.or_else(|| guard_env("KUBE_PROXY"));
+            if let Some(addr_str) = kube_proxy_addr {
+                if exec_as_caller {
+                    anyhow::bail!(
+                        "--kube-proxy is incompatible with --exec-as-caller: a child running as the caller could read the caller's own kubeconfig and reach the apiserver around the proxy"
+                    );
+                }
+                let listen: std::net::SocketAddr = addr_str
+                    .parse()
+                    .with_context(|| format!("invalid --kube-proxy address '{addr_str}'"))?;
+                let kubeconfig_path = kubeconfig
+                    .or_else(|| guard_env("KUBE_PROXY_KUBECONFIG").map(PathBuf::from))
+                    .context(
+                        "--kube-proxy requires --kubeconfig (the operator's real kubeconfig)",
+                    )?;
+                let context = kube_context.or_else(|| guard_env("KUBE_CONTEXT"));
+                let upstream = guard::proxy::Upstream::from_kubeconfig_file(
+                    &kubeconfig_path,
+                    context.as_deref(),
+                )
+                .context("load upstream kubeconfig for --kube-proxy")?;
+                let tls =
+                    guard::proxy::ProxyTls::generate().context("generate proxy TLS material")?;
+                let api_policy_path =
+                    api_policy.or_else(|| guard_env("API_POLICY").map(PathBuf::from));
+                let policy = match &api_policy_path {
+                    Some(p) => guard::proxy::ApiPolicy::load_file(p)
+                        .with_context(|| format!("load --api-policy {}", p.display()))?,
+                    None => {
+                        tracing::warn!(
+                            "--kube-proxy started without --api-policy: default-deny (no API requests pass)"
+                        );
+                        guard::proxy::ApiPolicy::deny_all()
+                    }
+                };
+                let proxy = Arc::new(guard::proxy::KubeProxy::new(
+                    listen,
+                    tls,
+                    upstream,
+                    policy,
+                    api_policy_path,
+                ));
+                if let Some(out) = brokered_kubeconfig_out
+                    .or_else(|| guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from))
+                {
+                    let yaml = proxy.brokered_kubeconfig();
+                    // The generator is credential-free by construction; assert it
+                    // before handing the file to an agent.
+                    guard::proxy::validate_brokered_kubeconfig(&yaml).map_err(|e| {
+                        anyhow::anyhow!("generated brokered kubeconfig is not credential-free: {e}")
+                    })?;
+                    std::fs::write(&out, yaml).with_context(|| {
+                        format!("write brokered kubeconfig to {}", out.display())
+                    })?;
+                    tracing::info!("Wrote brokered kubeconfig to {}", out.display());
+                }
+                tracing::info!("Kube-proxy enabled on {}", proxy.listen());
+                srv.set_kube_proxy(proxy);
             }
 
             srv.run().await
@@ -3254,6 +3352,11 @@ mod tests {
                 verbs,
                 allow_bin,
                 child_env,
+                kube_proxy,
+                kubeconfig,
+                kube_context,
+                api_policy,
+                brokered_kubeconfig_out,
                 service,
             }) => ServerCommands::Start {
                 socket,
@@ -3291,6 +3394,11 @@ mod tests {
                 verbs,
                 allow_bin,
                 child_env,
+                kube_proxy,
+                kubeconfig,
+                kube_context,
+                api_policy,
+                brokered_kubeconfig_out,
                 service,
             },
             _ => panic!("expected server start args"),

@@ -740,6 +740,12 @@ pub struct ServerConfig {
     /// generically without per-tool code — e.g. `KUBECONFIG` so brokered
     /// kubectl/helm read a config the agent cannot see.
     pub extra_child_env: Vec<String>,
+    /// Optional Kubernetes API proxy hosted alongside the gate socket. When set,
+    /// the daemon terminates brokered clients' TLS, gates each API operation
+    /// against the operator policy, and re-originates to the real apiserver with
+    /// the credentials only the daemon holds. Set by the entrypoint from
+    /// `--kube-proxy`; `None` means no proxy listener.
+    pub kube_proxy: Option<Arc<guard::proxy::KubeProxy>>,
 }
 
 impl ServerConfig {
@@ -801,6 +807,8 @@ impl ServerConfig {
             // No extra child-env passthrough by default; the entrypoint sets
             // this from --child-env / GUARD_CHILD_ENV.
             extra_child_env: Vec::new(),
+            // No API proxy by default; the entrypoint sets this from --kube-proxy.
+            kube_proxy: None,
         }
     }
 
@@ -990,6 +998,12 @@ impl Server {
         self.config.extra_child_env = vars;
     }
 
+    /// Attach a Kubernetes API proxy to run alongside the gate socket. Must be
+    /// called before `run`.
+    pub fn set_kube_proxy(&mut self, proxy: Arc<guard::proxy::KubeProxy>) {
+        self.config.kube_proxy = Some(proxy);
+    }
+
     /// Load persisted provisional/approval state and apply startup recovery:
     /// no revert ever runs unattended at boot. Past-deadline or interrupted
     /// provisionals become `needs_operator_decision`; interrupted approvals
@@ -1080,6 +1094,12 @@ impl Server {
             futures.push(tokio::spawn(async move {
                 Self::run_tcp_static(port, &config).await
             }));
+        }
+
+        if let Some(ref proxy) = self.config.kube_proxy {
+            tracing::info!("Starting kube-proxy listener on {}", proxy.listen());
+            let proxy = proxy.clone();
+            futures.push(tokio::spawn(async move { proxy.serve().await }));
         }
 
         if futures.is_empty() {

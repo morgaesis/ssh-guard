@@ -1,0 +1,321 @@
+//! Upstream connection to the real apiserver, built from the operator's
+//! kubeconfig. The daemon holds these credentials; the brokered config the agent
+//! receives carries none, so the proxy is the sole path to the cluster. Supports
+//! bearer-token and client-certificate auth. `exec` and `auth-provider`
+//! credential plugins are rejected: the proxy cannot run them, and a brokered
+//! client that could would reach the apiserver around the gate.
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use base64::Engine;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct KubeConfig {
+    #[serde(default)]
+    clusters: Vec<NamedCluster>,
+    #[serde(default)]
+    contexts: Vec<NamedContext>,
+    #[serde(default)]
+    users: Vec<NamedUser>,
+    #[serde(rename = "current-context")]
+    current_context: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedCluster {
+    name: String,
+    cluster: Cluster,
+}
+
+#[derive(Debug, Deserialize)]
+struct Cluster {
+    server: String,
+    #[serde(rename = "certificate-authority-data")]
+    ca_data: Option<String>,
+    #[serde(rename = "certificate-authority")]
+    ca_file: Option<String>,
+    #[serde(rename = "insecure-skip-tls-verify", default)]
+    insecure: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedContext {
+    name: String,
+    context: ContextSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextSpec {
+    cluster: String,
+    user: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedUser {
+    name: String,
+    user: User,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct User {
+    token: Option<String>,
+    #[serde(rename = "tokenFile")]
+    token_file: Option<String>,
+    #[serde(rename = "client-certificate-data")]
+    cert_data: Option<String>,
+    #[serde(rename = "client-certificate")]
+    cert_file: Option<String>,
+    #[serde(rename = "client-key-data")]
+    key_data: Option<String>,
+    #[serde(rename = "client-key")]
+    key_file: Option<String>,
+    exec: Option<serde_yaml::Value>,
+    #[serde(rename = "auth-provider")]
+    auth_provider: Option<serde_yaml::Value>,
+}
+
+/// A configured connection to the real apiserver. Holds the operator's
+/// credentials (a bearer token and/or a client identity baked into the TLS
+/// client); the proxy injects them when it re-originates a request.
+pub struct Upstream {
+    base: String,
+    client: reqwest::Client,
+    bearer: Option<String>,
+}
+
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never expose the operator's bearer token in debug output.
+        f.debug_struct("Upstream")
+            .field("base", &self.base)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Upstream {
+    /// Build an upstream from a kubeconfig file, selecting `context` (or the
+    /// file's `current-context` when `None`).
+    pub fn from_kubeconfig_file(path: &Path, context: Option<&str>) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read kubeconfig {}", path.display()))?;
+        Self::from_kubeconfig_str(&text, context)
+    }
+
+    /// Build an upstream from kubeconfig YAML text.
+    pub fn from_kubeconfig_str(text: &str, context: Option<&str>) -> Result<Self> {
+        let cfg: KubeConfig = serde_yaml::from_str(text).context("parse kubeconfig")?;
+
+        let ctx_name = context
+            .map(str::to_string)
+            .or_else(|| cfg.current_context.clone())
+            .context("kubeconfig has no current-context and no --kube-context was given")?;
+        let ctx = cfg
+            .contexts
+            .iter()
+            .find(|c| c.name == ctx_name)
+            .with_context(|| format!("context '{ctx_name}' not found in kubeconfig"))?;
+        let cluster = cfg
+            .clusters
+            .iter()
+            .find(|c| c.name == ctx.context.cluster)
+            .with_context(|| {
+                format!("cluster '{}' not found in kubeconfig", ctx.context.cluster)
+            })?;
+        let user = cfg
+            .users
+            .iter()
+            .find(|u| u.name == ctx.context.user)
+            .map(|u| u.user.clone())
+            .unwrap_or_default();
+
+        if user.exec.is_some() {
+            bail!(
+                "kubeconfig user '{}' uses an exec credential plugin, which the proxy cannot broker",
+                ctx.context.user
+            );
+        }
+        if user.auth_provider.is_some() {
+            bail!(
+                "kubeconfig user '{}' uses an auth-provider plugin, which the proxy cannot broker",
+                ctx.context.user
+            );
+        }
+
+        let mut builder = reqwest::Client::builder()
+            // The proxy is a transparent forwarder: it must not chase redirects
+            // on the client's behalf or auto-decompress bodies it streams back.
+            .redirect(reqwest::redirect::Policy::none());
+
+        // Trust the real apiserver's CA.
+        if let Some(ca_b64) = &cluster.cluster.ca_data {
+            let pem = base64::engine::general_purpose::STANDARD
+                .decode(ca_b64.as_bytes())
+                .context("decode cluster certificate-authority-data")?;
+            for cert in reqwest::Certificate::from_pem_bundle(&pem).context("parse cluster CA")? {
+                builder = builder.add_root_certificate(cert);
+            }
+        } else if let Some(ca_path) = &cluster.cluster.ca_file {
+            let pem = std::fs::read(ca_path)
+                .with_context(|| format!("read certificate-authority {ca_path}"))?;
+            for cert in reqwest::Certificate::from_pem_bundle(&pem).context("parse cluster CA")? {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        if cluster.cluster.insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        // Client-certificate identity, if the user authenticates that way.
+        let cert_pem = read_pem(
+            &user.cert_data,
+            user.cert_file.as_deref(),
+            "client-certificate",
+        )?;
+        let key_pem = read_pem(&user.key_data, user.key_file.as_deref(), "client-key")?;
+        if let (Some(cert), Some(key)) = (cert_pem.as_ref(), key_pem.as_ref()) {
+            let mut id = Vec::with_capacity(cert.len() + key.len() + 1);
+            id.extend_from_slice(cert);
+            id.push(b'\n');
+            id.extend_from_slice(key);
+            let identity = reqwest::Identity::from_pem(&id).context("build client identity")?;
+            builder = builder.identity(identity);
+        }
+
+        // Bearer token, if present (inline or from a file).
+        let bearer = if let Some(t) = &user.token {
+            Some(t.clone())
+        } else if let Some(tf) = &user.token_file {
+            Some(
+                std::fs::read_to_string(tf)
+                    .with_context(|| format!("read tokenFile {tf}"))?
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let client = builder.build().context("build upstream TLS client")?;
+        Ok(Self {
+            base: cluster.cluster.server.trim_end_matches('/').to_string(),
+            client,
+            bearer,
+        })
+    }
+
+    /// Base apiserver URL (scheme://host:port), no trailing slash.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The TLS client carrying the operator's CA trust and client identity.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// The operator's bearer token, injected on each forwarded request.
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
+    }
+}
+
+/// Resolve a PEM field that may be inline base64 (`*-data`) or a file path.
+fn read_pem(data_b64: &Option<String>, file: Option<&str>, what: &str) -> Result<Option<Vec<u8>>> {
+    if let Some(b64) = data_b64 {
+        let pem = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .with_context(|| format!("decode {what}-data"))?;
+        Ok(Some(pem))
+    } else if let Some(path) = file {
+        let pem = std::fs::read(path).with_context(|| format!("read {what} {path}"))?;
+        Ok(Some(pem))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_token_context() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: ctx
+clusters:
+  - name: c1
+    cluster:
+      server: https://api.example.test:6443/
+      certificate-authority-data: ""
+contexts:
+  - name: ctx
+    context: {cluster: c1, user: u1}
+users:
+  - name: u1
+    user:
+      token: brokered-secret-token
+"#;
+        // Empty CA data decodes to an empty bundle (no certs added) — fine for the
+        // parse-level test; we only assert base/bearer resolution here.
+        let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
+        assert_eq!(up.base(), "https://api.example.test:6443");
+        assert_eq!(up.bearer(), Some("brokered-secret-token"));
+    }
+
+    #[test]
+    fn explicit_context_overrides_current() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: a
+clusters:
+  - {name: ca, cluster: {server: "https://a:6443"}}
+  - {name: cb, cluster: {server: "https://b:6443"}}
+contexts:
+  - {name: a, context: {cluster: ca, user: ua}}
+  - {name: b, context: {cluster: cb, user: ub}}
+users:
+  - {name: ua, user: {token: ta}}
+  - {name: ub, user: {token: tb}}
+"#;
+        let up = Upstream::from_kubeconfig_str(yaml, Some("b")).unwrap();
+        assert_eq!(up.base(), "https://b:6443");
+        assert_eq!(up.bearer(), Some("tb"));
+    }
+
+    #[test]
+    fn rejects_exec_plugin() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: ctx
+clusters: [{name: c, cluster: {server: "https://x:6443"}}]
+contexts: [{name: ctx, context: {cluster: c, user: u}}]
+users:
+  - name: u
+    user:
+      exec: {command: aws-iam-authenticator}
+"#;
+        let err = Upstream::from_kubeconfig_str(yaml, None).unwrap_err();
+        assert!(err.to_string().contains("exec credential plugin"), "{err}");
+    }
+
+    #[test]
+    fn missing_context_errors() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+clusters: [{name: c, cluster: {server: "https://x:6443"}}]
+contexts: [{name: ctx, context: {cluster: c, user: u}}]
+users: [{name: u, user: {token: t}}]
+"#;
+        // No current-context and none supplied.
+        let err = Upstream::from_kubeconfig_str(yaml, None).unwrap_err();
+        assert!(err.to_string().contains("current-context"), "{err}");
+    }
+}
