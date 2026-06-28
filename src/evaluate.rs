@@ -33,7 +33,7 @@ const SYSTEM_PROMPT_GATING: &str = include_str!("../config/system-prompt-gating.
 /// The user's stated preference is a single call to this model, no fallback, no
 /// static policy. Changing this default will change the out-of-the-box behaviour
 /// of every daemon, so update deliberately.
-const DEFAULT_MODEL: &str = "openai/gpt-5.4-nano";
+const DEFAULT_MODEL: &str = "openai/gpt-5.4-mini";
 const DEFAULT_TIMEOUT: u64 = 10;
 const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_RETRIES: u32 = 2;
@@ -1805,7 +1805,7 @@ mod tests {
         assert!(config.models.is_empty());
         assert_eq!(config.timeout_secs, DEFAULT_TIMEOUT);
         assert_eq!(config.model(), DEFAULT_MODEL);
-        assert_eq!(config.model(), "openai/gpt-5.4-nano");
+        assert_eq!(config.model(), "openai/gpt-5.4-mini");
         assert_eq!(config.api_url(), DEFAULT_API_URL);
         assert_eq!(config.retries, DEFAULT_RETRIES);
     }
@@ -1814,7 +1814,7 @@ mod tests {
     fn test_llm_config_model_chain_default_single() {
         let config = LlmConfig::default();
         let chain = config.model_chain();
-        assert_eq!(chain, vec!["openai/gpt-5.4-nano".to_string()]);
+        assert_eq!(chain, vec!["openai/gpt-5.4-mini".to_string()]);
     }
 
     #[test]

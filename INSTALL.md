@@ -95,7 +95,7 @@ Key variables:
 
 - `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` -- LLM API key (required)
 - `GUARD_LLM_API_URL` / `GUARD_API_URL` -- LLM endpoint (default: OpenRouter)
-- `GUARD_LLM_MODEL` -- Primary model (default: `openai/gpt-5.4-nano`). For a fallback chain, use `GUARD_LLM_MODELS` with a comma-separated list; the chain takes precedence over this single-model value when set.
+- `GUARD_LLM_MODEL` -- Primary model (default: `openai/gpt-5.4-mini`). For a fallback chain, use `GUARD_LLM_MODELS` with a comma-separated list; the chain takes precedence over this single-model value when set.
 - `GUARD_MODE` -- Evaluation mode (default: `readonly`)
 - `GUARD_LLM_TIMEOUT` / `GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `30`)
 - `GUARD_AUTH_TOKEN` -- Shared token for TCP clients

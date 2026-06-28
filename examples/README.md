@@ -2,7 +2,7 @@
 
 Reference configs for guard. None of these are loaded automatically. Guard's
 default behaviour is LLM-only evaluation with a single model
-(`openai/gpt-5.4-nano` via OpenRouter, function-calling, two retries). That
+(`openai/gpt-5.4-mini` via OpenRouter, function-calling, two retries). That
 default is production-ready for most deployments. Everything in this directory
 is an opt-in override for a specific deployment constraint.
 

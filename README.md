@@ -15,9 +15,9 @@ DENIED: Recursive deletion of system config directory.
 
 AI agents (Claude Code, Codex, Aider, OpenHands, CrewAI, etc.) increasingly need command execution access for debugging, log analysis, and ops tasks. A single hallucinated `rm -rf` or `kubectl delete namespace` can take down production.
 
-Guard sits between the agent and the shell. Every command gets evaluated by an LLM (`openai/gpt-5.4-nano` via OpenRouter by default) before it reaches the system. The LLM analyzes intent and risk, not just pattern matching, so it catches obfuscated attacks and novel command chains that static policies miss.
+Guard sits between the agent and the shell. Every command gets evaluated by an LLM (`openai/gpt-5.4-mini` via OpenRouter by default) before it reaches the system. The LLM analyzes intent and risk, not just pattern matching, so it catches obfuscated attacks and novel command chains that static policies miss.
 
-Cost is negligible: each evaluation uses roughly 3600 prompt + 45 completion tokens, costing about $0.0005 per decision with `openai/gpt-5.4-nano`. A full 45-case CTF adversarial benchmark runs for about $0.02 total.
+Cost is negligible: each evaluation uses roughly 3600 prompt + 45 completion tokens, costing about $0.0005 per decision with `openai/gpt-5.4-mini`. A full 45-case CTF adversarial benchmark runs for about $0.02 total.
 
 ## Install
 
@@ -176,7 +176,7 @@ See [`examples/verbs.yaml`](examples/verbs.yaml).
 ### Defaults vs. opt-ins
 
 Guard ships with an LLM-only evaluation pipeline: a single call to
-`openai/gpt-5.4-nano` via OpenRouter, function-calling based, with two retries
+`openai/gpt-5.4-mini` via OpenRouter, function-calling based, with two retries
 before failing closed. No static allow or deny lists are loaded. No fallback
 model chain is active. This default is production-ready for the common case.
 
@@ -206,7 +206,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 |---|---|---|
 | `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
 | `GUARD_LLM_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
-| `GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
+| `GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-mini,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-mini`. |
 | `GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
 | `GUARD_LLM_TIMEOUT` | `30` | LLM call timeout in seconds. |
 | `GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
@@ -225,7 +225,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
 | `GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
 
-The primary model is `openai/gpt-5.4-nano` via OpenRouter by default. Set it
+The primary model is `openai/gpt-5.4-mini` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain
 across providers, use `GUARD_LLM_MODELS` (comma-separated) or
 `--llm-models`. `--llm-timeout <seconds>` controls the per-call HTTP timeout.
@@ -622,7 +622,7 @@ RUST_LOG=debug guard server start   # verbose request/response logging
 LLM token usage is logged per evaluation:
 
 ```
-[LLM_USAGE] model=openai/gpt-5.4-nano attempt=1 prompt_tokens=3594 completion_tokens=47 total_tokens=3641 status=ok
+[LLM_USAGE] model=openai/gpt-5.4-mini attempt=1 prompt_tokens=3594 completion_tokens=47 total_tokens=3641 status=ok
 ```
 
 For this local deployment model, the audit source of truth is the daemon's structured `tracing` output, typically collected by journald. The SQLite state database is for session state and queryable session history, not for replacing your log pipeline. `guard session show` is an operator view over that persisted session history; it should complement journald, not replace it.
