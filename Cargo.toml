@@ -36,6 +36,12 @@ shell-words = "1.0"
 rand = "0.10.1"
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 sha2 = "0.11.0"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem", "crypto"] }
+hyper = { version = "1.10.1", features = ["server", "client", "http1", "http2"] }
+http-body-util = "0.1.3"
+hyper-util = { version = "0.1.20", features = ["tokio", "server", "http1", "http2", "client", "client-legacy"] }
+base64 = "0.22.1"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.186"

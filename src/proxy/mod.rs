@@ -20,6 +20,7 @@
 pub mod k8s;
 pub mod kubeconfig;
 pub mod policy;
+pub mod tls;
 
 pub use k8s::{ApiOp, Verb};
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
