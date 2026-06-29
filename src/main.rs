@@ -255,6 +255,21 @@ enum VerbCommands {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Create a verb from plain-language prose (LLM-synthesized, validated, and
+    /// stored with the prose + evidence). Operator-only.
+    Create {
+        /// Plain-language description of the operation to expose as a verb.
+        #[arg(long)]
+        prompt: String,
+        /// Optional hint: the target binary (e.g. cmk, kubectl).
+        #[arg(long)]
+        binary: Option<String>,
+        /// Synthesize and show the verb but do not write it to the catalog.
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2161,6 +2176,48 @@ async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .await?;
             render_gated_response(&resp, streamed, &name)
         }
+        VerbCommands::Create {
+            prompt,
+            binary,
+            preview,
+            socket,
+        } => {
+            let client = gate_client(socket);
+            let req = server::AdminRequest::VerbCreate {
+                prose: prompt,
+                binary_hint: binary,
+                preview,
+            };
+            match client.send_admin(req).await? {
+                server::AdminResponse::VerbCreated { verb, persisted } => {
+                    if persisted {
+                        println!("Created verb '{}' and added it to the catalog:", verb.name);
+                    } else {
+                        println!(
+                            "Preview of verb '{}' (NOT written). Creating synthesizes again and may differ; every created verb is non-trusted and re-validated by the safety gate.",
+                            verb.name
+                        );
+                    }
+                    if let Some(ev) = &verb.evidence {
+                        println!("  evidence: {}", ev);
+                    }
+                    println!();
+                    match serde_yaml::to_string(&verb) {
+                        Ok(y) => print!("{}", y),
+                        Err(_) => println!("{:#?}", verb),
+                    }
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => {
+                    eprintln!("error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("unexpected response");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -2971,7 +3028,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::Provisionals { .. }
         | server::AdminResponse::Approvals { .. }
         | server::AdminResponse::ApprovalShow { .. }
-        | server::AdminResponse::Verbs { .. } => {
+        | server::AdminResponse::Verbs { .. }
+        | server::AdminResponse::VerbCreated { .. } => {
             // session subcommands never request these response variants.
             eprintln!("unexpected response from session admin call");
             std::process::exit(1);

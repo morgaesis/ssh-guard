@@ -1,3 +1,4 @@
+use crate::gating::verb::Verb;
 use crate::gating::{GateMode, Reversibility};
 use crate::learned_rules::{AutoShimMode, LearnedRuleStore, LearningOutcome};
 use crate::policy::{PolicyEngine, PolicyMode};
@@ -37,6 +38,32 @@ const DEFAULT_MODEL: &str = "openai/gpt-5.4-mini";
 const DEFAULT_TIMEOUT: u64 = 10;
 const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_RETRIES: u32 = 2;
+
+/// System guidance for `guard verb create --prompt` synthesis: turn operator
+/// prose into exactly ONE least-privilege, typed verb. Conservative defaults
+/// (read-only/reversible, narrow anchored patterns, no flag/shell injection).
+const SYSTEM_PROMPT_CREATE_VERB: &str = r#"You translate an operator's plain-language request into exactly ONE guard verb:
+a typed, least-privilege, fixed-binary command template an AI agent may invoke
+instead of raw shell. Always answer by calling the create_verb function.
+
+Rules:
+- Pick the single most specific operation that satisfies the request.
+- Every parameter `pattern` MUST be a fully anchored regex (^...$) and as NARROW
+  as possible. If the request names specific resources (a VM id, a network, a
+  profile), pin the pattern to exactly those values, e.g. ^(id-a|id-b)$ — never
+  allow arbitrary values when specific ones were named.
+- Use {param} placeholders in args; each renders as exactly ONE argv element.
+  Never put shell operators, pipes, redirects, spaces-as-separators, or a second
+  command in one arg. Never use sh -c / cmd /c / -c style interpreters.
+- allow_dash MUST be false unless a value is legitimately a leading-dash token.
+- consequence: "reversible" for read-only/list/get/idempotent; "recoverable"
+  ONLY for a mutation with a clean structured inverse, and then ALSO provide a
+  `revert`; "irreversible" for destruction or anything lacking a clean inverse.
+- trusted: true only for clearly safe read-only operations; otherwise false so
+  the LLM still evaluates the rendered command.
+- Do not invent flags that print or redirect credentials or configuration.
+- evidence: one or two sentences justifying the binary, params, patterns, and
+  class as least-privilege."#;
 
 pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
 pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
@@ -947,6 +974,95 @@ impl Evaluator {
         )
     }
 
+    /// Synthesize one typed verb from operator prose (the `guard verb create
+    /// --prompt` path). Reuses the daemon's own LLM client/key/model. Returns the
+    /// model-produced verb; the caller stamps `source_prose` and validates it
+    /// against the catalog before persisting. Operator-only at the RPC layer.
+    pub async fn synthesize_verb(&self, prose: &str, binary_hint: Option<&str>) -> Result<Verb> {
+        // Honor --no-llm: a daemon told not to talk to the model must not emit a
+        // synthesis request just because a key happens to be configured.
+        if !self.llm_config.enabled {
+            bail!(
+                "verb synthesis requires the LLM, which is disabled (--no-llm); \
+                 re-enable the LLM to create verbs"
+            );
+        }
+        let api_key = self
+            .llm_config
+            .api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verb synthesis needs an LLM API key, but the daemon has none configured"
+                )
+            })?;
+        let api_url = self.llm_config.api_url();
+        let model = self.llm_config.model();
+        let body = build_create_verb_body(&model, prose, binary_hint);
+
+        // A small model occasionally omits a required field or returns
+        // unparseable arguments; retry a few times before failing.
+        let attempts = self.llm_config.effective_retries().saturating_add(1).max(2);
+        let mut last_err = String::new();
+        for attempt in 1..=attempts {
+            match self.synthesize_verb_once(&api_key, &api_url, &body).await {
+                Ok(verb) => return Ok(verb),
+                Err(e) => {
+                    last_err = e.to_string();
+                    tracing::warn!(
+                        "verb synthesis attempt {}/{} failed: {}",
+                        attempt,
+                        attempts,
+                        last_err
+                    );
+                    if attempt < attempts {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                }
+            }
+        }
+        bail!("verb synthesis failed after {attempts} attempts: {last_err}")
+    }
+
+    /// One verb-synthesis round-trip: post the create_verb request and parse the
+    /// forced tool call's arguments straight into a `Verb`.
+    async fn synthesize_verb_once(
+        &self,
+        api_key: &str,
+        api_url: &str,
+        body: &serde_json::Value,
+    ) -> Result<Verb> {
+        let response = self
+            .http_client
+            .post(api_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
+        if !status.is_success() {
+            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let args_str = parsed
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("model did not return a create_verb tool call"))?;
+        let args: serde_json::Value = serde_json::from_str(args_str)
+            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let verb: Verb = serde_json::from_value(args)
+            .map_err(|e| anyhow::anyhow!("model output did not match the verb schema: {e}"))?;
+        Ok(verb)
+    }
+
     /// Runs one model through the full retry budget. Returns Ok(decision) on the
     /// first successful attempt, or Err once the budget is exhausted.
     #[tracing::instrument(skip(self, api_key, command, system_prompt), fields(model = %model))]
@@ -1168,8 +1284,80 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Back up to a char boundary so slicing a multi-byte UTF-8 body (e.g. an
+        // error page from the provider) cannot panic.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
+}
+
+/// Build the function-calling body for verb synthesis: force a single
+/// `create_verb` tool call whose arguments deserialize directly into a `Verb`.
+fn build_create_verb_body(
+    model: &str,
+    prose: &str,
+    binary_hint: Option<&str>,
+) -> serde_json::Value {
+    let user = match binary_hint {
+        Some(b) => format!("Target binary: {b}\n\nOperator request:\n{prose}"),
+        None => format!("Operator request:\n{prose}"),
+    };
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_CREATE_VERB},
+            {"role": "user", "content": user},
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "create_verb",
+                "description": "Define exactly one typed guard verb that satisfies the operator request with least privilege.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "short kebab-case verb name"},
+                        "description": {"type": "string"},
+                        "binary": {"type": "string", "description": "the exact executable name, no path"},
+                        "args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "argv template; use {param} placeholders, one per argv element; no shell operators"
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "map of param name -> spec",
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": {
+                                    "pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$, as narrow as possible; pin to specific named values when the request names them"},
+                                    "required": {"type": "boolean"},
+                                    "allow_dash": {"type": "boolean"}
+                                },
+                                "required": ["pattern"]
+                            }
+                        },
+                        "consequence": {"type": "string", "enum": ["reversible", "recoverable", "irreversible"]},
+                        "revert": {
+                            "type": "object",
+                            "properties": {
+                                "binary": {"type": "string"},
+                                "args": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "description": "required only for a recoverable verb: the structured inverse"
+                        },
+                        "trusted": {"type": "boolean", "description": "true only for clearly safe read-only operations"},
+                        "evidence": {"type": "string", "description": "one or two sentences justifying this least-privilege shape"}
+                    },
+                    "required": ["name", "binary", "consequence", "evidence"]
+                }
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "create_verb"}}
+    })
 }
 
 /// Build the OpenAI-compatible body for a function-calling request. The evaluator

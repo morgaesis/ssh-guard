@@ -346,6 +346,16 @@ pub enum AdminRequest {
     },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
+    /// Synthesize a typed verb from operator prose via the LLM and (unless
+    /// `preview`) append it to the catalog with the prose + evidence recorded.
+    /// Operator-only (mutates the catalog).
+    VerbCreate {
+        prose: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary_hint: Option<String>,
+        #[serde(default)]
+        preview: bool,
+    },
 }
 
 impl AdminRequest {
@@ -449,6 +459,11 @@ pub enum AdminResponse {
     },
     Verbs {
         items: Vec<VerbSummary>,
+    },
+    VerbCreated {
+        verb: guard::gating::verb::Verb,
+        /// True when the verb was written to the catalog; false for a preview.
+        persisted: bool,
     },
 }
 
@@ -2442,7 +2457,79 @@ async fn handle_admin_request(
             };
             AdminResponse::Verbs { items }
         }
+        AdminRequest::VerbCreate {
+            prose,
+            binary_hint,
+            preview,
+        } => {
+            let prose_norm = normalize_ws(&prose);
+            if prose_norm.is_empty() {
+                return AdminResponse::Error {
+                    message: "verb create requires non-empty --prompt prose".to_string(),
+                };
+            }
+            let mut verb = match config
+                .evaluator
+                .synthesize_verb(&prose, binary_hint.as_deref())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("verb synthesis failed: {e}"),
+                    }
+                }
+            };
+            // Record provenance verbatim (tidied to one line); the model's
+            // evidence is metadata only and never affects rendering.
+            verb.source_prose = Some(prose_norm);
+            if let Some(ev) = verb.evidence.take() {
+                verb.evidence = Some(normalize_ws(&ev));
+            }
+            // The model chose this shape, so do not trust its safety-critical
+            // fields: a synthesized verb is never `trusted` (the LLM still
+            // evaluates the rendered command at run time), and the shape must
+            // pass the synthesis safety gate (no shell/interpreter binary, no
+            // over-broad parameter pattern, kebab-case name).
+            verb.trusted = false;
+            if let Err(e) = guard::gating::verb::validate_synthesized_safety(&verb) {
+                return AdminResponse::Error {
+                    message: format!("synthesized verb rejected by the safety gate: {e}"),
+                };
+            }
+            let mut cat = config.verbs.write().await;
+            let result = if preview {
+                cat.validate_candidate(&verb)
+            } else {
+                cat.append_verb(&verb)
+            };
+            match result {
+                Ok(()) => {
+                    if !preview {
+                        tracing::info!(
+                            "[AUDIT] VERB_CREATED name={} consequence={} trusted={}",
+                            verb.name,
+                            verb.consequence.as_str(),
+                            verb.trusted
+                        );
+                    }
+                    AdminResponse::VerbCreated {
+                        verb,
+                        persisted: !preview,
+                    }
+                }
+                Err(e) => AdminResponse::Error {
+                    message: format!("synthesized verb rejected by validation: {e}"),
+                },
+            }
+        }
     }
+}
+
+/// Collapse runs of whitespace (incl. newlines) to single spaces, so prose and
+/// evidence persist as a tidy single line in the YAML catalog.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Returns `(is_daemon, caller_principal)` for read-scoping. A caller is the
@@ -6005,6 +6092,7 @@ impl Client {
             AdminRequest::ApprovalShow { .. } => "approval_show",
             AdminRequest::ApprovalNote { .. } => "approval_note",
             AdminRequest::VerbList => "verb_list",
+            AdminRequest::VerbCreate { .. } => "verb_create",
         };
         let envelope = IncomingMessage::Admin {
             admin: request,

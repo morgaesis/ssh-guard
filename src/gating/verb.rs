@@ -15,7 +15,7 @@
 use super::Reversibility;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -23,19 +23,19 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// A single parameter's validation rule.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSpec {
     /// Fully-anchored regex (`^...$`) the value must match. Rejected at load if
     /// not anchored, so a permissive pattern cannot silently allow a substring
     /// with shell metacharacters or flag-injection.
     pub pattern: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub required: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Allow a rendered value to begin with `-`. Off by default so a value can
     /// never be smuggled in as an option flag (e.g. `-o ProxyCommand=...`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub allow_dash: bool,
 }
 
@@ -43,36 +43,52 @@ fn default_true() -> bool {
     true
 }
 
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// A structured command template (binary + argv templates). No shell.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerbCommand {
     pub binary: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
 }
 
 /// One catalog verb.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verb {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     pub binary: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamSpec>,
     pub consequence: Reversibility,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert: Option<VerbCommand>,
     /// When true the rendered command skips the LLM evaluator (deterministic
     /// allow). The reversibility class still drives the gate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub trusted: bool,
     /// Extra context appended to the LLM system prompt when this verb IS
     /// evaluated (untrusted verbs only).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_context: Option<String>,
+    /// Operator prose this verb was generated from (`guard verb create
+    /// --prompt`), stored for posterity. Metadata only; never used in rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_prose: Option<String>,
+    /// Concise rationale/evidence for the generated shape (why this binary, these
+    /// params, patterns, and class). Metadata only; never used in rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +264,213 @@ impl VerbCatalog {
             params: resolved,
         })
     }
+
+    /// The backing catalog file, if this catalog was loaded from one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Validate a candidate verb against this catalog: it must pass the same
+    /// structural validation as a loaded verb (anchored patterns, declared
+    /// placeholders) and must not collide with an existing verb name.
+    pub fn validate_candidate(&self, verb: &Verb) -> Result<()> {
+        validate_verb(verb)?;
+        if self.verbs.contains_key(&verb.name) {
+            bail!("a verb named '{}' already exists in the catalog", verb.name);
+        }
+        Ok(())
+    }
+
+    /// Validate, then persist, a new verb by appending it to the backing catalog
+    /// file, then reload so the in-memory catalog (and its content version)
+    /// reflect the write. Requires the catalog to be file-backed. Nothing is
+    /// written if validation fails.
+    pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
+        self.validate_candidate(verb)?;
+        let path = self.path.clone().ok_or_else(|| {
+            anyhow::anyhow!("verb catalog is not backed by a file; cannot persist a new verb")
+        })?;
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let new_content = compose_appended_catalog(&existing, verb)?;
+        // Validate the COMBINED catalog in memory BEFORE touching the file, so a
+        // bad or duplicate verb can never corrupt the catalog on disk.
+        let validated = Self::from_yaml(&new_content)
+            .context("appending this verb would make the catalog invalid")?;
+        std::fs::write(&path, &new_content)
+            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        // Adopt the already-validated content rather than re-reading the file: a
+        // post-write reload failure would otherwise report an error to the
+        // operator even though the write landed, desyncing memory from disk.
+        self.verbs = validated.verbs;
+        self.version = validated.version;
+        self.mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        Ok(())
+    }
+}
+
+/// Compose the new catalog text by adding one verb to the top-level `verbs:`
+/// sequence. Parses the existing catalog into the YAML model (tolerating a
+/// leading UTF-8 BOM), pushes the verb, and re-serializes the whole document.
+/// Re-serializing — rather than text-appending at EOF — handles a missing,
+/// null, empty (`[]`), or flow-style `verbs:` key and preserves any other
+/// top-level keys, instead of assuming `verbs:` is the last block in the file.
+/// The caller validates the result before writing. (Comments in the catalog are
+/// not preserved across an append; the prose/evidence are stored in-band.)
+fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let verb_value = serde_yaml::to_value(verb).context("failed to serialize verb")?;
+
+    if body.trim().is_empty() {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            serde_yaml::Value::String("verbs".to_string()),
+            serde_yaml::Value::Sequence(vec![verb_value]),
+        );
+        return serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
+            .context("failed to serialize the new catalog");
+    }
+
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let key = serde_yaml::Value::String("verbs".to_string());
+    let is_seq = matches!(map.get(&key), Some(serde_yaml::Value::Sequence(_)));
+    let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml::Value::Null));
+    if is_seq {
+        if let Some(serde_yaml::Value::Sequence(seq)) = map.get_mut(&key) {
+            seq.push(verb_value);
+        }
+    } else if is_null_or_absent {
+        map.insert(key, serde_yaml::Value::Sequence(vec![verb_value]));
+    } else {
+        bail!("the catalog's `verbs` key is not a sequence");
+    }
+    serde_yaml::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+/// Binaries a synthesized verb may not use: shells and interpreters where a
+/// single argument can carry an arbitrary command, which would defeat the
+/// catalog's "no shell" guarantee. An operator who genuinely needs one authors
+/// the verb by hand (this gate applies only to LLM-synthesized verbs).
+const SYNTH_BINARY_DENYLIST: &[&str] = &[
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "ash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "busybox",
+    "cmd",
+    "command",
+    "powershell",
+    "pwsh",
+    "wscript",
+    "cscript",
+    "mshta",
+    "env",
+    "xargs",
+    "find",
+    "awk",
+    "gawk",
+    "sed",
+    "perl",
+    "python",
+    "python2",
+    "python3",
+    "ruby",
+    "node",
+    "nodejs",
+    "php",
+    "lua",
+    "tclsh",
+    "expect",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "telnet",
+    "ssh",
+    "scp",
+    "sftp",
+];
+
+/// Strings a least-privilege parameter pattern must NOT match: whitespace and
+/// shell control metacharacters. A pattern that matches any of these is too
+/// permissive to be a safe verb parameter (e.g. `^.+$`).
+const OVERBROAD_CANARIES: &[&str] = &[
+    "a b", "a\tb", "a\nb", "a;b", "a|b", "a&b", "a$b", "a`b", "a>b", "a<b", "a(b)", "a{b}", "a*b",
+    "a?b", "a[b", "a\\b", "a!b", "x y z",
+];
+
+/// True if `name` is kebab-case (`^[a-z0-9][a-z0-9-]*$`), so it is unambiguously
+/// invokable on the `guard verb run <name>` command line.
+fn is_kebab_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
+/// The binary's match key: basename, lowercased, with a `.exe` suffix stripped.
+fn binary_match_key(binary: &str) -> String {
+    let base = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    base.to_ascii_lowercase()
+}
+
+/// Extra safety gate for verbs produced by `guard verb create --prompt`. The LLM
+/// chose the shape, so its safety-critical fields must not be trusted: reject a
+/// `trusted` verb (a synthesized verb keeps the LLM run-time backstop), a
+/// shell/interpreter binary, a non-kebab name, and any parameter pattern broad
+/// enough to admit whitespace or shell metacharacters. Structural validation
+/// (anchored patterns, single-argv rendering) is still enforced by `validate_verb`.
+pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
+    if verb.trusted {
+        bail!(
+            "a synthesized verb may not be `trusted`; promote a verb to trusted only with a \
+             deliberate manual operator edit of the catalog"
+        );
+    }
+    if !is_kebab_name(&verb.name) {
+        bail!(
+            "synthesized verb name '{}' must be kebab-case (^[a-z0-9][a-z0-9-]*$)",
+            verb.name
+        );
+    }
+    let key = binary_match_key(&verb.binary);
+    if SYNTH_BINARY_DENYLIST.contains(&key.as_str()) {
+        bail!(
+            "synthesized verb binary '{}' is a shell/interpreter and is not allowed (one argument \
+             could carry an arbitrary command); author such a verb by hand if you truly need it",
+            verb.binary
+        );
+    }
+    for (pname, spec) in &verb.params {
+        let re = compile_anchored(&spec.pattern)
+            .with_context(|| format!("param '{}' pattern", pname))?;
+        if let Some(canary) = OVERBROAD_CANARIES.iter().find(|c| re.is_match(c)) {
+            bail!(
+                "synthesized verb parameter '{}' pattern {:?} is too permissive (it matches {:?}); \
+                 a verb parameter must be narrowly pinned and must not admit whitespace or shell \
+                 metacharacters",
+                pname,
+                spec.pattern,
+                canary
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validate a verb at load time. A param pattern must be fully anchored and
@@ -560,5 +783,256 @@ verbs:
 "#;
         let err = VerbCatalog::from_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn append_verb_persists_provenance_and_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verbs.yaml");
+        std::fs::write(
+            &path,
+            "verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n",
+        )
+        .unwrap();
+        let mut cat = VerbCatalog::load(&path).unwrap();
+
+        let mut p = BTreeMap::new();
+        p.insert(
+            "resource".to_string(),
+            ParamSpec {
+                pattern: "^(zones|networks|virtualmachines)$".to_string(),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        let verb = Verb {
+            name: "cmk-list".to_string(),
+            description: "Read-only CloudStack listing".to_string(),
+            binary: "cmk".to_string(),
+            args: vec!["list".to_string(), "{resource}".to_string()],
+            params: p,
+            consequence: Reversibility::Reversible,
+            revert: None,
+            trusted: true,
+            prompt_context: None,
+            source_prose: Some("read-only cmk listing of zones, networks, vms".to_string()),
+            evidence: Some("read-only; resource pinned to an allow-list; reversible".to_string()),
+        };
+        cat.append_verb(&verb).unwrap();
+
+        // Reload independently: persisted, provenance kept, pinning enforced.
+        let reloaded = VerbCatalog::load(&path).unwrap();
+        assert!(reloaded.names().contains(&"cmk-list".to_string()));
+        assert!(reloaded.names().contains(&"existing".to_string()));
+        let got = reloaded.get("cmk-list").unwrap();
+        assert_eq!(
+            got.source_prose.as_deref(),
+            Some("read-only cmk listing of zones, networks, vms")
+        );
+        assert!(got.evidence.is_some());
+        let r = reloaded
+            .render("cmk-list", &params(&[("resource", "zones")]))
+            .unwrap();
+        assert_eq!(r.binary, "cmk");
+        assert_eq!(r.args, vec!["list", "zones"]);
+        assert!(reloaded
+            .render("cmk-list", &params(&[("resource", "volumes")]))
+            .is_err());
+    }
+
+    #[test]
+    fn append_verb_rejects_duplicate_and_invalid_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verbs.yaml");
+        let initial = "verbs:\n  - name: dup\n    binary: echo\n    consequence: reversible\n";
+        std::fs::write(&path, initial).unwrap();
+        let mut cat = VerbCatalog::load(&path).unwrap();
+
+        let mk = |name: &str, pattern: Option<&str>| {
+            let mut params = BTreeMap::new();
+            let mut args = vec![];
+            if let Some(pat) = pattern {
+                params.insert(
+                    "x".to_string(),
+                    ParamSpec {
+                        pattern: pat.to_string(),
+                        required: true,
+                        default: None,
+                        allow_dash: false,
+                    },
+                );
+                args.push("{x}".to_string());
+            }
+            Verb {
+                name: name.to_string(),
+                description: String::new(),
+                binary: "echo".to_string(),
+                args,
+                params,
+                consequence: Reversibility::Reversible,
+                revert: None,
+                trusted: false,
+                prompt_context: None,
+                source_prose: None,
+                evidence: None,
+            }
+        };
+
+        // Duplicate name -> rejected.
+        assert!(cat.append_verb(&mk("dup", None)).is_err());
+        // Unanchored pattern -> rejected by validation.
+        assert!(cat.append_verb(&mk("bad", Some("[a-z]+"))).is_err());
+        // Neither failed append touched the file.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+    }
+
+    #[test]
+    fn append_tolerates_bom_and_keeps_one_verbs_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verbs.yaml");
+        // Seed with a leading UTF-8 BOM, as a Windows editor or PowerShell's
+        // utf8 mode would write it.
+        let seed =
+            "\u{feff}verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n";
+        std::fs::write(&path, seed).unwrap();
+        let mut cat = VerbCatalog::load(&path).unwrap();
+
+        let v = Verb {
+            name: "added".to_string(),
+            description: String::new(),
+            binary: "echo".to_string(),
+            args: vec![],
+            params: BTreeMap::new(),
+            consequence: Reversibility::Reversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+        };
+        cat.append_verb(&v).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("verbs:").count(),
+            1,
+            "BOM must not cause a duplicate verbs: key"
+        );
+        assert!(
+            !text.starts_with('\u{feff}'),
+            "BOM should be stripped on write"
+        );
+        let reloaded = VerbCatalog::load(&path).unwrap();
+        assert!(reloaded.names().contains(&"existing".to_string()));
+        assert!(reloaded.names().contains(&"added".to_string()));
+    }
+
+    fn synth_verb(binary: &str, pattern: Option<&str>, trusted: bool, name: &str) -> Verb {
+        let mut params = BTreeMap::new();
+        let mut args = vec![];
+        if let Some(p) = pattern {
+            params.insert(
+                "x".to_string(),
+                ParamSpec {
+                    pattern: p.to_string(),
+                    required: true,
+                    default: None,
+                    allow_dash: false,
+                },
+            );
+            args.push("{x}".to_string());
+        }
+        Verb {
+            name: name.to_string(),
+            description: String::new(),
+            binary: binary.to_string(),
+            args,
+            params,
+            consequence: Reversibility::Reversible,
+            revert: None,
+            trusted,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+        }
+    }
+
+    #[test]
+    fn synthesis_safety_gate_blocks_dangerous_shapes() {
+        // shell / interpreter binaries (incl. path and .exe forms)
+        assert!(validate_synthesized_safety(&synth_verb("sh", Some("^.+$"), false, "x")).is_err());
+        assert!(
+            validate_synthesized_safety(&synth_verb("/bin/bash", Some("^x$"), false, "x")).is_err()
+        );
+        assert!(validate_synthesized_safety(&synth_verb(
+            "PowerShell.exe",
+            Some("^x$"),
+            false,
+            "x"
+        ))
+        .is_err());
+        // over-broad / whitespace-admitting patterns
+        assert!(validate_synthesized_safety(&synth_verb("cmk", Some("^.+$"), false, "x")).is_err());
+        assert!(
+            validate_synthesized_safety(&synth_verb("cmk", Some("^[a-z ]+$"), false, "x")).is_err()
+        );
+        // trusted synthesized verb
+        assert!(
+            validate_synthesized_safety(&synth_verb("cmk", Some("^zones$"), true, "x")).is_err()
+        );
+        // non-kebab name
+        assert!(validate_synthesized_safety(&synth_verb(
+            "cmk",
+            Some("^zones$"),
+            false,
+            "Bad Name"
+        ))
+        .is_err());
+        // good narrow read-only verbs pass
+        assert!(validate_synthesized_safety(&synth_verb(
+            "cmk",
+            Some("^(zones|networks)$"),
+            false,
+            "cmk-list"
+        ))
+        .is_ok());
+        assert!(validate_synthesized_safety(&synth_verb(
+            "cmk",
+            Some("^[a-f0-9-]{36}$"),
+            false,
+            "cmk-show"
+        ))
+        .is_ok());
+        assert!(validate_synthesized_safety(&synth_verb(
+            "kubectl",
+            Some("^[a-z0-9-]{1,63}$"),
+            false,
+            "k-get"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn append_handles_empty_inline_and_trailing_key_catalogs() {
+        let v = synth_verb("cmk", Some("^(zones|networks)$"), false, "cmk-list");
+        let seeds = [
+            "verbs: []\n",
+            "verbs:\n  - name: a\n    binary: echo\n    consequence: reversible\n",
+            "verbs:\n  - name: a\n    binary: echo\n    consequence: reversible\ndefaults:\n  timeout: 30\n",
+        ];
+        for seed in seeds {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("verbs.yaml");
+            std::fs::write(&path, seed).unwrap();
+            let mut cat = VerbCatalog::load(&path).unwrap();
+            cat.append_verb(&v)
+                .unwrap_or_else(|e| panic!("append failed for seed {seed:?}: {e}"));
+            let reloaded = VerbCatalog::load(&path).unwrap();
+            assert!(
+                reloaded.names().contains(&"cmk-list".to_string()),
+                "seed {seed:?} should gain the verb"
+            );
+        }
     }
 }

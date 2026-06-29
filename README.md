@@ -177,6 +177,28 @@ hot-reloaded on change; agents cannot add or alter verbs. A `trusted` verb skips
 the LLM (a deterministic allow path); its declared class still drives the gate.
 See [`examples/verbs.yaml`](examples/verbs.yaml).
 
+#### Generating a verb from prose
+
+Hand-writing verb YAML is optional. `guard verb create --prompt "<description>"`
+asks the daemon's evaluator LLM to synthesize one typed verb from a plain-language
+description, validates it exactly like a hand-authored verb, and appends it to the
+catalog with the original prose and a short rationale recorded inline
+(`source_prose`, `evidence`). Use `--preview` to see the synthesized verb without
+writing it, and `--binary <name>` to hint the target tool.
+
+```bash
+guard verb create --binary cmk --prompt \
+  "read-only: list CloudStack VMs for the atlas-debug profile, only the VM with id <uuid>"
+```
+
+Creating a verb is operator-only (it mutates the catalog). The synthesis is held
+to a safety gate the model cannot talk its way past: a synthesized verb is never
+`trusted` (so the LLM still evaluates the rendered command at run time), its binary
+may not be a shell or interpreter, its parameter patterns may not admit whitespace
+or shell metacharacters, and its name must be kebab-case. This lets an operator add
+narrow, least-privilege verbs — including per-resource limits a tool's own RBAC
+cannot express — without writing YAML by hand.
+
 ## Kubernetes API proxy
 
 The command gate sees a command's argv, but tools that drive the Kubernetes API
