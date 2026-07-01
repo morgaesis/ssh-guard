@@ -414,14 +414,24 @@ function Invoke-Install {
     #    --service                 -> answer the SCM start/stop handshake
     #                                 (guard.exe is otherwise a console binary)
     #    --no-llm                  -> only when no key is configured
+    # `guard server start --verbs <path>` hard-errors if the file does not
+    # exist, so only pass it when step 2 actually placed (or found) one --
+    # otherwise the service fails to start while sc.exe's own failure is only
+    # a warning (see below), and this script would print "install complete"
+    # even though the daemon never came up.
     $binArgs = @(
         'server', 'start',
         '--socket', $SocketName,
         '--gate', 'consequence',
         '--state-db', $StateDb,
-        '--verbs', $VerbsPath,
         '--service'
     )
+    if (Test-Path -LiteralPath $VerbsPath) {
+        $binArgs += '--verbs', $VerbsPath
+    }
+    else {
+        Write-Warning "No verb catalog at $VerbsPath; starting the service without --verbs."
+    }
     if (-not $haveKey) { $binArgs += '--no-llm' }
 
     # sc.exe binPath is a single string; quote the exe (it can contain spaces)
@@ -487,10 +497,24 @@ function Invoke-Install {
         Write-Host "Service env: KUBECONFIG set; no LLM key found, daemon runs --no-llm."
     }
 
-    # 9. Start the service.
+    # 9. Start the service, then verify it actually reached Running -- sc.exe
+    #    start can return success while the service immediately stops (e.g.
+    #    the binPath args above are rejected at startup), and a missing verb
+    #    catalog used to be exactly this failure mode. Without this check the
+    #    script would print "Install complete" regardless of whether the
+    #    daemon is actually up.
     & sc.exe start $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "sc.exe start returned exit $LASTEXITCODE. Check 'sc.exe query $ServiceName' and the Windows Event Log (Application)."
+    }
+    Start-Sleep -Seconds 2
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -eq $svc -or $svc.Status -ne 'Running') {
+        $status = if ($null -eq $svc) { 'not found' } else { $svc.Status }
+        Write-Warning "guard service is not running (status: $status). The daemon did NOT start successfully -- check 'sc.exe query $ServiceName' and the Windows Event Log (Application) before relying on this deployment."
+    }
+    else {
+        Write-Host "Service is running."
     }
 
     Write-Host ''

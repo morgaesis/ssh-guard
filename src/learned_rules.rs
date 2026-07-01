@@ -1,8 +1,21 @@
-//! Learned static allow rules promoted from repeated low-risk LLM approvals.
+//! Candidate detection for repeated low-risk LLM approvals.
 //!
-//! This module intentionally does not reuse `PolicyEngine` for lookup. A
-//! `PolicyEngine` miss is a deny, while a learned-rule miss must fall through
-//! to the LLM evaluator.
+//! This module tracks commands the LLM evaluator has approved more than once
+//! at low risk and, once a pattern crosses `min_approvals`, returns a
+//! `LearningOutcome` the caller (`server::learning_notice`) turns into an
+//! operator-facing notice.
+//!
+//! It deliberately does NOT grant a bypass itself. An agent's own repeated
+//! behavior is not a trustworthy signal to grant that same agent a
+//! permanent, LLM-skipping allow -- that would let an agent promote itself
+//! past the evaluator by simply repeating a borderline-but-approved command,
+//! via a second glob matcher with the same "can't parse shell quoting"
+//! weakness `PolicyEngine` documents for its own deny-only fast path. Every
+//! other deterministic-allow mechanism in this codebase (`guard verb`) is
+//! operator-authored or operator-invoked; this one is too. The candidate
+//! becomes a real, LLM-skipping rule only when the operator runs `guard verb
+//! create --prompt` (the notice text gives the exact command), which goes
+//! through the same synthesis safety gate as any other verb.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -55,53 +68,18 @@ impl AutoShimMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LearnedRuleHit {
-    pub service: String,
-    pub pattern: String,
-    pub matched_pattern: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shim: Option<LearnedShim>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LearningOutcome {
     pub service: String,
     pub pattern: String,
     pub approvals: u32,
     pub required_approvals: u32,
-    pub promoted: bool,
+    /// True once `approvals >= required_approvals`. This means the pattern is
+    /// ready for operator review, NOT that it can now skip the LLM -- nothing
+    /// in this module grants a bypass. See the module docs.
+    pub is_candidate: bool,
     pub shim: Option<LearnedShim>,
     pub skipped_reason: Option<String>,
-}
-
-impl LearningOutcome {
-    pub fn notice(&self) -> Option<String> {
-        if let Some(reason) = &self.skipped_reason {
-            return Some(format!("Learned-rule skip: {reason}."));
-        }
-
-        let mut parts = Vec::new();
-        if self.promoted {
-            parts.push(format!(
-                "Promoted learned static rule `{}` for `{}` after {} approvals.",
-                self.pattern, self.service, self.approvals
-            ));
-        } else {
-            parts.push(format!(
-                "Learned-rule candidate `{}` for `{}` ({}/{} approvals).",
-                self.pattern, self.service, self.approvals, self.required_approvals
-            ));
-        }
-        if let Some(shim) = &self.shim {
-            parts.push(format!(
-                "Shim hint: `{}` wraps `{}`.",
-                shim.name,
-                shim.render_command()
-            ));
-        }
-        Some(parts.join(" "))
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,24 +188,6 @@ impl LearnedRuleStore {
         self.data.rules.len()
     }
 
-    pub fn check(&self, command: &str) -> Option<LearnedRuleHit> {
-        if looks_dangerous_for_learned_allow(command) {
-            return None;
-        }
-
-        self.data.rules.iter().find_map(|rule| {
-            let matched_pattern = std::iter::once(&rule.pattern)
-                .chain(rule.equivalent_patterns.iter())
-                .find(|pattern| glob_match(pattern, command));
-            matched_pattern.map(|matched_pattern| LearnedRuleHit {
-                service: rule.service.clone(),
-                pattern: rule.pattern.clone(),
-                matched_pattern: matched_pattern.clone(),
-                shim: rule.shim.clone(),
-            })
-        })
-    }
-
     pub fn record_approval(
         &mut self,
         binary: &str,
@@ -243,7 +203,7 @@ impl LearnedRuleStore {
                 pattern: command.to_string(),
                 approvals: 0,
                 required_approvals: self.config.min_approvals,
-                promoted: false,
+                is_candidate: false,
                 shim: None,
                 skipped_reason: Some(format!(
                     "risk {risk} exceeds max learned-rule risk {}",
@@ -257,7 +217,7 @@ impl LearnedRuleStore {
                 pattern: command.to_string(),
                 approvals: 0,
                 required_approvals: self.config.min_approvals,
-                promoted: false,
+                is_candidate: false,
                 shim: None,
                 skipped_reason: Some("command contains shell-control or destructive tokens".into()),
             }));
@@ -292,8 +252,8 @@ impl LearnedRuleStore {
         observation.equivalent_patterns = candidate.equivalent_patterns.clone();
 
         let approvals = observation.approvals;
-        let promoted = approvals >= self.config.min_approvals;
-        if promoted {
+        let is_candidate = approvals >= self.config.min_approvals;
+        if is_candidate {
             if let Some(rule) = self
                 .data
                 .rules
@@ -327,7 +287,7 @@ impl LearnedRuleStore {
             pattern: candidate.pattern,
             approvals,
             required_approvals: self.config.min_approvals,
-            promoted,
+            is_candidate,
             shim: candidate.shim,
             skipped_reason: None,
         }))
@@ -504,7 +464,9 @@ fn infer_ssh_service(host: &str, remote_args: &[String]) -> String {
     sanitize_name(base, "service")
 }
 
-fn infer_service_from_binary(binary: &str) -> String {
+/// Also used by `gating::deny_shape` so both the allow-candidate and the
+/// auto-deny bucketing key commands to the same "service" the same way.
+pub(crate) fn infer_service_from_binary(binary: &str) -> String {
     sanitize_name(binary.trim_end_matches(".exe"), "service")
 }
 
@@ -591,44 +553,6 @@ fn looks_dangerous_for_learned_allow(command: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn glob_match(pattern: &str, text: &str) -> bool {
-    if pattern == text {
-        return true;
-    }
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    let text_chars: Vec<char> = text.chars().collect();
-    glob_match_inner(&pattern_chars, &text_chars)
-}
-
-fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
-    let mut p = 0usize;
-    let mut t = 0usize;
-    let mut star = None;
-    let mut match_after_star = 0usize;
-
-    while t < text.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
-            star = Some(p);
-            match_after_star = t;
-            p += 1;
-        } else if let Some(star_pos) = star {
-            p = star_pos + 1;
-            match_after_star += 1;
-            t = match_after_star;
-        } else {
-            return false;
-        }
-    }
-
-    while p < pattern.len() && pattern[p] == '*' {
-        p += 1;
-    }
-    p == pattern.len()
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -690,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_low_risk_approval_promotes_rule() {
+    fn repeated_low_risk_approval_becomes_a_candidate_not_a_bypass() {
         let temp = tempfile::tempdir().unwrap();
         let config = LearningConfig {
             path: temp.path().join("learned.yaml"),
@@ -704,51 +628,17 @@ mod tests {
             .record_approval("opnsense-api", &args, "opnsense-api status", Some(1), "ok")
             .unwrap()
             .unwrap();
-        assert!(!first.promoted);
+        assert!(!first.is_candidate);
+        assert_eq!(store.rule_count(), 0);
 
         let second = store
             .record_approval("opnsense-api", &args, "opnsense-api status", Some(1), "ok")
             .unwrap()
             .unwrap();
-        assert!(second.promoted);
-        assert!(store.check("opnsense-api status").is_some());
-    }
-
-    #[test]
-    fn learned_rule_does_not_generalize_to_other_service_verb() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = LearningConfig {
-            path: temp.path().join("learned.yaml"),
-            min_approvals: 1,
-            max_risk: 2,
-            auto_shim: AutoShimMode::Suggest,
-        };
-        let mut store = LearnedRuleStore::load(config).unwrap();
-        let args = vec![
-            "firewall".to_string(),
-            "configctl".to_string(),
-            "system".to_string(),
-            "status".to_string(),
-        ];
-        store
-            .record_approval(
-                "ssh",
-                &args,
-                "ssh firewall configctl system status",
-                Some(1),
-                "ok",
-            )
-            .unwrap()
-            .unwrap();
-
-        assert!(store
-            .check("ssh firewall configctl system status")
-            .is_some());
-        assert!(store.check("opnsense-api system status").is_some());
-        assert!(store
-            .check("ssh firewall configctl system reboot")
-            .is_none());
-        assert!(store.check("opnsense-api system reboot").is_none());
+        assert!(second.is_candidate);
+        // Crossing the threshold persists a reviewable candidate record, but
+        // grants nothing: this module has no lookup that can return an allow.
+        assert_eq!(store.rule_count(), 1);
     }
 
     #[test]

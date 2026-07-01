@@ -116,6 +116,35 @@ impersonation. A Unix root daemon started with `--exec-as-caller` over a
 Unix-socket-only listener instead drops each child to the calling uid before
 exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only.
 
+## OS-level sandboxing profiles
+
+`guard profile seccomp` emits a default-allow seccomp profile (use via
+`--security-opt seccomp=<file>` on Docker/Podman) that denies
+container-escape and host-tampering syscalls (`mount`, `pivot_root`,
+`ptrace`, kernel module load, etc.) while leaving the daemon's legitimate
+operation -- spawning approved child commands, TLS calls to the LLM
+provider, reading/writing its state directory -- intact.
+
+`guard profile apparmor --exe <path-to-binary> --data-dir <state-dir>`
+emits an AppArmor profile confining the daemon to its binary, data
+directory, and child-command execution. Apply it alongside the systemd
+hardening directives below; it is a complementary, OS-level layer, not a
+replacement for `NoNewPrivileges`/`User=guard`/`--users`.
+
+## Auto-learned deny shapes
+
+Auto-learned deny shapes (`--learn-deny`, on by default) write a state file,
+`learned-deny.yaml`, alongside `learned-rules.yaml` and `state.db` in the
+daemon's state directory. It's a deny-only fast path the daemon populates
+itself from repeated LLM denials -- it never grants a bypass, so it needs no
+operator review step, and upgrading an existing deployment enables it
+automatically. Check `guard status` for `learn_deny enabled=... shapes=N` to
+see whether it's active and how many shapes it has learned; disable with
+`--no-learn-deny` / `GUARD_LEARN_DENY=false` if you want to fully opt out
+(this stops new learning; it does not retroactively remove shapes already on
+disk -- delete or edit `learned-deny.yaml` for that). A caller can force a
+fresh LLM look past a specific auto-learned deny with `guard run --reevaluate`.
+
 ## Files
 
 Example systemd files:

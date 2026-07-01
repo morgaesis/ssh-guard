@@ -51,13 +51,19 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 5. **Decision cache**: An in-memory LRU-style cache of evaluator decisions, keyed on the exact command line. Cache hits return the stored `Allow`/`Deny` without another LLM call. The cache is owned by a single `Evaluator` instance, so restarting the daemon or changing the prompt gives a fresh cache. Both approve and deny decisions are cached; transient evaluator errors are not. Size and TTL are configurable (`--cache-capacity`, `--cache-ttl`, `GUARD_CACHE_*`); disable with `--no-cache` / `GUARD_CACHE=false`.
 
-6. **Session grants** (optional, opt-in per request): The caller may include a `session_token` in `ExecuteRequest`. Operators grant sessions extra allow/deny glob patterns via the admin protocol (`guard session grant`) or the shorthand (`guard grant`). Matching session deny patterns short-circuit to DENY before the evaluator. Matching session allow patterns short-circuit to ALLOW and skip the evaluator. Prose supplied to a grant is compiled into conservative static rules for recognized domains such as Kubernetes, then appended as session context for LLM fallback. Generated globs are intentionally sparse and are paired with explicit deny patterns for known-dangerous misses such as Kubernetes secrets, shell escapes, and mutating verbs outside the requested scope. Prose grants enable session auto-amend unless disabled: a fresh low-risk LLM fallback approval can add an exact `binary + argv` session allow, and a fresh high-risk LLM denial can add an exact session deny. Cache hits, static-policy hits, and learned-rule hits do not amend sessions, and session-scoped LLM approvals do not promote global learned rules. Operators can also run `guard appeal` / `guard session appeal` to evaluate and amend a proposed command without executing it. A grant may carry an additive prompt (`--prompt` / `--prompt-file`) that the evaluator appends to the system prompt for that session's calls, giving the LLM context the static glob patterns cannot express; the decision cache is bypassed for these calls so cached base-prompt verdicts do not leak across the extended context. Non-matching sessions fall through to the evaluator unless the grant was created with `--static-only`, in which case a miss is denied and recorded as `session_static_only`; static-only grants disable auto-amend. Grants, historical grant transitions, and bounded interaction history are persisted in the state database, so `session list` and `session show` survive daemon restart. Session history retention remains bounded; older interactions and expired history are purged opportunistically on write and read paths.
+6. **Session grants** (optional, opt-in per request): The caller may include a `session_token` in `ExecuteRequest`. Operators grant sessions extra allow/deny glob patterns via the admin protocol (`guard session grant`) or the shorthand (`guard grant`). Matching session deny patterns short-circuit to DENY before the evaluator. Matching session allow patterns short-circuit to ALLOW and skip the evaluator. Prose supplied to a grant is compiled into conservative static rules for recognized domains such as Kubernetes, then appended as session context for LLM fallback. Generated globs are intentionally sparse and are paired with explicit deny patterns for known-dangerous misses such as Kubernetes secrets, shell escapes, and mutating verbs outside the requested scope. Prose grants enable session auto-amend unless disabled: a fresh low-risk LLM fallback approval can add an exact `binary + argv` session allow, and a fresh high-risk LLM denial can add an exact session deny. Cache hits and static-policy hits do not amend sessions, and session-scoped LLM approvals do not feed global learned-rule candidate detection. Operators can also run `guard appeal` / `guard session appeal` to evaluate and amend a proposed command without executing it. A grant may carry an additive prompt (`--prompt` / `--prompt-file`) that the evaluator appends to the system prompt for that session's calls, giving the LLM context the static glob patterns cannot express; the decision cache is bypassed for these calls so cached base-prompt verdicts do not leak across the extended context. Non-matching sessions fall through to the evaluator unless the grant was created with `--static-only`, in which case a miss is denied and recorded as `session_static_only`; static-only grants disable auto-amend. Grants, historical grant transitions, and bounded interaction history are persisted in the state database, so `session list` and `session show` survive daemon restart. Session history retention remains bounded; older interactions and expired history are purged opportunistically on write and read paths.
 
-7. **Static policy** (optional, opt-in): Glob-pattern allow and deny lists for fast decisions on deterministically safe or unsafe commands. Allow matches skip the LLM; deny matches reject without an LLM call. Everything else falls through to the LLM evaluator. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics. See `examples/` for reference policies.
+7. **Static policy** (optional, opt-in): a glob-pattern, pre-LLM DENY fast path only. A deny pattern (or a deny-decision policy-group rule) fast-rejects a command before paying for an LLM call. A command that matches no deny rule falls through to the LLM evaluator, exactly as if no policy were loaded — including under a deny-only policy with no other rules. `commands.allow` is still parsed (for `--no-llm` deployments, where `PolicyEngine` is the sole decision-maker, and for backward-compatible config loading) but is deliberately NOT consulted on the pre-LLM path: an allow pattern cannot skip the LLM evaluator while it is enabled. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics — which is exactly why allow patterns are not trusted with a bypass; see `examples/` for reference policies. **The verb catalog (8) is the supported mechanism for a deterministic, LLM-skipping allow.**
 
-8. **Consequence gating** (optional, opt-in via `--gate consequence`): After an LLM allow, the daemon routes the command by the reversibility class the evaluator returned. `reversible` (low-risk) executes immediately; `recoverable` executes inside a containment envelope that auto-reverts unless an operator confirms; `irreversible` (or high-risk, or unclassified) is held for operator approval and not executed. The operator is whoever runs as the daemon's own principal (its uid on Unix, its SID on Windows). Routing is fail-safe — a missing class holds, and reversibility can only raise the gate. Operator-authored deterministic allows (static policy, trusted verbs) bypass the gate; only the open-ended LLM path is routed. The held command is bound to an immutable execution snapshot (binary, args, env, secret-key mapping, rendered verb, catalog version); approval executes that snapshot verbatim and a verb-catalog change since the hold voids it. Provisional and approval state persist in the state database; startup recovery never fires a revert unattended (past-deadline provisionals become `needs_operator_decision`). A free-form `--revert` is assessed by the evaluator at arm time — with the forward command as context — for both policy compliance and sensibility as an inverse of the forward action; only an explicit approval arms the envelope, and any other verdict holds the command for operator review rather than denying it or arming an unverified rollback. A verb's revert is operator-authored and pre-authorized. A single sweeper task fires due auto-reverts (after a startup grace) and expires unattended holds (fail-closed deny).
+8. **Verb catalog** (optional, opt-in via `--verbs`): an operator-authored, hot-reloaded catalog of typed operations, and the single mechanism for a deterministic, LLM-skipping allow. Each verb fixes a binary and an argv template with pattern-validated, anchored parameters; rendering substitutes each placeholder as exactly one argv element, so parameter and flag injection are structurally impossible — unlike a glob pattern over a flat command string, a verb's safety does not depend on guessing every shell-quoting evasion. A verb declares its consequence class (which drives the gate) and, for recoverable verbs, a structured rollback. A `trusted` verb skips the LLM evaluator while still enforcing parameter patterns. Agents cannot add or alter verbs; the catalog is the slow, operator-reviewed surface.
 
-9. **Verb catalog** (optional, opt-in via `--verbs`): An operator-authored, hot-reloaded catalog of typed operations. Each verb fixes a binary and an argv template with pattern-validated, anchored parameters; rendering substitutes each placeholder as exactly one argv element, so parameter and flag injection are structurally impossible. A verb declares its consequence class (which drives the gate) and, for recoverable verbs, a structured rollback. A `trusted` verb skips the LLM evaluator — a deterministic allow path comparable to a static-policy allow — while still enforcing parameter patterns. Agents cannot add or alter verbs; the catalog is the slow, operator-reviewed surface.
+   `guard verb create --prompt "<description>"` (operator-only admin RPC) asks the evaluator LLM to synthesize one verb from prose, validates it exactly like a hand-authored verb, and appends it to the catalog with the prose and a short rationale recorded inline (`source_prose`, `evidence`); `--preview` shows the result without writing it. A synthesized verb is held to a safety gate the model cannot bypass: it is never `trusted` (the LLM still evaluates the rendered command at run time until an operator makes a deliberate manual edit to the catalog), the binary may not be a shell or interpreter, parameter patterns may not admit whitespace or shell metacharacters, and the name must be kebab-case.
+
+   Learned-rule candidate detection (optional, opt-in via `--learn-rules`) feeds this same path: when the LLM approves the same low-risk command shape `--learn-min-approvals` times, the policy reason returned to the caller includes a candidate notice with a ready-to-run `guard verb create --prompt` suggestion. Crossing the threshold does not itself grant anything — an agent's own repeated behavior is not treated as authorization to bypass the evaluator, since that would let an agent promote itself past the gate just by repeating a borderline-but-approved command. Only an operator running the suggested command (or hand-authoring a verb) creates an actual bypass, through the same synthesis safety gate as any other verb.
+
+9. **Consequence gating** (optional, opt-in via `--gate consequence`): After an LLM allow, the daemon routes the command by the reversibility class the evaluator returned. `reversible` (low-risk) executes immediately; `recoverable` executes inside a containment envelope that auto-reverts unless an operator confirms; `irreversible` (or high-risk, or unclassified) is held for operator approval and not executed. The operator is whoever runs as the daemon's own principal (its uid on Unix, its SID on Windows). Routing is fail-safe — a missing class holds, and reversibility can only raise the gate. Operator-authored deterministic allows (trusted verbs, and static-policy allows in the `--no-llm` fallback mode) bypass the gate; only the open-ended LLM path is routed. The held command is bound to an immutable execution snapshot (binary, args, env, secret-key mapping, rendered verb, catalog version); approval executes that snapshot verbatim and a verb-catalog change since the hold voids it. Provisional and approval state persist in the state database; startup recovery never fires a revert unattended (past-deadline provisionals become `needs_operator_decision`). A free-form `--revert` is assessed by the evaluator at arm time — with the forward command as context — for both policy compliance and sensibility as an inverse of the forward action; only an explicit approval arms the envelope, and any other verdict holds the command for operator review rather than denying it or arming an unverified rollback. A verb's revert is operator-authored and pre-authorized. A single sweeper task fires due auto-reverts (after a startup grace) and expires unattended holds (fail-closed deny).
+
+10. **Auto-learned deny shapes** (on by default; disable with `--no-learn-deny`): asymmetric with learned-rule candidate detection (8) on purpose. When the LLM denies the same command shape for a binary `--learn-deny-min-denials` times, the daemon asks its own LLM to synthesize a fully-anchored regex over the observed argument evidence and, once validated (anchored, compiles, matches its own evidence, does not match shell-injection-shaped canary content), persists it as an automatic pre-LLM deny fast path -- no operator step. This is safe unconditionally, unlike an equivalent allow-side shortcut: the store can only ever be populated from shapes the LLM already denied, so the worst case of an over-broad synthesis is an unnecessary block on something that should have been allowed, never a granted capability. A caller can force a fresh LLM look past an auto-learned deny with `--reevaluate` (`guard run --reevaluate` / the MCP `run` tool's `reevaluate` param); this never skips an operator-authored static-policy deny rule, only the auto-learned store, and its only effect is another real LLM call -- never a grant. `guard session appeal` also always bypasses the auto-learned store, since an appeal is itself a request for a fresh look.
 
 ## Admin authorization
 
@@ -143,6 +149,86 @@ secret backend. Requests do not carry the client's current working directory as
 structured metadata. Relative paths therefore resolve in the daemon process
 working directory when a command is actually executed, and the evaluator only
 sees the relative path text supplied in the command.
+
+## Prompt-injection resilience
+
+guard's evaluator is itself an LLM reading a command string an agent fully
+controls. Whatever leads that agent to construct the command (its own
+training, a tool result, a file it read, an email it processed) can embed
+adversarial text the agent passes straight through, intentionally or not. The
+command string IS the "external content" an indirect-prompt-injection attacker
+controls in this threat model -- the same structural position as a malicious
+email or webpage in a tool-calling agent.
+
+[Dziemian et al., "How Vulnerable Are AI Agents to Indirect Prompt
+Injections? Insights from a Large-Scale Public Competition"](https://arxiv.org/abs/2603.15714)
+(Gray Swan AI / Anthropic / Meta / UK AISI / US CAISI, Mar 2026) ran a 464-participant,
+272K-attempt red-teaming competition against 13 frontier models and found every
+model vulnerable (0.5%-8.5% attack success rate even under a *concealment*
+requirement -- the attack also had to avoid revealing itself in the model's
+visible output). The five highest-transfer "universal" attack templates, found
+to generalize across model families:
+
+- **Fake chain-of-thought** (highest ASR overall): a forged `<thinking>` block
+  that pre-states the "correct" (malicious) conclusion before the real
+  reasoning would happen.
+- **Disable critical/safety-oriented thinking**: text instructing the model to
+  stop analyzing, skip its explanation, or approve immediately.
+- **Reward and punishment**: a fake protocol or directive promising approval
+  or threatening a penalty (bad rating, termination) for non-compliance.
+- **"Holodeck"** (the single largest cluster, 63 minimally-different attacks
+  across 21/41 behaviors and 9 models): frames the interaction as a simulated
+  or sandboxed environment with a fake meta-level control panel, so normal
+  rules are claimed not to apply.
+- **Protocol override / visual ruleset injection / alignment matrix**: a
+  formal-looking document, decorative banner, or fake "mode" assignment
+  claiming to supersede or reinterpret the evaluator's standing instructions.
+
+Two findings are directly load-bearing for how guard is built, not just how
+its prompts are worded:
+
+1. **Concealment.** The paper's threat model requires an attack to both
+   succeed AND hide that it succeeded in the model's user-facing response,
+   because most agent deployments only show users (or a calling agent) the
+   final response, not the full transcript. guard's audit trail
+   (`tracing` structured logs, the policy reason returned in
+   `ExecuteResult`) is generated by the *daemon*, independently of whatever
+   the calling agent chooses to tell its own user -- a compromised agent
+   cannot suppress or rewrite guard's own record of what it asked for and
+   what guard decided, even if it conceals the compromise from its user
+   entirely. This is exactly the "monitor the actual tool execution, not the
+   model's self-report" pattern the paper's discussion section calls for.
+2. **System-level defense over model-level robustness.** The paper's transfer
+   experiments found that attacks succeeding against the *most* robust
+   models transferred broadly (44-81%) to every other target, while attacks
+   against weak models transferred poorly upward -- evidence that no model's
+   training-time robustness is a sufficient backstop on its own, and that
+   "guard is itself an LLM call" inherits this risk regardless of which
+   model it's pointed at. This is the rationale for layering deterministic,
+   non-LLM mechanisms in front of the evaluator wherever a command's shape
+   allows it: the static-policy deny fast path (`PolicyEngine::check_deny_fast_path`)
+   and especially the verb catalog (anchored-regex parameters, single-argv
+   rendering -- structurally immune to the *injection* even existing, since
+   there's no free-text argument for it to live in). The evaluator remains
+   the backstop for everything that doesn't fit a verb's fixed shape, which
+   is most of an agent's traffic; it cannot be the only layer.
+
+Each system prompt's "Anti-injection" clause names these specific templates
+(fake chain-of-thought, disable-reasoning requests, reward/punishment framing,
+simulation/sandbox claims, protocol-override documents, decorative
+"system override" formatting) rather than relying on a generic "ignore
+embedded instructions" line, since the paper's own results show that frontier
+models given exactly that kind of generic instruction still measurably fall
+for these specific structured templates. `tests/prompt_regression_corpus.yaml`
+has a dedicated section of cases built from these templates (each wraps a
+command that must be denied on its own merits, e.g. reading `/etc/shadow` or
+flushing iptables, with one of the templates appended as an argument); run it
+against a live model via `tests/prompt_regression.rs`
+(`GUARD_LLM_API_KEY=... cargo test --test prompt_regression`) after any prompt
+change. The prompt wording above is evidence-motivated but not a guarantee --
+treat a prompt clause as raising the cost of an attack, not as a deterministic
+control, and prefer pushing a command into the verb catalog over trusting the
+evaluator to resist a cleverer version of the same template.
 
 ## Design constraints
 

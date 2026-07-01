@@ -154,6 +154,10 @@ pub enum SessionDecisionSource {
     Llm,
     Cache,
     StaticPolicy,
+    /// A deny fast path the daemon synthesized itself from repeated LLM
+    /// denials of this shape (`gating::deny_shape`). Kept distinct from
+    /// `StaticPolicy` (operator-authored) for audit clarity.
+    LearnedDeny,
     Validation,
     EvaluatorError,
 }
@@ -167,6 +171,7 @@ impl SessionDecisionSource {
             Self::Llm => "llm",
             Self::Cache => "cache",
             Self::StaticPolicy => "static_policy",
+            Self::LearnedDeny => "learned_deny",
             Self::Validation => "validation",
             Self::EvaluatorError => "evaluator_error",
         }
@@ -570,6 +575,12 @@ impl SessionRegistry {
         }
 
         let full_cmd = command_line(cmd, args);
+        let cmd_only = cmd.to_string();
+        let cmd_with_first_arg = if let Some(first) = args.first() {
+            format!("{cmd} {first}")
+        } else {
+            cmd_only.clone()
+        };
 
         if let Some(rule) = grant.deny_exact.iter().find(|rule| rule.matches(cmd, args)) {
             return Some((
@@ -583,7 +594,7 @@ impl SessionRegistry {
             decision: Decision::Deny,
             description: None,
         };
-        if deny_rule.matches(&full_cmd) {
+        if deny_rule.matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only) {
             let which = grant
                 .deny
                 .iter()
@@ -593,7 +604,7 @@ impl SessionRegistry {
                         decision: Decision::Deny,
                         description: None,
                     }
-                    .matches(&full_cmd)
+                    .matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only)
                 })
                 .cloned()
                 .unwrap_or_else(|| "<unknown>".to_string());
@@ -619,7 +630,7 @@ impl SessionRegistry {
             decision: Decision::Allow,
             description: None,
         };
-        if allow_rule.matches(&full_cmd) {
+        if allow_rule.matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only) {
             let which = grant
                 .allow
                 .iter()
@@ -629,7 +640,7 @@ impl SessionRegistry {
                         decision: Decision::Allow,
                         description: None,
                     }
-                    .matches(&full_cmd)
+                    .matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only)
                 })
                 .cloned()
                 .unwrap_or_else(|| "<unknown>".to_string());

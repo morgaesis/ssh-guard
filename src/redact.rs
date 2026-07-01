@@ -31,12 +31,6 @@ fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
                 Regex::new(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
                 "[REDACTED]",
             ),
-            // 6. Catch-all: ANY_VAR=<high-entropy value> (hex 20+, base64 24+, or mixed-alnum 30+)
-            //    This catches things like X_CT0=9c52ab..., SESSION_ID=a3f8b1..., etc.
-            (
-                Regex::new(r#"(?i)([A-Z_][A-Z0-9_]*\s*[=:]\s*["']?)([0-9a-f]{20,}|[A-Za-z0-9+/]{24,}={0,2}|[A-Za-z0-9_-]{40,})(["']?\s)"#).unwrap(),
-                "${1}[REDACTED]${3}",
-            ),
             // 7. Standalone long base64 blobs (lines of 40+ base64 chars, like encoded keys/certs)
             (
                 Regex::new(r"^[A-Za-z0-9+/]{40,}={0,2}$").unwrap(),
@@ -44,6 +38,57 @@ fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
             ),
         ]
     })
+}
+
+/// Catch-all: `ANY_VAR=<high-entropy value>` (hex 20+, base64 24+, or
+/// mixed-alnum 40+). Catches things like `X_CT0=9c52ab...`,
+/// `SESSION_ID=a3f8b1...`, etc. -- secret-shaped values whose variable name
+/// doesn't contain a TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL/AUTH substring, so
+/// patterns 1-2 miss them.
+///
+/// The trailing group matches end-of-line/end-of-string, not just a
+/// following whitespace/quote char: every real call site strips the
+/// line-terminating newline before this pattern ever runs (`ssh.rs` reads
+/// lines via `BufReader`, `redact_output_text` splits on `.lines()`), so a
+/// value that is the last token on a line -- the overwhelmingly common shape
+/// for `KEY=value` output -- would otherwise never match.
+fn catchall_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?im)([A-Z_][A-Z0-9_]*)(\s*[=:]\s*["']?)([0-9a-f]{20,}|[A-Za-z0-9+/]{24,}={0,2}|[A-Za-z0-9_-]{40,})(["']?(?:\s|$))"#).unwrap()
+    })
+}
+
+/// Generic structural keys (YAML/JSON field names, not env-var-style secret
+/// names) that the catch-all must not treat as "any var": their values are
+/// often coincidentally hex/base64/UUID-shaped (git SHAs, resource IDs,
+/// generation timestamps) without being secrets. `value`/`data` specifically
+/// collide with the stateful, context-aware YAML name+value redaction
+/// (`yaml_secret_name_pattern`/`yaml_value_pattern`), which already redacts
+/// these correctly when the preceding `name:` line is secret-bearing; the
+/// catch-all firing unconditionally on every `value:`/`data:` line would
+/// both duplicate that and false-positive on non-secret values it can't see
+/// the context for.
+const CATCHALL_EXCLUDED_NAMES: &[&str] = &["VALUE", "DATA", "NAME", "TYPE", "KIND", "ID"];
+
+/// Apply the catch-all pattern, skipping a match whose captured name is a
+/// generic structural key (see `CATCHALL_EXCLUDED_NAMES`). The `regex` crate
+/// has no lookahead, so the exclusion is a code-level check in the
+/// replacement closure rather than part of the pattern itself.
+fn redact_catchall(text: &str) -> String {
+    catchall_pattern()
+        .replace_all(text, |caps: &regex::Captures| {
+            let name = &caps[1];
+            if CATCHALL_EXCLUDED_NAMES
+                .iter()
+                .any(|excluded| name.eq_ignore_ascii_case(excluded))
+            {
+                caps[0].to_string()
+            } else {
+                format!("{}{}[REDACTED]{}", &caps[1], &caps[2], &caps[4])
+            }
+        })
+        .to_string()
 }
 
 fn yaml_secret_name_pattern() -> &'static Regex {
@@ -72,7 +117,7 @@ pub fn redact_output(text: &str) -> String {
         result = pattern.replace_all(&result, *replacement).to_string();
     }
 
-    result
+    redact_catchall(&result)
 }
 
 #[derive(Debug, Default)]
@@ -219,6 +264,22 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_hex_cookie_value_no_trailing_whitespace() {
+        // Same value, but shaped exactly like the real call sites: no trailing
+        // space/newline. ssh.rs reads lines via BufReader (newline stripped) and
+        // redact_output_text splits on `.lines()` (also strips it) before this
+        // pattern ever runs, so a value at end-of-line with no padding is the
+        // realistic, common case -- not the exception.
+        let input = "X_CT0=9c52ab235e556a3f8b1d2e4f6a7c9d0e1f2a3b4c5d6e7f";
+        let output = redact_output(input);
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+        assert!(
+            !output.contains("9c52ab235e556a3f"),
+            "hex value should be redacted even with no trailing whitespace, got: {output}"
+        );
+    }
+
+    #[test]
     fn test_redact_base64_env_value() {
         // GITHUB_APP_KEY_B64=LS0tLS1CRUdJTi... -- KEY in name catches it,
         // but also test the base64 catch-all pattern
@@ -244,6 +305,21 @@ mod tests {
         let input = "SESSION_ID=a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5 \n";
         let output = redact_output(input);
         assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_output_text_line_with_no_trailing_padding() {
+        // Exercises the real call path (redact_output_text -> .lines() ->
+        // redact_output_with_state -> redact_output), which is what strips the
+        // newline before pattern 6 ever sees the text. A single-line value with
+        // no trailing whitespace at all must still be redacted.
+        let input = "SESSION_ID=a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5";
+        let output = redact_output_text(input);
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+        assert!(
+            !output.contains("a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5"),
+            "got: {output}"
+        );
     }
 
     #[test]
