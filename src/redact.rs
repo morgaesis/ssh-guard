@@ -316,7 +316,10 @@ mod tests {
         let input = "SESSION_ID=a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5";
         let output = redact_output_text(input);
         assert!(output.contains("[REDACTED]"), "got: {output}");
-        assert!(!output.contains("a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5"), "got: {output}");
+        assert!(
+            !output.contains("a3f8b1c2d4e5f6a7b8c9d0e1f2a3b4c5"),
+            "got: {output}"
+        );
     }
 
     #[test]

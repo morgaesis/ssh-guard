@@ -114,7 +114,12 @@ impl PolicyRule {
     /// not just the first two. Without this, a group rule with a simple
     /// (non-wildcard) pattern silently behaves narrower than the identical
     /// pattern written as a top-level `commands.allow`/`commands.deny` entry.
-    pub fn matches_command(&self, full_cmd: &str, cmd_with_first_arg: &str, cmd_only: &str) -> bool {
+    pub fn matches_command(
+        &self,
+        full_cmd: &str,
+        cmd_with_first_arg: &str,
+        cmd_only: &str,
+    ) -> bool {
         self.patterns
             .iter()
             .any(|p| pattern_matches(p, full_cmd, cmd_with_first_arg, cmd_only))

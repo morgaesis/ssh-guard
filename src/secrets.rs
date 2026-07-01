@@ -2069,8 +2069,7 @@ mod tests {
             "expected a Legacy store"
         );
 
-        let namespaced =
-            parse_store_variant("1000:\n  OPNSENSE_API_KEY: some-value\n").unwrap();
+        let namespaced = parse_store_variant("1000:\n  OPNSENSE_API_KEY: some-value\n").unwrap();
         assert!(
             matches!(namespaced, LocalStoreVariant::Namespaced(ref m) if m.get("1000").and_then(|inner| inner.get("OPNSENSE_API_KEY")).map(String::as_str) == Some("some-value")),
             "expected a Namespaced store"

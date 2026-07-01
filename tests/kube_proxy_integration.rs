@@ -412,7 +412,9 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
 
     // 1. The `proxy` subresource is denied outright, like exec/attach/portforward.
     let resp = client
-        .get(format!("{base}/api/v1/namespaces/dev/pods/web-0/proxy/metrics"))
+        .get(format!(
+            "{base}/api/v1/namespaces/dev/pods/web-0/proxy/metrics"
+        ))
         .send()
         .await
         .unwrap();

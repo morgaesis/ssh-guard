@@ -69,7 +69,10 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
         );
 
         if !matched {
-            failures.push(format!("[{}] {}: expected {}, got {:?}", case.id, command_line, case.expect, result));
+            failures.push(format!(
+                "[{}] {}: expected {}, got {:?}",
+                case.id, command_line, case.expect, result
+            ));
         }
     }
 

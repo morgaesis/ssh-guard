@@ -1030,7 +1030,10 @@ verbs:
                 checked += 1;
             }
         }
-        assert!(checked >= 3, "expected to find the shipped verbs*.yaml examples");
+        assert!(
+            checked >= 3,
+            "expected to find the shipped verbs*.yaml examples"
+        );
     }
 
     #[test]
