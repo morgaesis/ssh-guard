@@ -394,7 +394,6 @@ pub enum EvalResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalSource {
     StaticPolicy,
-    LearnedRule,
     Cache,
     Llm,
 }
@@ -532,6 +531,21 @@ impl Evaluator {
         } else {
             config.mode.map(PolicyEngine::from_mode)
         };
+
+        if config.llm.enabled {
+            if let Some(ref engine) = policy_engine {
+                if !engine.allow_list().is_empty() {
+                    tracing::warn!(
+                        "static policy has {} allow pattern(s) configured, but they do not skip \
+                         the LLM evaluator while it is enabled (glob patterns over a flat command \
+                         string cannot be trusted for that); use `guard verb` for a deterministic, \
+                         LLM-skipping allow instead. Static allow patterns are only authoritative \
+                         when the LLM is disabled (--no-llm).",
+                        engine.allow_list().len()
+                    );
+                }
+            }
+        }
 
         // Load system prompt. Priority:
         // 1. --system-prompt <path> (explicit override)
@@ -777,47 +791,22 @@ impl Evaluator {
     ) -> EvalResult {
         let session_prompt_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
 
-        // Only apply static policy if the engine has explicit rules.
-        // Empty engines (from modes without a policy file) should not block anything
-        // since they'd just default-deny everything before the LLM gets a chance.
+        // Pre-LLM fast-reject: an explicit deny pattern (or deny-decision
+        // group rule) rejects without an LLM call. A command that matches
+        // nothing here -- including under a deny-only policy with no other
+        // rules, or under an allow-only policy whose allow list doesn't
+        // cover it -- falls through to the LLM, exactly as if no policy
+        // were loaded. Allow patterns never skip the LLM: `guard verb`
+        // (`trusted = true`) is the supported mechanism for a deterministic,
+        // LLM-skipping allow. See `PolicyEngine::check_deny_fast_path`.
         if let Some(ref engine) = self.policy_engine {
-            if !engine.deny_list().is_empty() || !engine.allow_list().is_empty() {
-                let static_result = engine.check(command);
-                if static_result.is_denied() {
-                    tracing::debug!("static policy denied: {}", static_result.reason);
-                    return EvalResult::Deny {
-                        reason: static_result.reason,
-                        source: EvalSource::StaticPolicy,
-                        risk: None,
-                    };
-                }
-            }
-        }
-
-        if !session_prompt_active {
-            if let Some(ref learned_rules) = self.learned_rules {
-                let hit = {
-                    let guard = learned_rules.read().await;
-                    guard.check(command)
+            if let Some(reason) = engine.check_deny_fast_path(command) {
+                tracing::debug!("static policy denied: {}", reason);
+                return EvalResult::Deny {
+                    reason,
+                    source: EvalSource::StaticPolicy,
+                    risk: None,
                 };
-                if let Some(hit) = hit {
-                    let mut reason = format!(
-                        "learned static rule: matched `{}` for service `{}`",
-                        hit.matched_pattern, hit.service
-                    );
-                    if let Some(shim) = hit.shim {
-                        reason.push_str(&format!(
-                            "; prefer shim `{}` for shorter future calls",
-                            shim.name
-                        ));
-                    }
-                    return EvalResult::Allow {
-                        reason,
-                        source: EvalSource::LearnedRule,
-                        risk: None,
-                        reversibility: None,
-                    };
-                }
             }
         }
 
@@ -878,16 +867,25 @@ impl Evaluator {
             return result;
         }
 
+        // LLM disabled: PolicyEngine is the sole, authoritative decision-maker,
+        // so its full allow/deny/default-deny semantics apply here (unlike the
+        // pre-LLM fast path above, which only ever fast-rejects).
         if let Some(ref engine) = self.policy_engine {
             let static_result = engine.check(command);
-            if static_result.is_allowed() {
-                return EvalResult::Allow {
+            return if static_result.is_allowed() {
+                EvalResult::Allow {
                     reason: static_result.reason,
                     source: EvalSource::StaticPolicy,
                     risk: None,
                     reversibility: None,
-                };
-            }
+                }
+            } else {
+                EvalResult::Deny {
+                    reason: static_result.reason,
+                    source: EvalSource::StaticPolicy,
+                    risk: None,
+                }
+            };
         }
 
         EvalResult::Deny {
@@ -1836,7 +1834,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learned_rule_allow_bypasses_missing_llm_key() {
+    async fn deny_only_policy_falls_through_to_llm_on_no_match() {
+        // Regression test: a deny-only policy (the documented
+        // "fast-reject known-bad, LLM decides the rest" use case, e.g.
+        // examples/deny-policy.yaml) must NOT hard-deny a command that
+        // matches nothing. Proven here by reaching the LLM stage (which
+        // errors for lack of an API key) rather than short-circuiting to a
+        // StaticPolicy deny on bare default-deny fallthrough.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deny-only.yaml");
+        std::fs::write(&path, "policy:\n  commands:\n    deny:\n      - \"rm -rf /*\"\n").unwrap();
+
+        let evaluator = Evaluator::new(EvalConfig::default().policy_path(path)).unwrap();
+
+        match evaluator.evaluate("ls -la").await {
+            EvalResult::Error(msg) => assert!(msg.contains("API key")),
+            other => panic!("expected fallthrough to the LLM (and an API-key error), got {other:?}"),
+        }
+
+        match evaluator.evaluate("rm -rf /*").await {
+            EvalResult::Deny { source, reason, .. } => {
+                assert_eq!(source, EvalSource::StaticPolicy);
+                assert!(reason.contains("deny pattern"));
+            }
+            other => panic!("expected an explicit deny match to fast-reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_only_policy_falls_through_to_llm_on_no_match() {
+        // Regression test: an allow-only policy must not deny everything
+        // outside the allow list; non-matching commands fall through to the
+        // LLM, and allow matches do not skip the LLM either (no LLM-skip
+        // glob mechanism is supported while the LLM is enabled -- use
+        // `guard verb` for that; see examples/verbs-readonly.yaml).
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("allow-only.yaml");
+        std::fs::write(&path, "policy:\n  commands:\n    allow:\n      - \"id\"\n").unwrap();
+
+        let evaluator = Evaluator::new(EvalConfig::default().policy_path(path)).unwrap();
+
+        match evaluator.evaluate("ls -la").await {
+            EvalResult::Error(msg) => assert!(msg.contains("API key")),
+            other => panic!("expected fallthrough to the LLM, got {other:?}"),
+        }
+        match evaluator.evaluate("id").await {
+            EvalResult::Error(msg) => assert!(msg.contains("API key")),
+            other => panic!(
+                "allow patterns must not skip the LLM while it is enabled, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn learned_rule_observation_does_not_bypass_llm() {
+        // A learned-rule observation that crossed the promotion threshold must
+        // NOT grant itself an LLM-skipping allow: only the operator, via
+        // `guard verb create`, can grant that. With no LLM key configured the
+        // call must still reach (and fail in) the LLM path, not short-circuit
+        // to an allow from the learned-rule store.
         let temp = tempfile::tempdir().unwrap();
         let mut store = LearnedRuleStore::load(crate::learned_rules::LearningConfig {
             path: temp.path().join("learned.yaml"),
@@ -1845,7 +1901,7 @@ mod tests {
             auto_shim: AutoShimMode::Suggest,
         })
         .unwrap();
-        store
+        let outcome = store
             .record_approval(
                 "opnsense-api",
                 &["status".to_string()],
@@ -1853,7 +1909,12 @@ mod tests {
                 Some(1),
                 "safe status lookup",
             )
+            .unwrap()
             .unwrap();
+        assert!(
+            outcome.is_candidate,
+            "single approval should cross min_approvals=1"
+        );
 
         let evaluator =
             Evaluator::new(EvalConfig::default().learned_rules(Arc::new(RwLock::new(store))))
@@ -1861,11 +1922,8 @@ mod tests {
 
         let result = evaluator.evaluate("opnsense-api status").await;
         match result {
-            EvalResult::Allow { source, reason, .. } => {
-                assert_eq!(source, EvalSource::LearnedRule);
-                assert!(reason.contains("learned static rule"));
-            }
-            other => panic!("expected learned allow, got {other:?}"),
+            EvalResult::Error(msg) => assert!(msg.contains("API key")),
+            other => panic!("expected an LLM error (no bypass), got {other:?}"),
         }
     }
 

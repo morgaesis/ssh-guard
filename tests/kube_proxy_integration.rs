@@ -333,3 +333,127 @@ async fn proxy_arms_auto_revert_for_writes() {
         other => panic!("patch should arm Restore, got {other:?}"),
     }
 }
+
+/// Mock apiserver that echoes the request headers it received back as a JSON
+/// object, so a test can assert on what the proxy actually forwarded.
+async fn header_echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let headers: serde_json::Map<String, Value> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                Value::String(v.to_str().unwrap_or("").to_string()),
+            )
+        })
+        .collect();
+    let body = json!({"kind": "Status", "apiVersion": "v1", "status": "Success", "receivedHeaders": headers});
+    Ok(Response::builder()
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap())
+}
+
+async fn spawn_header_echo_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(header_echo_handler))
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Regression test: the proxy must deny the `proxy` subresource outright (it
+/// tunnels an arbitrary HTTP request to the target's network endpoint, which
+/// a verb/resource policy rule cannot see into) and must never forward
+/// client-supplied `Impersonate-*` / `X-Remote-*` identity headers upstream
+/// (the operator's own credential may hold the `impersonate` RBAC verb, which
+/// would let an agent re-author a request under an arbitrary identity).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_denies_subresource_and_strips_identity_headers() {
+    let mock_base = spawn_header_echo_upstream().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    // 1. The `proxy` subresource is denied outright, like exec/attach/portforward.
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/pods/web-0/proxy/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "pod proxy subresource must be denied");
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["message"].as_str().unwrap().contains("proxy"));
+
+    // Node proxy reaches the kubelet API, an even larger blast radius -- must
+    // also be denied.
+    let resp = client
+        .get(format!("{base}/api/v1/nodes/node-1/proxy/runningpods"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "node proxy subresource must be denied");
+
+    // 2. An allowed request carrying spoofed identity headers must not have
+    // them forwarded upstream; the mock echoes back what it actually saw.
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/pods"))
+        .header("Impersonate-User", "system:masters")
+        .header("Impersonate-Group", "system:masters")
+        .header("X-Remote-User", "admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the underlying read is allowed");
+    let v: Value = resp.json().await.unwrap();
+    let received = v["receivedHeaders"]
+        .as_object()
+        .expect("receivedHeaders object");
+    assert!(
+        !received.contains_key("impersonate-user"),
+        "Impersonate-User must not reach the apiserver, got headers: {received:?}"
+    );
+    assert!(
+        !received.contains_key("impersonate-group"),
+        "Impersonate-Group must not reach the apiserver, got headers: {received:?}"
+    );
+    assert!(
+        !received.contains_key("x-remote-user"),
+        "X-Remote-User must not reach the apiserver, got headers: {received:?}"
+    );
+}

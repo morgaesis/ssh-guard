@@ -513,7 +513,10 @@ enum ServerCommands {
         #[arg(long, value_name = "UID[,UID]")]
         users: Option<String>,
 
-        /// Path to a static allow/deny policy YAML file.
+        /// Path to a static policy YAML file: a pre-LLM deny fast path. `deny`
+        /// patterns fast-reject before the LLM is called; `allow` patterns are
+        /// parsed for the --no-llm fallback and backward compatibility but do
+        /// not skip the LLM while it is enabled -- use `guard verb` for that.
         #[arg(long, value_name = "PATH")]
         policy: Option<String>,
 
@@ -586,28 +589,31 @@ enum ServerCommands {
         #[arg(long, value_name = "SECONDS")]
         cache_ttl: Option<u64>,
 
-        /// Learn static allow rules from repeated low-risk LLM approvals.
-        /// Env: GUARD_LEARN_RULES.
+        /// Detect repeated low-risk LLM approvals and surface them as verb
+        /// candidates in the policy reason text (with a ready-to-run `guard
+        /// verb create --prompt` suggestion). Never grants a bypass itself --
+        /// only an operator running that command can. Env: GUARD_LEARN_RULES.
         #[arg(long = "learn-rules", action = ArgAction::SetTrue)]
         learn_rules: bool,
 
-        /// Path to learned static rules YAML.
+        /// Path to the learned-rule candidate state YAML.
         /// Env: GUARD_LEARNED_RULES.
         #[arg(long, value_name = "PATH")]
         learned_rules: Option<PathBuf>,
 
-        /// LLM approvals required before a learned allow rule is promoted.
-        /// Env: GUARD_LEARN_MIN_APPROVALS.
+        /// LLM approvals required before a command becomes a learned-rule
+        /// candidate. Env: GUARD_LEARN_MIN_APPROVALS.
         #[arg(long, value_name = "N")]
         learn_min_approvals: Option<u32>,
 
-        /// Maximum risk score eligible for learned static allow promotion.
+        /// Maximum risk score eligible for learned-rule candidacy.
         /// Env: GUARD_LEARN_MAX_RISK.
         #[arg(long, value_name = "0-10")]
         learn_max_risk: Option<i32>,
 
-        /// Service-shim behavior for learned rules: off, suggest, or create.
-        /// Env: GUARD_LEARN_SHIMS.
+        /// Service-shim behavior for learned-rule candidates: off, suggest, or
+        /// create. A shim is a command alias, not a bypass -- the aliased
+        /// command still runs through normal evaluation. Env: GUARD_LEARN_SHIMS.
         #[arg(long, value_name = "MODE")]
         learn_shims: Option<String>,
 
@@ -874,7 +880,7 @@ async fn main() -> Result<()> {
     // that `guard --version` stays concise and does not require parsing
     // subcommands.
     if top_level_version_requested(&args) {
-        println!("guard v{}", env!("CARGO_PKG_VERSION"));
+        println!("guard v{} ({})", env!("CARGO_PKG_VERSION"), env!("GUARD_GIT_COMMIT"));
         return Ok(());
     }
     if run_help_requested(&args) {
@@ -1428,7 +1434,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     )
                 })?;
                 tracing::info!(
-                    "Learned static rules enabled: path={} min_approvals={} max_risk={} shims={}",
+                    "Learned-rule candidate detection enabled: path={} min_approvals={} max_risk={} shims={}",
                     store.path().display(),
                     store.min_approvals(),
                     store.max_risk(),
@@ -2441,7 +2447,15 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
 
     // Client info first — useful even when the daemon is unreachable.
     println!("Client:");
-    println!("  version        {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  version        {} ({}, {}{})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GUARD_GIT_COMMIT"),
+        env!("GUARD_GIT_BRANCH"),
+        option_env!("GUARD_GIT_TAG")
+            .map(|t| format!(", tag {t}"))
+            .unwrap_or_default()
+    );
     println!("  endpoint       {}", client.endpoint_for_log());
     println!();
 
@@ -2500,7 +2514,7 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
                 status.cache_enabled, status.cache_size
             );
             println!(
-                "  learning       enabled={} rules={}",
+                "  learning       enabled={} candidates={}",
                 status.learning_enabled, status.learned_rule_count
             );
             println!("  sessions       {}", status.session_count);

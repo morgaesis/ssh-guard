@@ -20,19 +20,22 @@ cargo build --quiet --release
 Install from a GitHub release artifact:
 
 ```bash
-# Example for Linux x86_64
-curl -fsSLO https://github.com/morgaesis/guard/releases/download/v0.1.0/guard-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf guard-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+# Example for Linux x86_64 -- substitute the version tag you want
+GUARD_VERSION=v0.3.0
+curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+tar -xzf "guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 install -m 0755 guard ~/.local/bin/guard
 ```
 
-Choose the release asset that matches the target platform:
+Choose the release asset that matches the target platform (see
+`.github/workflows/release.yml` for the authoritative, currently-built list):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
+
+macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`) is not currently
+published as a release asset; build from source on macOS instead.
 
 ## Basic setup
 

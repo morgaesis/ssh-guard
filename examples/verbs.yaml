@@ -18,9 +18,11 @@
 #   recoverable  -> runs behind an auto-revert envelope (must declare `revert`)
 #   irreversible -> held for operator approval
 #
-# `trusted: true` skips the LLM evaluator (a deterministic allow path, like a
-# static-policy allow); the declared class still drives the gate. Leave it false
-# (default) to keep the LLM as a backstop on the rendered command.
+# `trusted: true` skips the LLM evaluator -- the only supported way to get a
+# deterministic, LLM-skipping allow (a static-policy `allow` pattern does NOT
+# skip the LLM; see examples/deny-policy.yaml). The declared class still
+# drives the gate. Leave `trusted` false (default) to keep the LLM as a
+# backstop on the rendered command.
 
 verbs:
   # Read-only inspection: runs immediately.

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="/home/me/Projects/morgaesis/ssh-guard"
-codex_bin="/home/me/.volta/tools/image/node/24.16.0/bin/codex"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+codex_bin="$(command -v codex || true)"
 out_dir="$repo/.cache/guard-market-research"
 lock_dir="$out_dir/lock"
 log_file="$out_dir/loop.log"
 
 mkdir -p "$out_dir"
+
+if [ -z "$codex_bin" ]; then
+  printf '%s skipped: codex not found on PATH\n' "$(date -u +%FT%TZ)" >>"$log_file"
+  exit 0
+fi
 
 if ! mkdir "$lock_dir" 2>/dev/null; then
   printf '%s skipped: previous research loop still running\n' "$(date -u +%FT%TZ)" >>"$log_file"

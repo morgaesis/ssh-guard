@@ -14,7 +14,7 @@
 //! `pass guard/u<uid>/...` and `secrets.yaml` `{<uid>: ...}` layout with no
 //! migration) and a filesystem/env-safe form for SIDs.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
@@ -492,6 +492,37 @@ fn yaml_key_to_principal_string(value: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+/// Parse decrypted secrets-file content into its store shape. A pure function
+/// (no I/O, no GPG) so the namespaced/legacy detection logic is unit-testable
+/// directly, independent of `LocalBackend`'s GPG-backed storage.
+fn parse_store_variant(content: &str) -> Result<LocalStoreVariant> {
+    // The namespaced shape is `{ <principal>: { <key>: <value> } }`. Parse
+    // through `Value` so a legacy integer uid key (`1000:`) and a string
+    // key (`"1000":` or a SID) both normalize to the principal raw string.
+    if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(content)
+    {
+        let mut namespaced: LocalStore = HashMap::new();
+        let mut all_namespaced = true;
+        for (k, v) in &map {
+            let (Some(principal), Ok(inner)) = (
+                yaml_key_to_principal_string(k),
+                serde_yaml::from_value::<HashMap<String, String>>(v.clone()),
+            ) else {
+                all_namespaced = false;
+                break;
+            };
+            namespaced.insert(principal, inner);
+        }
+        if all_namespaced {
+            return Ok(LocalStoreVariant::Namespaced(namespaced));
+        }
+    }
+    if let Ok(store) = serde_yaml::from_str::<LegacyLocalStore>(content) {
+        return Ok(LocalStoreVariant::Legacy(store));
+    }
+    bail!("content did not match either the namespaced or legacy secrets-file shape")
+}
+
 impl LocalBackend {
     pub fn new() -> Result<Self> {
         let config_dir = dirs::config_dir()
@@ -547,32 +578,8 @@ impl LocalBackend {
         }
 
         let content = String::from_utf8_lossy(&output.stdout);
-        // The namespaced shape is `{ <principal>: { <key>: <value> } }`. Parse
-        // through `Value` so a legacy integer uid key (`1000:`) and a string
-        // key (`"1000":` or a SID) both normalize to the principal raw string.
-        if let Ok(serde_yaml::Value::Mapping(map)) =
-            serde_yaml::from_str::<serde_yaml::Value>(&content)
-        {
-            let mut namespaced: LocalStore = HashMap::new();
-            let mut all_namespaced = true;
-            for (k, v) in &map {
-                let (Some(principal), Ok(inner)) = (
-                    yaml_key_to_principal_string(k),
-                    serde_yaml::from_value::<HashMap<String, String>>(v.clone()),
-                ) else {
-                    all_namespaced = false;
-                    break;
-                };
-                namespaced.insert(principal, inner);
-            }
-            if all_namespaced {
-                return Ok(LocalStoreVariant::Namespaced(namespaced));
-            }
-        }
-        if let Ok(store) = serde_yaml::from_str::<LegacyLocalStore>(&content) {
-            return Ok(LocalStoreVariant::Legacy(store));
-        }
-        bail!("failed to parse secrets file {}", encrypted.display())
+        parse_store_variant(&content)
+            .with_context(|| format!("failed to parse secrets file {}", encrypted.display()))
     }
 
     async fn save_store_variant(&self, secrets: &LocalStoreVariant) -> Result<()> {
@@ -642,7 +649,14 @@ impl SecretBackend for LocalBackend {
             LocalStoreVariant::Namespaced(store) => {
                 Ok(store.get(ns).and_then(|m| m.get(key)).cloned())
             }
-            LocalStoreVariant::Legacy(_) => Ok(None),
+            // Surface the same migration-required error as set()/delete()
+            // rather than a silent Ok(None): an unmigrated legacy store is
+            // indistinguishable from "secret not found" otherwise, which can
+            // make an operator believe a configured credential is simply
+            // missing when it is actually still present but unreadable.
+            LocalStoreVariant::Legacy(_) => bail!(
+                "legacy flat local secret store detected; daemon migration is required before user-scoped reads"
+            ),
         }
     }
 
@@ -653,7 +667,9 @@ impl SecretBackend for LocalBackend {
                 .get(ns)
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default(),
-            LocalStoreVariant::Legacy(_) => Vec::new(),
+            LocalStoreVariant::Legacy(_) => bail!(
+                "legacy flat local secret store detected; daemon migration is required before user-scoped reads"
+            ),
         };
         keys.sort();
         keys.dedup();
@@ -1236,9 +1252,13 @@ impl SecretBackend for InfisicalBackend {
         if resp.status().is_success() {
             return Ok(());
         }
-        // Infisical returns a 4xx when creating a secret that already exists.
-        // Fall back to an update via PATCH on a create conflict.
-        if resp.status().is_client_error() {
+        // Infisical returns 409 Conflict when creating a secret that already
+        // exists. Fall back to an update via PATCH on that specific conflict
+        // only -- treating every 4xx as "already exists" would retry (and
+        // misreport) genuine errors like a bad request, an auth/permission
+        // failure, or a validation error as if they were update conflicts,
+        // hiding the real cause from whoever is debugging the failure.
+        if resp.status() == reqwest::StatusCode::CONFLICT {
             let resp = self
                 .send_authed(|tok| self.client.patch(&url).bearer_auth(tok).json(&body))
                 .await?;
@@ -1299,12 +1319,31 @@ impl SecretFd {
         let temp_dir = tempfile::TempDir::new()?;
         let path = temp_dir.path().join("secret");
 
-        fs::write(&path, secret)?;
-        // Restrict to the owner. On Unix this is the 0600 mode bit; on Windows
-        // the file inherits the owner-scoped default ACL of the service
-        // account's per-user temp directory (see the type-level docs).
+        // On Unix, create the file with mode 0600 from the `open()` call
+        // itself (O_CREAT|O_EXCL with the mode argument), rather than
+        // writing the file with the process's default (umask-determined)
+        // permissions and tightening them with a separate set_permissions
+        // call afterward: that write-then-chmod sequence leaves a window
+        // where the file briefly has broader permissions than intended. A
+        // mode of 0600 has no group/other bits for umask to need to strip,
+        // so passing it directly to open() is already correct regardless of
+        // umask, with no separate permissions call needed.
         #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(secret.as_bytes())?;
+        }
+        // On Windows the file inherits the owner-scoped default ACL of the
+        // service account's per-user temp directory (see the type-level
+        // docs), so a plain write is sufficient.
+        #[cfg(windows)]
+        fs::write(&path, secret)?;
 
         Ok(Self { path, temp_dir })
     }
@@ -1337,6 +1376,12 @@ struct CacheKey {
 pub struct SecretManager {
     backend: Arc<dyn SecretBackend>,
     cache: Arc<RwLock<HashMap<CacheKey, String>>>,
+    /// Bumped by every `set`/`delete`. `get()` captures this before its
+    /// backend round-trip and only writes the result into the cache if it is
+    /// unchanged afterward -- otherwise a concurrent delete/set raced the
+    /// fetch and the read may already be stale, so caching it could
+    /// resurrect a deleted secret or overwrite a fresher value indefinitely.
+    epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for SecretManager {
@@ -1352,6 +1397,7 @@ impl SecretManager {
         Self {
             backend,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1375,11 +1421,28 @@ impl SecretManager {
             }
         }
 
+        let epoch_before = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let value = self.backend.get(principal, key).await?;
 
         if let Some(ref v) = value {
+            // A set()/delete() for ANY key that lands during this backend
+            // round-trip bumps the epoch; skip caching rather than risk
+            // resurrecting a value a concurrent delete just removed, or
+            // overwriting a concurrent set's fresher value. The recheck
+            // happens AFTER acquiring the write lock, not before: checking
+            // first and then separately acquiring the lock would leave a
+            // gap where a set()/delete() could bump the epoch and complete
+            // its own (lock-protected) cache write in between, so this
+            // get() would still insert a stale value once it finally got
+            // the lock. set()/delete() bump the epoch before taking their
+            // own write lock, so by the time this get() holds the lock, any
+            // racing mutation that matters has already either bumped the
+            // epoch (detected here) or not yet started (and will see this
+            // insert and correctly overwrite/remove it in turn).
             let mut cache = self.cache.write().await;
-            cache.insert(ck, v.clone());
+            if self.epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch_before {
+                cache.insert(ck, v.clone());
+            }
         }
 
         Ok(value)
@@ -1395,6 +1458,7 @@ impl SecretManager {
 
     pub async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
         self.backend.set(principal, key, value).await?;
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut cache = self.cache.write().await;
         cache.insert(
             CacheKey {
@@ -1408,6 +1472,7 @@ impl SecretManager {
 
     pub async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
         self.backend.delete(principal, key).await?;
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut cache = self.cache.write().await;
         cache.remove(&CacheKey {
             principal: principal.clone(),
@@ -1630,6 +1695,105 @@ mod tests {
         assert_eq!(
             manager.get(&p(1001), "api_key").await.unwrap(),
             Some("bob-key".to_string())
+        );
+    }
+
+    /// A backend whose `get()` captures the value, signals that it has
+    /// started, then blocks until the test releases it before returning --
+    /// letting a test deterministically interleave a `delete`/`set` in the
+    /// middle of an in-flight `get`'s backend round-trip. Only the FIRST
+    /// `get()` call is slow this way; subsequent calls (e.g. a test's
+    /// post-race verification read) behave like a normal `MockBackend`.
+    #[derive(Debug)]
+    struct SlowGetBackend {
+        inner: MockBackend,
+        started: tokio::sync::Notify,
+        proceed: tokio::sync::Notify,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl SlowGetBackend {
+        fn new() -> Self {
+            Self {
+                inner: MockBackend::new(),
+                started: tokio::sync::Notify::new(),
+                proceed: tokio::sync::Notify::new(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SecretBackend for SlowGetBackend {
+        fn name(&self) -> &str {
+            "slow-mock"
+        }
+
+        async fn get(&self, principal: &PrincipalKey, key: &str) -> Result<Option<String>> {
+            let value = self.inner.get(principal, key).await?;
+            let was_armed = self.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+            if was_armed {
+                self.started.notify_one();
+                self.proceed.notified().await;
+            }
+            Ok(value)
+        }
+
+        async fn list(&self, principal: &PrincipalKey) -> Result<Vec<String>> {
+            self.inner.list(principal).await
+        }
+
+        async fn list_all(&self) -> Result<Vec<(PrincipalKey, String)>> {
+            self.inner.list_all().await
+        }
+
+        async fn set(&self, principal: &PrincipalKey, key: &str, value: &str) -> Result<()> {
+            self.inner.set(principal, key, value).await
+        }
+
+        async fn delete(&self, principal: &PrincipalKey, key: &str) -> Result<()> {
+            self.inner.delete(principal, key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_delete_during_get_does_not_resurrect_into_cache() {
+        // Regression test: a get() in flight when a delete() for the same key
+        // lands and fully completes must not insert the (now stale) value
+        // into the cache afterward -- otherwise every later get() returns the
+        // deleted secret out of cache until clear_cache() or a restart.
+        let backend = Arc::new(SlowGetBackend::new());
+        backend.inner.store.lock().unwrap().insert(
+            (p(1000), "api_key".to_string()),
+            "soon-to-be-deleted".to_string(),
+        );
+        let manager = SecretManager::new(backend.clone());
+
+        let get_manager = manager.clone();
+        let get_task = tokio::spawn(async move { get_manager.get(&p(1000), "api_key").await });
+
+        // Wait for the get() to have read the (still-present) value from the
+        // backend and be parked before its cache-write.
+        backend.started.notified().await;
+
+        // A delete fully completes while the get() is still in flight.
+        manager.delete(&p(1000), "api_key").await.unwrap();
+
+        // Let the stale get() proceed and finish.
+        backend.proceed.notify_one();
+        let stale_read = get_task.await.unwrap().unwrap();
+        assert_eq!(
+            stale_read,
+            Some("soon-to-be-deleted".to_string()),
+            "the in-flight read itself should still observe the pre-delete value"
+        );
+
+        // The cache must NOT have been resurrected by the stale get()'s
+        // late write: a fresh get() must reflect the delete, not the cache.
+        assert_eq!(
+            manager.get(&p(1000), "api_key").await.unwrap(),
+            None,
+            "delete must not be undone by a racing get()'s cache insert"
         );
     }
 
@@ -1891,6 +2055,26 @@ mod tests {
         assert_eq!(legacy, vec!["LEGACY".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_store_variant_detects_legacy_flat_shape() {
+        // Prerequisite for the get()/set()/list()/delete() migration-required
+        // check: a legacy flat `{ <key>: <value> }` file (no principal
+        // namespacing) must parse as Legacy, not as an empty/partial
+        // Namespaced store.
+        let legacy = parse_store_variant("OPNSENSE_API_KEY: some-value\n").unwrap();
+        assert!(
+            matches!(legacy, LocalStoreVariant::Legacy(ref m) if m.get("OPNSENSE_API_KEY").map(String::as_str) == Some("some-value")),
+            "expected a Legacy store"
+        );
+
+        let namespaced =
+            parse_store_variant("1000:\n  OPNSENSE_API_KEY: some-value\n").unwrap();
+        assert!(
+            matches!(namespaced, LocalStoreVariant::Namespaced(ref m) if m.get("1000").and_then(|inner| inner.get("OPNSENSE_API_KEY")).map(String::as_str) == Some("some-value")),
+            "expected a Namespaced store"
+        );
     }
 
     #[test]

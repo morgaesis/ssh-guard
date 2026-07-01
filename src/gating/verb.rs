@@ -1014,6 +1014,26 @@ verbs:
     }
 
     #[test]
+    fn example_verb_catalogs_parse_and_validate() {
+        // Guards against example/doc drift: every shipped examples/verbs*.yaml
+        // must actually load (anchored patterns, declared placeholders, no
+        // duplicate names) -- the same check `guard server start --verbs`
+        // performs at startup.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if name.starts_with("verbs") && name.ends_with(".yaml") {
+                VerbCatalog::load(&path)
+                    .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
+                checked += 1;
+            }
+        }
+        assert!(checked >= 3, "expected to find the shipped verbs*.yaml examples");
+    }
+
+    #[test]
     fn append_handles_empty_inline_and_trailing_key_catalogs() {
         let v = synth_verb("cmk", Some("^(zones|networks)$"), false, "cmk-list");
         let seeds = [

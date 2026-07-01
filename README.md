@@ -104,9 +104,10 @@ With gating on, the LLM keeps deciding APPROVE/DENY exactly as before (the deny
 rules are unchanged) and additionally classifies the reversibility of commands it
 approves. The daemon routes on that class. Classification is **fail-safe**:
 reversibility can only *raise* the gate, never lower it, and a missing or
-uncertain class is held, never run. Operator-authored allows (static policy,
-trusted verbs) and the LLM-uncertain path are separated: the open-ended LLM path
-is gated; the operator-vetted surface is not.
+uncertain class is held, never run. Operator-authored allows (trusted verbs,
+and static policy in the `--no-llm` fallback mode) and the LLM-uncertain path
+are separated: the open-ended LLM path is gated; the operator-vetted surface
+is not.
 
 Gating is meaningful only where the daemon's principal differs from the agent's
 (so the agent cannot approve its own held command). The principal is a Unix uid
@@ -248,17 +249,23 @@ model chain is active. This default is production-ready for the common case.
 
 Two opt-in features exist for deployments with specific constraints:
 
-- **Static allow/deny lists** via `--policy <yaml>`. Short-circuits the LLM
-  for deterministic safe or unsafe patterns. See
-  [`examples/`](examples/README.md) for `allow-policy.yaml`,
-  `deny-policy.yaml`, and `hybrid-policy.yaml`.
+- **Static deny list** via `--policy <yaml>`. Fast-rejects deterministically
+  unsafe patterns before the LLM is called. See
+  [`examples/`](examples/README.md) for `deny-policy.yaml` and
+  `hybrid-policy.yaml`. `commands.allow` is also parsed (for the
+  `--no-llm` fallback mode and backward compatibility) but, while the LLM is
+  enabled, an allow pattern never skips it -- glob patterns over a flat
+  command string can't be trusted with that the way `guard verb`'s
+  anchored-regex, single-argv parameters can. Use `guard verb` for a
+  deterministic, LLM-skipping allow.
 - **Fallback model chain** via `GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
   [`examples/fallback-models.env`](examples/fallback-models.env).
-- **Learned static rules** via `--learn-rules`. Repeated low-risk LLM
-  approvals can promote conservative exact static allow rules so repeated
-  calls return immediately. Misses and risky commands still fall through to
-  the LLM.
+- **Learned-rule candidates** via `--learn-rules`. Repeated low-risk LLM
+  approvals surface as a candidate in the policy reason text, with a
+  ready-to-run `guard verb create --prompt` suggestion. Candidates do not
+  grant themselves a bypass -- only an operator running that command can,
+  through the same synthesis safety gate as any other verb.
 
 Enable either only when a concrete latency or uptime constraint forces it.
 
@@ -404,14 +411,21 @@ guard server start \
   --socket .cache/guard.sock &
 ```
 
-When the LLM repeatedly approves the same low-risk command shape, guard writes
-a learned allow rule to the state directory and future identical calls bypass
-the LLM. Learned rules never deny or wildcard over service verbs; misses,
-session-prompted calls, and commands with destructive shell-control tokens fall
-back to normal evaluation. For SSH API wrappers, guard may also mention a
-shorter service shim such as `opnsense-api`; with `--learn-shims create`,
-promoted rules create that wrapper in the configured shim directory, and the
-same approved operation is covered through the shim name.
+When the LLM repeatedly approves the same low-risk command shape, guard
+records the observation to the state directory; once it crosses
+`--learn-min-approvals`, the policy reason returned to the caller includes a
+candidate notice with a ready-to-run `guard verb create --prompt "..."`
+command. Crossing the threshold does NOT bypass the LLM by itself -- every
+future identical call is still evaluated normally, because granting that
+bypass automatically would let an agent promote itself past the evaluator
+just by repeating a borderline command. Only an operator running the
+suggested `guard verb create` command (or hand-authoring a verb) can turn a
+candidate into an actual LLM-skipping allow, through the same synthesis
+safety gate as any other verb. For SSH API wrappers, guard may also mention a
+shorter service shim such as `opnsense-api`; with `--learn-shims create`, a
+candidate creates that wrapper in the configured shim directory (a command
+alias, not a bypass -- it still runs through normal evaluation) once it
+reaches the approval threshold.
 
 ### Custom system prompt
 

@@ -3895,7 +3895,6 @@ fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecis
     match source {
         crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
         crate::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
-        crate::evaluate::EvalSource::LearnedRule => SessionDecisionSource::StaticPolicy,
         crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
     }
 }
@@ -4048,10 +4047,12 @@ async fn maybe_auto_amend_session_after_llm(
 }
 
 async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Option<String> {
-    let mut notice = if outcome.promoted {
+    let mut notice = if outcome.is_candidate {
         format!(
-            "Promoted learned static rule `{}` for `{}` after {} approvals.",
-            outcome.pattern, outcome.service, outcome.approvals
+            "Learned-rule candidate `{}` for `{}` reached {} approvals. This does NOT skip the \
+             LLM by itself; an operator can promote it with: guard verb create --prompt \
+             \"allow exactly: {}\" --binary {}.",
+            outcome.pattern, outcome.service, outcome.approvals, outcome.pattern, outcome.service
         )
     } else if let Some(reason) = &outcome.skipped_reason {
         format!("Learned-rule skip: {reason}.")
@@ -4080,7 +4081,7 @@ async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Op
                 shim.render_command()
             ));
         }
-        AutoShimMode::Create if outcome.promoted => {
+        AutoShimMode::Create if outcome.is_candidate => {
             let Some(ref shim_dir) = config.shim_dir else {
                 notice.push_str(&format!(
                     " Shim `{}` could be created after configuring a shim directory.",
@@ -4116,8 +4117,8 @@ async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Op
         }
         AutoShimMode::Create => {
             notice.push_str(&format!(
-                " Shim `{}` will be created when the rule is promoted.",
-                shim.name
+                " Shim `{}` will be created once this candidate reaches {} approvals.",
+                shim.name, outcome.required_approvals
             ));
         }
     }

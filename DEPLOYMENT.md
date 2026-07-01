@@ -116,6 +116,21 @@ impersonation. A Unix root daemon started with `--exec-as-caller` over a
 Unix-socket-only listener instead drops each child to the calling uid before
 exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only.
 
+## OS-level sandboxing profiles
+
+`guard profile seccomp` emits a default-allow seccomp profile (use via
+`--security-opt seccomp=<file>` on Docker/Podman) that denies
+container-escape and host-tampering syscalls (`mount`, `pivot_root`,
+`ptrace`, kernel module load, etc.) while leaving the daemon's legitimate
+operation -- spawning approved child commands, TLS calls to the LLM
+provider, reading/writing its state directory -- intact.
+
+`guard profile apparmor --exe <path-to-binary> --data-dir <state-dir>`
+emits an AppArmor profile confining the daemon to its binary, data
+directory, and child-command execution. Apply it alongside the systemd
+hardening directives below; it is a complementary, OS-level layer, not a
+replacement for `NoNewPrivileges`/`User=guard`/`--users`.
+
 ## Files
 
 Example systemd files:

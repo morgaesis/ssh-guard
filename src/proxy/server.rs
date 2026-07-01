@@ -185,9 +185,15 @@ impl KubeProxy {
         };
 
         // Interactive subresources tunnel arbitrary bytes and cannot be gated at
-        // the request level yet: deny them outright in phase 1.
+        // the request level yet: deny them outright in phase 1. `proxy` is in
+        // the same class: it tunnels an arbitrary HTTP request (any method,
+        // any path) to the target Pod/Service/Node's network endpoint -- for
+        // a Node, that reaches the kubelet API, which exposes `exec`, `run`,
+        // `portForward`, and `logs` itself. A get/list/watch ApiPolicy allow
+        // rule has no visibility into the tunneled request, so it would
+        // silently approve what is really an unrestricted network pivot.
         if let Some(sub) = op.subresource.as_deref() {
-            if matches!(sub, "exec" | "attach" | "portforward") {
+            if matches!(sub, "exec" | "attach" | "portforward" | "proxy") {
                 return status_resp(
                     StatusCode::FORBIDDEN,
                     &format!("guard kube-proxy: subresource '{sub}' is not permitted"),
@@ -305,6 +311,7 @@ impl KubeProxy {
                 || name == header::AUTHORIZATION
                 || name == header::COOKIE
                 || name == header::CONTENT_LENGTH
+                || is_identity_header(name)
             {
                 continue;
             }
@@ -524,6 +531,23 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+/// Headers that carry or override the request's authenticated identity. The
+/// brokered client authenticates as nothing (its kubeconfig has no
+/// credential); the daemon's own upstream credential is what actually talks
+/// to the apiserver. If that credential holds the Kubernetes `impersonate`
+/// RBAC verb -- a common grant for admin/CI service accounts -- forwarding
+/// these headers verbatim would let the agent re-author the request under an
+/// arbitrary user/group/serviceaccount, authorized against the impersonated
+/// identity rather than the operator's, bypassing ApiPolicy entirely (it only
+/// evaluates verb/resource/namespace, never identity). `X-Remote-*` are the
+/// equivalent front-proxy identity headers for aggregated API servers; strip
+/// them for the same reason even though exploiting them additionally
+/// requires the apiserver to trust this proxy's client certificate.
+fn is_identity_header(name: &header::HeaderName) -> bool {
+    let s = name.as_str();
+    s.starts_with("impersonate-") || s.starts_with("x-remote-")
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
